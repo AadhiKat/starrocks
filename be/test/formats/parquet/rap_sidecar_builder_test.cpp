@@ -34,7 +34,9 @@
 #include "formats/parquet/rap_sidecar_builder.h"
 #include "fs/fs.h"
 #include "runtime/runtime_state.h"
+#include "types/date_value.h"
 #include "types/datum.h"
+#include "types/timestamp_value.h"
 
 namespace starrocks::formats {
 
@@ -332,7 +334,7 @@ TEST_F(RapSidecarBuilderTest, RoundTripAndLookup) {
     EXPECT_EQ(w.writer->rap_export_stats().sidecars_written, 1);
     EXPECT_EQ(w.writer->rap_export_stats().failures, 0);
     EXPECT_GT(w.writer->rap_export_stats().sidecar_bytes, 100);
-    const std::string base = basename(w.path);
+    const std::string base = parquet::RapIndex::key_of(w.path); // slice 2g v3: the key is the file's full path
     const std::string sidecar = _dir + "/rapx/" + base + ".k.rapx";
     ASSERT_TRUE(std::filesystem::exists(sidecar)) << sidecar;
     EXPECT_EQ(static_cast<int64_t>(std::filesystem::file_size(sidecar)), w.writer->rap_export_stats().sidecar_bytes);
@@ -369,8 +371,8 @@ TEST_F(RapSidecarBuilderTest, RoundTripAndLookup) {
     // retain a copy for the harness decoder when asked
     if (const char* keep = std::getenv("RAP_EXPORT_RETAIN_DIR"); keep != nullptr && *keep) {
         std::filesystem::create_directories(keep);
-        std::filesystem::copy_file(sidecar, std::string(keep) + "/" + base + ".k.rapx", std::filesystem::copy_options::overwrite_existing);
-        std::filesystem::copy_file(w.path, std::string(keep) + "/" + base, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(sidecar, std::string(keep) + "/" + basename(w.path) + ".k.rapx", std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(w.path, std::string(keep) + "/" + basename(w.path), std::filesystem::copy_options::overwrite_existing);
     }
 }
 
@@ -381,7 +383,7 @@ TEST_F(RapSidecarBuilderTest, RoundTripAndLookup) {
 TEST_F(RapSidecarBuilderTest, AdjacentBucketsMerge) {
     Written w = write_file(_dir + "/rapx", {"k"});
     ASSERT_TRUE(w.result.io_status.ok()) << w.result.io_status.message();
-    const std::string base = basename(w.path);
+    const std::string base = parquet::RapIndex::key_of(w.path); // slice 2g v3: the key is the file's full path
     const std::string sidecar = _dir + "/rapx/" + base + ".k.rapx";
     parquet::RapIndex::Identity id{base, static_cast<uint64_t>(w.result.file_statistics.file_size), static_cast<uint64_t>(kRows), "k", 7};
     auto r = parquet::RapIndex::load(sidecar, id);
@@ -407,7 +409,7 @@ TEST_F(RapSidecarBuilderTest, AdjacentBucketsMerge) {
 TEST_F(RapSidecarBuilderTest, IdentityRefusals) {
     Written w = write_file(_dir + "/rapx", {"k"});
     ASSERT_TRUE(w.result.io_status.ok());
-    const std::string base = basename(w.path);
+    const std::string base = parquet::RapIndex::key_of(w.path); // slice 2g v3: the key is the file's full path
     const std::string sidecar = _dir + "/rapx/" + base + ".k.rapx";
     const uint64_t size = w.result.file_statistics.file_size;
     auto expect_unusable = [&](parquet::RapIndex::Identity id, const char* why) {
@@ -470,6 +472,7 @@ TEST_F(RapSidecarBuilderTest, OffByDefault) {
     EXPECT_EQ(a.writer->rap_export_stats().sidecars_written, 0);
     EXPECT_EQ(a.writer->rap_export_stats().sidecar_bytes, 0);
     EXPECT_FALSE(std::filesystem::exists(_dir + "/rapx/" + basename(a.path) + ".k.rapx"));
+    EXPECT_FALSE(std::filesystem::exists(_dir + "/rapx/" + parquet::RapIndex::key_of(a.path) + ".k.rapx"));
     Written b = write_file(_dir + "/rapx", {"zzz", "v"});
     ASSERT_TRUE(b.result.io_status.ok());
     EXPECT_EQ(b.writer->rap_export_stats().sidecars_written, 0);
@@ -480,7 +483,7 @@ TEST_F(RapSidecarBuilderTest, OffByDefault) {
 TEST_F(RapSidecarBuilderTest, RollbackRemovesSidecar) {
     Written w = write_file(_dir + "/rapx", {"k"});
     ASSERT_TRUE(w.result.io_status.ok());
-    const std::string sidecar = _dir + "/rapx/" + basename(w.path) + ".k.rapx";
+    const std::string sidecar = _dir + "/rapx/" + parquet::RapIndex::key_of(w.path) + ".k.rapx"; // slice 2g v3
     ASSERT_TRUE(std::filesystem::exists(sidecar));
     ASSERT_TRUE(std::filesystem::exists(w.path));
     w.result.rollback_action();
@@ -512,7 +515,7 @@ TEST_F(RapSidecarBuilderTest, EvaluatorRunsOnce) {
     EXPECT_EQ(calls, static_cast<int>(kRows / kChunk)) << "the indexed column must be evaluated exactly once per chunk";
     EXPECT_EQ(w.result.file_statistics.record_count, kRows);
     EXPECT_EQ(w.writer->rap_export_stats().sidecars_written, 1);
-    const std::string base = basename(w.path);
+    const std::string base = parquet::RapIndex::key_of(w.path); // slice 2g v3: the key is the file's full path
     parquet::RapIndex::Identity id{base, static_cast<uint64_t>(w.result.file_statistics.file_size), static_cast<uint64_t>(kRows), "k", 7};
     auto r = parquet::RapIndex::load(_dir + "/rapx/" + base + ".k.rapx", id);
     ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
@@ -547,9 +550,10 @@ TEST_F(RapSidecarBuilderTest, WriterKeysSidecarByPathUnderData) {
     Written w = write_file(_dir + "/rapx", {"k"}, true, nullptr, "p=1/");
     ASSERT_TRUE(w.result.io_status.ok()) << w.result.io_status.message();
     EXPECT_EQ(w.writer->rap_export_stats().sidecars_written, 1);
-    const std::string key = "p=1/" + basename(w.path);
+    const std::string key = parquet::RapIndex::key_of(w.path); // slice 2g v3: the full path, partition directory included
+    ASSERT_NE(key.find("/p=1/"), std::string::npos) << key;
     const std::string sidecar = _dir + "/rapx/" + key + ".k.rapx";
-    ASSERT_TRUE(std::filesystem::exists(sidecar)) << "the sidecar must sit under the partition prefix";
+    ASSERT_TRUE(std::filesystem::exists(sidecar)) << "the sidecar must sit under the mirrored full-path prefix";
     EXPECT_FALSE(std::filesystem::exists(_dir + "/rapx/" + basename(w.path) + ".k.rapx")) << "and not under the basename";
     const auto size = static_cast<uint64_t>(w.result.file_statistics.file_size);
     auto r = parquet::RapIndex::load(sidecar, parquet::RapIndex::Identity{key, size, static_cast<uint64_t>(kRows), "k", 7});
@@ -586,6 +590,154 @@ TEST_F(RapSidecarBuilderTest, WriterKeysSidecarByFullPathWithoutDataRoot) {
     EXPECT_EQ(base_r.rows.size(), 1500u);
     EXPECT_EQ(idx.rows, base_r.rows);
     EXPECT_EQ(idx.ready, 2);
+}
+
+// =====================================================================================================================
+// slice 4 -- EXPORT6: typed keys through the export builder
+// =====================================================================================================================
+
+// n: the export path indexes the BIGINT column `v` (0..99999, one per row) as INT64 keys in numeric order -- the sidecar is
+//    v2 / INT64, a range over the values selects exactly their buckets, and the keys 9 < 10 < 100 order numerically
+//    (a string key would put "10" and "100" before "9").
+TEST_F(RapSidecarBuilderTest, TypedInt64KeysEncodeInNumericOrder) {
+    Written w = write_file(_dir + "/rapx", {"v"});
+    ASSERT_TRUE(w.result.io_status.ok()) << w.result.io_status.message();
+    EXPECT_EQ(w.writer->rap_export_stats().sidecars_written, 1) << "an integer column is indexable (slice 4)";
+    const std::string key = parquet::RapIndex::key_of(w.path);
+    const std::string sidecar = _dir + "/rapx/" + key + ".v.rapx";
+    ASSERT_TRUE(std::filesystem::exists(sidecar)) << sidecar;
+    auto r = parquet::RapIndex::load(sidecar, parquet::RapIndex::Identity{key, static_cast<uint64_t>(w.result.file_statistics.file_size), static_cast<uint64_t>(kRows), "v", 8});
+    ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
+    EXPECT_EQ(r.index->version(), parquet::RapIndex::kVersionV2);
+    EXPECT_EQ(r.index->key_type(), parquet::RapIndex::KeyType::INT64);
+    EXPECT_EQ(r.index->num_values(), static_cast<size_t>(kRows));
+    auto enc = [](int64_t x) { std::string k; parquet::RapIndex::encode_int64(x, &k); return k; };
+    // [9, 100]: rows 9..100 -- all inside bucket 0
+    const std::string lo = enc(9), hi = enc(100);
+    auto rs = r.index->lookup_range(&lo, true, &hi, true);
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_EQ(rs[0].start_row, 0);
+    EXPECT_EQ(rs[0].end_row, static_cast<int64_t>(G));
+    // (19999, 40001): rows 20000..40000 -> buckets 1 and 2
+    const std::string a = enc(19999), b = enc(40001);
+    rs = r.index->lookup_range(&a, false, &b, false);
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_EQ(rs[0].start_row, static_cast<int64_t>(G));
+    EXPECT_EQ(rs[0].end_row, static_cast<int64_t>(3 * G));
+    // >= 99999: the last row only -> the last, partial bucket
+    const std::string last = enc(99999);
+    rs = r.index->lookup_range(&last, true, nullptr, true);
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_EQ(rs[0].start_row, 80000);
+    EXPECT_EQ(rs[0].end_row, kRows);
+    // the order of the keys themselves
+    EXPECT_LT(enc(9), enc(10));
+    EXPECT_LT(enc(10), enc(100));
+    EXPECT_TRUE(r.index->null_ranges().empty()) << "`v` has no NULLs";
+}
+
+// o: NULLs are indexed as the null posting, per bucket; the typed observe() handles DATE / DATETIME / BOOLEAN columns.
+TEST_F(RapSidecarBuilderTest, NullPostingAndTypedObserve) {
+    // BIGINT with NULL every 7th row of the first two buckets only
+    {
+        RapSidecarBuilder b("n", 9, TYPE_BIGINT, 1000);
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_BIGINT), true);
+        for (int64_t r = 0; r < 3000; ++r) {
+            if (r < 2000 && r % 7 == 0) col->append_nulls(1);
+            else col->append_datum(Datum(r));
+        }
+        b.observe(*col, 0);
+        const std::string bytes = b.encode("k", 5000, 3000);
+        auto r = parquet::RapIndex::parse(bytes, parquet::RapIndex::Identity{"k", 5000, 3000, "n", 9});
+        ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
+        auto nulls = r.index->null_ranges();
+        ASSERT_EQ(nulls.size(), 1u) << "buckets 0 and 1 hold NULLs and merge into one range";
+        EXPECT_EQ(nulls[0].start_row, 0);
+        EXPECT_EQ(nulls[0].end_row, 2000);
+        EXPECT_EQ(b.num_null_buckets(), 2u);
+        auto nn = r.index->not_null_ranges();
+        ASSERT_EQ(nn.size(), 1u);
+        EXPECT_EQ(nn[0].end_row, 3000);
+    }
+    // BOOLEAN: two keys, each in its own bucket
+    {
+        RapSidecarBuilder b("f", 4, TYPE_BOOLEAN, 10);
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_BOOLEAN), false);
+        for (int r = 0; r < 20; ++r) col->append_datum(Datum(static_cast<uint8_t>(r >= 10 ? 1 : 0)));
+        b.observe(*col, 0);
+        auto r = parquet::RapIndex::parse(b.encode("k", 1, 20), parquet::RapIndex::Identity{"k", 1, 20, "f", 4});
+        ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
+        EXPECT_EQ(r.index->key_type(), parquet::RapIndex::KeyType::BOOLEAN);
+        auto t = r.index->lookup({std::string(1, '\x01')});
+        ASSERT_EQ(t.size(), 1u);
+        EXPECT_EQ(t[0].start_row, 10);
+        auto f = r.index->lookup({std::string(1, '\0')});
+        ASSERT_EQ(f.size(), 1u);
+        EXPECT_EQ(f[0].end_row, 10);
+    }
+    // DATE and DATETIME: keys order as time does and a day-boundary range selects the right bucket
+    {
+        RapSidecarBuilder b("d", 6, TYPE_DATE, 10);
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_DATE), false);
+        for (int r = 0; r < 20; ++r) {
+            DateValue d;
+            d.from_date(2026, 9, r < 10 ? 12 : 13);
+            col->append_datum(Datum(d));
+        }
+        b.observe(*col, 0);
+        auto r = parquet::RapIndex::parse(b.encode("k", 1, 20), parquet::RapIndex::Identity{"k", 1, 20, "d", 6});
+        ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
+        EXPECT_EQ(r.index->key_type(), parquet::RapIndex::KeyType::DATE);
+        DateValue d13;
+        d13.from_date(2026, 9, 13);
+        std::string k13;
+        ASSERT_TRUE(parquet::RapIndex::encode_literal(parquet::RapIndex::KeyType::DATE, TYPE_DATE, Datum(d13), &k13));
+        auto ge = r.index->lookup_range(&k13, true, nullptr, true);
+        ASSERT_EQ(ge.size(), 1u);
+        EXPECT_EQ(ge[0].start_row, 10);
+        auto lt = r.index->lookup_range(nullptr, true, &k13, false);
+        ASSERT_EQ(lt.size(), 1u);
+        EXPECT_EQ(lt[0].end_row, 10);
+    }
+    {
+        RapSidecarBuilder b("t", 7, TYPE_DATETIME, 10);
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_DATETIME), false);
+        for (int r = 0; r < 20; ++r) {
+            TimestampValue t;
+            t.from_timestamp(2026, 9, r < 10 ? 12 : 13, 0, 0, 0, 0);
+            col->append_datum(Datum(t));
+        }
+        b.observe(*col, 0);
+        auto r = parquet::RapIndex::parse(b.encode("k", 1, 20), parquet::RapIndex::Identity{"k", 1, 20, "t", 7});
+        ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
+        EXPECT_EQ(r.index->key_type(), parquet::RapIndex::KeyType::DATETIME);
+        TimestampValue t13;
+        t13.from_timestamp(2026, 9, 13, 0, 0, 0, 0);
+        std::string k13;
+        ASSERT_TRUE(parquet::RapIndex::encode_literal(parquet::RapIndex::KeyType::DATETIME, TYPE_DATETIME, Datum(t13), &k13));
+        auto ge = r.index->lookup_range(&k13, true, nullptr, true);
+        ASSERT_EQ(ge.size(), 1u);
+        EXPECT_EQ(ge[0].start_row, 10);
+    }
+}
+
+// PRD-02: the distinct-value ceiling caps the builder -- above it nothing is written (advisory failure), below it all is.
+TEST_F(RapSidecarBuilderTest, DistinctValueCeilingCapsTheBuilder) {
+    const int64_t saved = config::rap_index_max_values;
+    config::rap_index_max_values = 10;
+    RapSidecarBuilder b("v", 8, TYPE_BIGINT, 1000);
+    auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_BIGINT), false);
+    for (int64_t r = 0; r < 100; ++r) col->append_datum(Datum(r));
+    b.observe(*col, 0);
+    EXPECT_TRUE(b.over_cap());
+    EXPECT_EQ(b.num_values(), 10u) << "the eleventh distinct key caps the builder";
+    // the export writer refuses to write a capped builder's sidecar
+    Written w = write_file(_dir + "/rapx", {"v"});
+    config::rap_index_max_values = saved;
+    ASSERT_TRUE(w.result.io_status.ok()) << w.result.io_status.message();
+    EXPECT_EQ(w.writer->rap_export_stats().sidecars_written, 0) << "100,000 distinct values above a ceiling of 10";
+    EXPECT_EQ(w.writer->rap_export_stats().failures, 1);
+    EXPECT_FALSE(std::filesystem::exists(_dir + "/rapx/" + parquet::RapIndex::key_of(w.path) + ".v.rapx"));
 }
 
 } // namespace starrocks::formats

@@ -6,13 +6,19 @@
 #include <sstream>
 
 #include "base/hash/crc32c.h"
+#include "common/config.h"
 #include "fs/fs.h"
+#include "types/datum.h"
 
 namespace starrocks::parquet {
 
 namespace {
 
 constexpr char kMagic[4] = {'R', 'A', 'P', 'X'};
+// slice 4 (PRD-02): the smallest footprint one declared entry can have in the body -- a count is refused against
+// these BEFORE anything is reserved for it
+constexpr size_t kMinValueBytes = 4 + 4; // u32 key length (an empty key) + u32 range count
+constexpr size_t kRangeBytes = 16;       // i64 start + i64 end
 
 class Cursor {
 public:
@@ -45,16 +51,45 @@ RapIndex::Result unusable(const std::string& why) {
     return r;
 }
 
+bool valid_key_type(uint8_t t) {
+    return t >= static_cast<uint8_t>(RapIndex::KeyType::STRING) && t <= static_cast<uint8_t>(RapIndex::KeyType::DATETIME);
+}
+
+// one ascending, non-overlapping range list read from the cursor, every range inside [0, file_rows)
+bool read_ranges(Cursor* c, uint32_t nr, uint64_t file_rows, size_t body_end, std::vector<RowRangeHint>* out, std::string* why) {
+    // PRD-02: the declared count is checked against the bytes left BEFORE reserving
+    if (c->offset() > body_end || nr > (body_end - c->offset()) / kRangeBytes) {
+        *why = "declared count exceeds body";
+        return false;
+    }
+    out->reserve(nr);
+    int64_t last_end = -1;
+    for (uint32_t k = 0; k < nr; ++k) {
+        int64_t s = 0, e = 0;
+        if (!c->read(&s) || !c->read(&e)) {
+            *why = "truncated range";
+            return false;
+        }
+        if (s < 0 || s >= e || s < last_end) {
+            *why = "malformed range";
+            return false;
+        }
+        if (static_cast<uint64_t>(e) > file_rows) {
+            *why = "range beyond file_rows";
+            return false;
+        }
+        last_end = e;
+        out->push_back(RowRangeHint{s, e});
+    }
+    return true;
+}
+
 } // namespace
 
 RapIndex::Result RapIndex::load(const std::string& path, const Identity& expect) {
     return load(nullptr, path, expect);
 }
 
-// Slice 2c: read through the scan's own FileSystem (null = the default one), so a sidecar next to
-// the lake data (gs://...) is opened by the same connector that opened the data file. A missing
-// object is ABSENT; any other open / read failure is UNUSABLE with the status message, so the scan
-// stays complete and the counter shows it.
 std::string RapIndex::cache_key(bool negative, const std::string& file_key, const std::string& column,
                                 const std::string& generation, const std::string& directory) {
     auto field = [](const std::string& s) { return std::to_string(s.size()) + ":" + s; };
@@ -65,10 +100,10 @@ std::string RapIndex::cache_key(bool negative, const std::string& file_key, cons
 }
 
 std::string RapIndex::key_of(const std::string& path) {
-    const auto pos = path.rfind("/data/");
-    if (pos != std::string::npos && pos + 6 < path.size()) return path.substr(pos + 6);
-    // slice 2g v2 (m36 review, F-COLLISION): no data/ root -> the FULL path minus its scheme, never the basename, which
-    // aliases equal-size, equal-row-count files under different custom roots and lets one file's postings answer another's
+    // slice 2g v3 (PRD-01): the FULL path minus its scheme and leading slashes -- never shortened to the part after
+    // /data/ (which dropped the table and let two tables share a sidecar) and never the basename (which the sink reuses
+    // across partition directories). One rule, one namespace: relative keys and fallback keys cannot collide because
+    // there is no fallback.
     std::string p = path;
     const auto sch = p.find("://");
     if (sch != std::string::npos) p = p.substr(sch + 3);
@@ -76,6 +111,10 @@ std::string RapIndex::key_of(const std::string& path) {
     return p;
 }
 
+// Slice 2c: read through the scan's own FileSystem (null = the default one), so a sidecar next to
+// the lake data (gs://...) is opened by the same connector that opened the data file. A missing
+// object is ABSENT; any other open / read failure is UNUSABLE with the status message, so the scan
+// stays complete and the counter shows it.
 RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const Identity& expect) {
     if (fs == nullptr) fs = FileSystem::Default();
     // slice 2e (deployed check D3-c): the HDFS-backed remote filesystems open LAZILY -- a missing object is not
@@ -93,6 +132,13 @@ RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const I
             return r;
         }
         return unusable("exists: " + std::string(exists.message()));
+    }
+    // slice 4 (PRD-02): the byte ceiling is applied BEFORE the read; a filesystem that cannot report the size falls
+    // through to the open / read, whose own failures report themselves
+    auto size_or = fs->get_file_size(path);
+    if (size_or.ok() && static_cast<int64_t>(*size_or) > config::rap_index_max_sidecar_bytes) {
+        return unusable("size " + std::to_string(*size_or) + " above rap_index_max_sidecar_bytes " +
+                        std::to_string(config::rap_index_max_sidecar_bytes));
     }
     auto file_or = fs->new_random_access_file(path);
     if (!file_or.ok()) {
@@ -119,6 +165,7 @@ RapIndex::Result RapIndex::parse(const std::string& b, const Identity& expect) {
     std::memcpy(&stored_crc, b.data() + b.size() - 8, 4);
     const uint32_t crc = starrocks::crc32c::Value(b.data(), b.size() - 8);
     if (crc != stored_crc) return unusable("crc32c");
+    const size_t body_end = b.size() - 8;
 
     Cursor c(b);
     std::string magic;
@@ -126,18 +173,32 @@ RapIndex::Result RapIndex::parse(const std::string& b, const Identity& expect) {
     uint32_t version = 0;
     uint64_t file_size = 0, file_rows = 0;
     if (!c.read(&version) || !c.read(&file_size) || !c.read(&file_rows)) return unusable("truncated header");
-    if (version != kVersion) return unusable("version " + std::to_string(version));
+    if (version != kVersion && version != kVersionV2) return unusable("version " + std::to_string(version));
+    const bool v2 = version == kVersionV2;
     uint32_t n = 0;
     std::string name, column;
-    if (!c.read(&n) || !c.read_bytes(n, &name)) return unusable("truncated name");
-    if (!c.read(&n) || !c.read_bytes(n, &column)) return unusable("truncated column");
+    if (!c.read(&n) || n > body_end - c.offset() || !c.read_bytes(n, &name)) return unusable("truncated name");
+    if (!c.read(&n) || n > body_end - c.offset() || !c.read_bytes(n, &column)) return unusable("truncated column");
     int32_t field_id = -1;
-    uint32_t granularity = 0, n_values = 0;
+    uint8_t key_type = static_cast<uint8_t>(KeyType::STRING);
+    uint32_t granularity = 0, n_values = 0, n_null_ranges = 0;
     uint64_t postings_offset = 0;
-    if (!c.read(&field_id) || !c.read(&granularity) || !c.read(&n_values) || !c.read(&postings_offset)) {
-        return unusable("truncated header");
-    }
+    if (!c.read(&field_id)) return unusable("truncated header");
+    if (v2 && !c.read(&key_type)) return unusable("truncated header");
+    if (!c.read(&granularity) || !c.read(&n_values)) return unusable("truncated header");
+    if (v2 && !c.read(&n_null_ranges)) return unusable("truncated header");
+    if (!c.read(&postings_offset)) return unusable("truncated header");
     if (postings_offset != c.offset()) return unusable("postings_offset");
+    if (v2 && !valid_key_type(key_type)) return unusable("key_type " + std::to_string(key_type));
+    // slice 4 (PRD-02): declared counts are checked against the ceiling and against the bytes left BEFORE any reserve
+    if (static_cast<int64_t>(n_values) > config::rap_index_max_values) {
+        return unusable("declared values " + std::to_string(n_values) + " above rap_index_max_values " +
+                        std::to_string(config::rap_index_max_values));
+    }
+    const size_t remaining = body_end - c.offset();
+    if (n_values > remaining / kMinValueBytes || static_cast<size_t>(n_null_ranges) > remaining / kRangeBytes) {
+        return unusable("declared count exceeds body");
+    }
 
     // identity gate -- the whole point
     if (name != expect.file_name) return unusable("file_name mismatch: index '" + name + "' vs file '" + expect.file_name + "'");
@@ -154,47 +215,86 @@ RapIndex::Result RapIndex::parse(const std::string& b, const Identity& expect) {
 
     auto idx = std::make_unique<RapIndex>();
     idx->_identity = Identity{name, file_size, file_rows, column, field_id};
+    idx->_version = version;
+    idx->_key_type = static_cast<KeyType>(key_type);
     idx->_granularity_rows = granularity;
     idx->_values.reserve(n_values);
     idx->_ranges.reserve(n_values);
     std::string prev;
+    std::string why;
     for (uint32_t i = 0; i < n_values; ++i) {
         uint32_t vlen = 0;
         std::string v;
-        if (!c.read(&vlen) || !c.read_bytes(vlen, &v)) return unusable("truncated value");
+        if (!c.read(&vlen) || vlen > body_end - c.offset() || !c.read_bytes(vlen, &v)) return unusable("truncated value");
         if (i > 0 && !(prev < v)) return unusable("values not sorted");
         prev = v;
         uint32_t nr = 0;
         if (!c.read(&nr)) return unusable("truncated ranges");
         std::vector<RowRangeHint> rs;
-        rs.reserve(nr);
-        int64_t last_end = -1;
-        for (uint32_t k = 0; k < nr; ++k) {
-            int64_t s = 0, e = 0;
-            if (!c.read(&s) || !c.read(&e)) return unusable("truncated range");
-            if (s < 0 || s >= e || s < last_end) return unusable("malformed range");
-            if (static_cast<uint64_t>(e) > file_rows) return unusable("range beyond file_rows");
-            last_end = e;
-            rs.push_back(RowRangeHint{s, e});
-        }
+        if (!read_ranges(&c, nr, file_rows, body_end, &rs, &why)) return unusable(why);
         idx->_values.push_back(std::move(v));
         idx->_ranges.push_back(std::move(rs));
     }
-    if (c.offset() != b.size() - 8) return unusable("trailing bytes");
+    if (v2 && !read_ranges(&c, n_null_ranges, file_rows, body_end, &idx->_null_ranges, &why)) return unusable("null posting: " + why);
+    if (c.offset() != body_end) return unusable("trailing bytes");
     Result r;
     r.state = State::READY;
     r.index = std::move(idx);
     return r;
 }
 
-std::vector<RowRangeHint> RapIndex::lookup(const std::vector<std::string>& values) const {
-    std::vector<RowRangeHint> all;
-    for (const auto& v : values) {
-        auto it = std::lower_bound(_values.begin(), _values.end(), v);
-        if (it == _values.end() || *it != v) continue;
-        const auto& rs = _ranges[it - _values.begin()];
-        all.insert(all.end(), rs.begin(), rs.end());
+void RapIndex::encode_int64(int64_t v, std::string* out) {
+    // sign bit flipped, big-endian: bytewise order == signed numeric order
+    const uint64_t u = static_cast<uint64_t>(v) ^ (1ULL << 63);
+    for (int i = 7; i >= 0; --i) out->push_back(static_cast<char>((u >> (8 * i)) & 0xff));
+}
+
+bool RapIndex::encode_literal(KeyType kt, LogicalType lt, const Datum& d, std::string* out) {
+    if (d.is_null()) return false;
+    out->clear();
+    switch (kt) {
+    case KeyType::STRING:
+        if (lt != TYPE_VARCHAR && lt != TYPE_CHAR) return false;
+        *out = d.get_slice().to_string();
+        return true;
+    case KeyType::INT64: {
+        int64_t v = 0;
+        switch (lt) {
+        case TYPE_TINYINT:
+            v = d.get_int8();
+            break;
+        case TYPE_SMALLINT:
+            v = d.get_int16();
+            break;
+        case TYPE_INT:
+            v = d.get_int32();
+            break;
+        case TYPE_BIGINT:
+            v = d.get_int64();
+            break;
+        default:
+            return false;
+        }
+        encode_int64(v, out);
+        return true;
     }
+    case KeyType::BOOLEAN:
+        if (lt != TYPE_BOOLEAN) return false;
+        out->push_back(d.get_uint8() ? 1 : 0);
+        return true;
+    case KeyType::DATE:
+        if (lt != TYPE_DATE) return false;
+        encode_int64(static_cast<int64_t>(d.get_date().julian()), out);
+        return true;
+    case KeyType::DATETIME:
+        if (lt != TYPE_DATETIME) return false;
+        encode_int64(static_cast<int64_t>(d.get_timestamp().timestamp()), out);
+        return true;
+    }
+    return false;
+}
+
+std::vector<RowRangeHint> RapIndex::merge(std::vector<RowRangeHint> all) {
     std::sort(all.begin(), all.end(), [](const RowRangeHint& a, const RowRangeHint& b) {
         return a.start_row < b.start_row || (a.start_row == b.start_row && a.end_row < b.end_row);
     });
@@ -207,6 +307,46 @@ std::vector<RowRangeHint> RapIndex::lookup(const std::vector<std::string>& value
         }
     }
     return out;
+}
+
+std::vector<RowRangeHint> RapIndex::lookup(const std::vector<std::string>& values) const {
+    std::vector<RowRangeHint> all;
+    for (const auto& v : values) {
+        auto it = std::lower_bound(_values.begin(), _values.end(), v);
+        if (it == _values.end() || *it != v) continue;
+        const auto& rs = _ranges[it - _values.begin()];
+        all.insert(all.end(), rs.begin(), rs.end());
+    }
+    return merge(std::move(all));
+}
+
+std::vector<RowRangeHint> RapIndex::lookup_range(const std::string* lower, bool lower_inclusive, const std::string* upper,
+                                                 bool upper_inclusive) const {
+    // the keys are sorted bytewise and, for a typed sidecar, bytewise order is the type's order (canonical encodings);
+    // every key inside the interval contributes its ranges -- an under-selection here would lose rows, so the bounds
+    // follow SQL exactly: [lower, upper] when both inclusive, (lower, upper) when neither
+    auto lo = _values.begin();
+    if (lower != nullptr) lo = lower_inclusive ? std::lower_bound(_values.begin(), _values.end(), *lower)
+                                               : std::upper_bound(_values.begin(), _values.end(), *lower);
+    auto hi = _values.end();
+    if (upper != nullptr) hi = upper_inclusive ? std::upper_bound(_values.begin(), _values.end(), *upper)
+                                               : std::lower_bound(_values.begin(), _values.end(), *upper);
+    std::vector<RowRangeHint> all;
+    for (auto it = lo; it < hi; ++it) {
+        const auto& rs = _ranges[it - _values.begin()];
+        all.insert(all.end(), rs.begin(), rs.end());
+    }
+    return merge(std::move(all));
+}
+
+std::vector<RowRangeHint> RapIndex::null_ranges() const {
+    return merge(_null_ranges);
+}
+
+std::vector<RowRangeHint> RapIndex::not_null_ranges() const {
+    std::vector<RowRangeHint> all;
+    for (const auto& rs : _ranges) all.insert(all.end(), rs.begin(), rs.end());
+    return merge(std::move(all));
 }
 
 std::vector<RowRangeHint> RapIndex::intersect(const std::vector<RowRangeHint>& a, const std::vector<RowRangeHint>& b) {

@@ -29,6 +29,7 @@
 #include "formats/parquet/group_reader.h"
 #include "formats/parquet/meta_helper.h"
 #include "formats/parquet/metadata.h"
+#include "formats/parquet/rap_sidecar_builder.h"
 #include "formats/parquet/split_context.h"
 #include "formats/scan_context.h"
 #include "gen_cpp/parquet_types.h"
@@ -124,6 +125,18 @@ private:
     bool _rap_ready = false;
     void _maybe_consult_rap_index();
     void _maybe_consult_rap_index_impl();
+    // RAP / lake-index slice 4 (P3b): scan-side sidecar builders, attached only to a whole-file read (see the .cpp)
+    struct RapBuild {
+        SlotId slot;
+        LogicalType type;
+        std::unique_ptr<formats::RapSidecarBuilder> builder;
+    };
+    std::vector<RapBuild> _rap_builds;
+    int64_t _rap_build_rows_seen = 0;
+    bool _rap_build_done = false;
+    void _maybe_attach_rap_builders();
+    void _rap_build_observe(const ChunkPtr& chunk);
+    void _rap_build_finish();
     std::shared_ptr<MetaHelper> _meta_helper = nullptr;
     SkipRowsContextPtr _skip_rows_ctx = nullptr;
     std::shared_ptr<RuntimeScanRangePruner> _runtime_filter_scan_range_pruner;

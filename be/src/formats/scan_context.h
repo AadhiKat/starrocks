@@ -167,6 +167,10 @@ struct FormatScannerStats {
     int64_t rap_index_consult_ns = 0;       // CX-28: the whole consult, request-time
     std::string rap_index_reason;           // slice 2e: first non-READY consult outcome ("absent: ..." / "unusable: ...")
     int rap_index_negative_hit = 0;         // slice 2f: a refused consult answered from the cache (no filesystem call)
+    // slice 4 (P3b, scan-side builder): sidecars written / skipped by a whole-file scan with rap_build_index_dir set
+    int rap_build_written = 0;
+    int rap_build_skipped = 0;
+    std::string rap_build_reason;           // first skip reason ("partial read", "exists", "too many distinct values", ...)
 };
 
 // Immutable scan options derived from the query plan node, embedded by value

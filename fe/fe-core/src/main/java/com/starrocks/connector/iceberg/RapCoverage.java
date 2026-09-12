@@ -134,6 +134,14 @@ public class RapCoverage {
                 LOG.info("RAP manifest absent for {} snapshot {} ({}) -- ordinary scan", uuid, snap, path);
                 return disabled(snap);
             }
+            // slice 4 (PRD-02): the byte ceiling is applied BEFORE the read; an oversize manifest is "off", never a
+            // partial parse
+            long length = in.getLength();
+            if (length > Config.rap_manifest_max_bytes) {
+                LOG.warn("RAP manifest for {} snapshot {} is {} bytes, above rap_manifest_max_bytes {} -- ordinary scan",
+                        uuid, snap, length, Config.rap_manifest_max_bytes);
+                return disabled(snap);
+            }
             String json;
             try (InputStream s = in.newStream()) {
                 json = new String(s.readAllBytes(), StandardCharsets.UTF_8);
@@ -301,17 +309,13 @@ public class RapCoverage {
     }
 
     /**
-     * slice 2g (F-COLLISION): the key of a data file -- its path after the LAST "/data/" segment, partition
-     * directories included; a path without one is keyed by its full path minus its scheme (v2, m36 review: the
-     * basename would alias equal-size, equal-row-count files under different custom roots). The BE's
-     * RapIndex::key_of is the same rule.
+     * slice 2g v3 (fork production-readiness review, PRD-01; m37 review): the key of a data file is its FULL path
+     * minus its scheme and leading slashes -- bucket, table location, partition directories and file name. v2's "path
+     * after the last /data/" dropped the table, so two tables with the same suffix, size and row count could share a
+     * sidecar under one directory, and its relative and fallback keys shared one namespace. One rule, no fallback. The
+     * BE's RapIndex::key_of and the harness's rap_index_build.key_of apply the same rule.
      */
     public static String keyOf(String loc) {
-        int pos = loc.lastIndexOf("/data/");
-        if (pos >= 0 && pos + 6 < loc.length()) {
-            return loc.substring(pos + 6);
-        }
-        // slice 2g v2 (m36 review): no data/ root -> the full path minus its scheme, never the basename
         int sch = loc.indexOf("://");
         String p = sch >= 0 ? loc.substring(sch + 3) : loc;
         while (p.startsWith("/")) {

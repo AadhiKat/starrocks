@@ -79,8 +79,8 @@ public class RapCoverageTest extends TableTestBase {
     private static String manifest(long snap, String uuid, boolean postings, long f2Size) {
         String base = "{\"version\": 1, \"table_uuid\": \"" + uuid + "\", \"snapshot_id\": " + snap + ", "
                 + "\"column\": \"model\", \"field_id\": 15, \"granularity_rows\": 20000, "
-                + "\"files\": [{\"name\": \"f1.parquet\", \"size\": 1000, \"rows\": 100}, "
-                + "{\"name\": \"f2.parquet\", \"size\": " + f2Size + ", \"rows\": 200}]";
+                + "\"files\": [{\"name\": \"bucket/warehouse/db/t/data/f1.parquet\", \"size\": 1000, \"rows\": 100}, "
+                + "{\"name\": \"bucket/warehouse/db/t/data/f2.parquet\", \"size\": " + f2Size + ", \"rows\": 200}]";
         if (postings) {
             base += ", \"postings\": {\"v\": [0], \"w\": [1]}";
         }
@@ -402,13 +402,20 @@ public class RapCoverageTest extends TableTestBase {
     }
 
     @Test
-    public void testKeyOfIsThePathUnderData() { // slice 2g a-d
-        Assertions.assertEquals("x.parquet", RapCoverage.keyOf("gs://b/t/data/x.parquet"));
-        Assertions.assertEquals("day=1/bucket=2/x.parquet", RapCoverage.keyOf("gs://b/t/data/day=1/bucket=2/x.parquet"));
-        Assertions.assertEquals("p=data/x.parquet", RapCoverage.keyOf("gs://b/data/t/data/p=data/x.parquet"));
-        Assertions.assertEquals("b/t/other/x.parquet", RapCoverage.keyOf("gs://b/t/other/x.parquet")); // v2: full path, never the basename
+    public void testKeyOfIsThePathUnderData() { // slice 2g a-d, v3: the full path minus its scheme, always
+        Assertions.assertEquals("b/t/data/x.parquet", RapCoverage.keyOf("gs://b/t/data/x.parquet"));
+        Assertions.assertEquals("b/t/data/day=1/bucket=2/x.parquet", RapCoverage.keyOf("gs://b/t/data/day=1/bucket=2/x.parquet"));
+        Assertions.assertEquals("b/data/t/data/p=data/x.parquet", RapCoverage.keyOf("gs://b/data/t/data/p=data/x.parquet"));
+        Assertions.assertEquals("b/t/other/x.parquet", RapCoverage.keyOf("gs://b/t/other/x.parquet"));
         Assertions.assertEquals("b/custom/p=0/x.parquet", RapCoverage.keyOf("gs://b/custom/p=0/x.parquet"));
         Assertions.assertNotEquals(RapCoverage.keyOf("gs://b/custom/p=0/x.parquet"), RapCoverage.keyOf("gs://b/custom/p=1/x.parquet"));
+        // PRD-01 (fork production-readiness review): two tables with the same suffix under data/ must not share a key
+        Assertions.assertNotEquals(RapCoverage.keyOf("gs://fixture-bucket/table-a/data/p=0/part.parquet"),
+                RapCoverage.keyOf("gs://fixture-bucket/table-b/data/p=0/part.parquet"));
+        // m37 review: a relative key and a custom-root key must not share one namespace
+        Assertions.assertNotEquals(RapCoverage.keyOf("gs://b/t/data/b/custom/p=0/x.parquet"),
+                RapCoverage.keyOf("gs://b/custom/p=0/x.parquet"));
+        Assertions.assertEquals("x.parquet", RapCoverage.keyOf("x.parquet"));
     }
 
     @Test
@@ -438,8 +445,9 @@ public class RapCoverageTest extends TableTestBase {
                 .withFileSizeInBytes(2000).withRecordCount(200).withFormat("PARQUET").build();
         String m = "{\"version\": 1, \"table_uuid\": \"" + UUID + "\", \"snapshot_id\": " + SNAP + ", \"column\": \"model\", "
                 + "\"field_id\": 15, \"granularity_rows\": 20000, \"files\": ["
-                + "{\"name\": \"b=0/x.parquet\", \"size\": 1000, \"rows\": 100}, "
-                + "{\"name\": \"b=1/x.parquet\", \"size\": 2000, \"rows\": 200}], \"postings\": {\"v\": [0], \"w\": [1]}}";
+                + "{\"name\": \"bucket/warehouse/db/t/data/b=0/x.parquet\", \"size\": 1000, \"rows\": 100}, "
+                + "{\"name\": \"bucket/warehouse/db/t/data/b=1/x.parquet\", \"size\": 2000, \"rows\": 200}], "
+                + "\"postings\": {\"v\": [0], \"w\": [1]}}";
         RapCoverage c = RapCoverage.fromJson(m, UUID, SNAP, eq("model", "v"));
         Assertions.assertTrue(c.isActive());
         Assertions.assertEquals(RapCoverage.Decision.KEEP, c.decide(p0));

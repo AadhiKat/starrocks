@@ -138,6 +138,13 @@ void ParquetFileWriter::_write_rap_sidecars(FileCommitResult* result) {
     const uint64_t size = static_cast<uint64_t>(result->file_statistics.file_size);
     std::vector<std::string> written_paths;
     for (auto& [idx, builder] : _rap_builders) {
+        if (builder->over_cap()) {
+            // slice 4 (PRD-02): the distinct-value ceiling was hit -- advisory failure, the file scans unindexed
+            _rap_stats.failures++;
+            LOG(WARNING) << "RAP sidecar not written for " << base << " (" << builder->column() << "): more than "
+                         << config::rap_index_max_values << " distinct values (rap_index_max_values)";
+            continue;
+        }
         const std::string path = builder->sidecar_path(_rap_dir, base);
         const std::string bytes = builder->encode(base, size, rows);
         auto st = [&]() -> Status {
@@ -344,17 +351,18 @@ Status ParquetFileWriter::init() {
     for (auto& e : _column_evaluators) {
         RETURN_IF_ERROR(e->init());
     }
-    // RAP slice 3a: one builder per listed column that exists in this file and is a string column
+    // RAP slice 3a: one builder per listed column that exists in this file and has a supported type (slice 4: string,
+    // integer, boolean, date and datetime columns, typed keys)
     _rap_builders.clear();
     if (_rap_fs != nullptr && !_rap_dir.empty()) {
         for (size_t i = 0; i < _column_names.size(); ++i) {
             if (std::find(_rap_columns.begin(), _rap_columns.end(), _column_names[i]) == _rap_columns.end()) continue;
-            if (!_type_descs[i].is_string_type()) continue;
+            if (!RapSidecarBuilder::supports(_type_descs[i].type)) continue;
             int32_t field_id = -1;
             if (_writer_options->column_ids.has_value() && i < _writer_options->column_ids->size()) {
                 field_id = (*_writer_options->column_ids)[i].field_id;
             }
-            _rap_builders.emplace_back(i, std::make_unique<RapSidecarBuilder>(_column_names[i], field_id));
+            _rap_builders.emplace_back(i, std::make_unique<RapSidecarBuilder>(_column_names[i], field_id, _type_descs[i].type));
         }
     }
     _eval_func = [&](Chunk* chunk, size_t col_idx) -> StatusOr<ColumnPtr> {

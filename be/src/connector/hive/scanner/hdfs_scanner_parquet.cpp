@@ -146,6 +146,8 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     RuntimeProfile::Counter* rap_index_cache_incompatible = nullptr;
     RuntimeProfile::Counter* rap_index_consult_timer = nullptr;
     RuntimeProfile::Counter* rap_index_negative_hit = nullptr;
+    RuntimeProfile::Counter* rap_build_written = nullptr;   // slice 4 (P3b)
+    RuntimeProfile::Counter* rap_build_skipped = nullptr;
     RuntimeProfile::Counter* page_index_filter_group_counter = nullptr;
     RuntimeProfile::Counter* bloom_filter_tried_counter = nullptr;
     RuntimeProfile::Counter* bloom_filter_success_counter = nullptr;
@@ -161,6 +163,8 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     rap_index_cache_incompatible = ADD_CHILD_COUNTER(root, "RapIndexCacheIncompatible", TUnit::UNIT, kParquetProfileSectionPrefix);
     rap_index_consult_timer = ADD_CHILD_TIMER(root, "RapIndexConsultTime", kParquetProfileSectionPrefix);
     rap_index_negative_hit = ADD_CHILD_COUNTER(root, "RapIndexNegativeHit", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_build_written = ADD_CHILD_COUNTER(root, "RapBuildWritten", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_build_skipped = ADD_CHILD_COUNTER(root, "RapBuildSkipped", TUnit::UNIT, kParquetProfileSectionPrefix);
     request_bytes_read_uncompressed =
             ADD_CHILD_COUNTER(root, "RequestBytesReadUncompressed", TUnit::BYTES, kParquetProfileSectionPrefix);
 
@@ -272,6 +276,12 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     // slice 2e: the first non-READY consult outcome, as an info string (absent when every consult was READY)
     if (!_app_stats.rap_index_reason.empty()) {
         root->add_info_string("RapIndexConsultReason", _app_stats.rap_index_reason.substr(0, 200));
+    }
+    // slice 4 (P3b): scan-side sidecar builds -- written / skipped counts and the first skip reason
+    COUNTER_UPDATE(rap_build_written, _app_stats.rap_build_written);
+    COUNTER_UPDATE(rap_build_skipped, _app_stats.rap_build_skipped);
+    if (!_app_stats.rap_build_reason.empty()) {
+        root->add_info_string("RapBuildReason", _app_stats.rap_build_reason.substr(0, 200));
     }
     COUNTER_UPDATE(page_index_filter_group_counter, _app_stats.page_index_filter_group_counter);
     COUNTER_UPDATE(bloom_filter_tried_counter, _app_stats.bloom_filter_tried_counter);

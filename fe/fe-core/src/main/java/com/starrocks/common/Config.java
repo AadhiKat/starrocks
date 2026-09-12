@@ -106,6 +106,9 @@ public class Config extends ConfigBase {
     // (<dir>/<table_uuid>/<snapshot_id>.rapm.json). Empty = the FE consults no manifest.
     @ConfField(mutable = true)
     public static String rap_manifest_dir = "";
+    // RAP slice 4 (PRD-02): a manifest above this many bytes is treated as absent (ordinary scan), never read in part
+    @ConfField(mutable = true)
+    public static long rap_manifest_max_bytes = 64L * 1024 * 1024;
     @ConfField
     public static String sys_log_level = "INFO";
     @ConfField

@@ -473,7 +473,8 @@ TEST_F(RapSidecarBuilderTest, OffByDefault) {
     EXPECT_EQ(a.writer->rap_export_stats().sidecar_bytes, 0);
     EXPECT_FALSE(std::filesystem::exists(_dir + "/rapx/" + basename(a.path) + ".k.rapx"));
     EXPECT_FALSE(std::filesystem::exists(_dir + "/rapx/" + parquet::RapIndex::key_of(a.path) + ".k.rapx"));
-    Written b = write_file(_dir + "/rapx", {"zzz", "v"});
+    // slice 4: `v` (BIGINT) is indexable now (TypedInt64KeysEncodeInNumericOrder), so only an unknown column stays silent
+    Written b = write_file(_dir + "/rapx", {"zzz"});
     ASSERT_TRUE(b.result.io_status.ok());
     EXPECT_EQ(b.writer->rap_export_stats().sidecars_written, 0);
     EXPECT_TRUE(std::filesystem::is_empty(_dir + "/rapx"));

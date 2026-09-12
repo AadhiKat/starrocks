@@ -1323,4 +1323,93 @@ TEST_F(RapIndexTest, AliasedGenerationCannotReadReadyAsNegative) {
     EXPECT_EQ(lazy.exists_calls, 2) << "the consult pays: nothing aliased";
 }
 
+// slice 2g (F-COLLISION): the key of a data file is its path under the table's data/ root.
+// rekey_sidecar re-encodes a sidecar's header with another file_name (postings copied), CRC and trailer redone.
+static std::string rekey_sidecar(const std::string& b, const std::string& new_name) {
+    size_t o = 4;
+    auto rd32 = [&](size_t at) { uint32_t v; std::memcpy(&v, b.data() + at, 4); return v; };
+    auto rd64 = [&](size_t at) { uint64_t v; std::memcpy(&v, b.data() + at, 8); return v; };
+    const uint32_t version = rd32(o); o += 4;
+    const uint64_t size = rd64(o); o += 8;
+    const uint64_t rows = rd64(o); o += 8;
+    const uint32_t nlen = rd32(o); o += 4 + nlen;
+    const uint32_t clen = rd32(o); o += 4; const std::string col = b.substr(o, clen); o += clen;
+    int32_t field_id = 0; std::memcpy(&field_id, b.data() + o, 4); o += 4;
+    const uint32_t gran = rd32(o); o += 4;
+    const uint32_t nvals = rd32(o); o += 4;
+    const uint64_t postings_offset = rd64(o);
+    Enc e;
+    e.b.append("RAPX", 4); e.put<uint32_t>(version); e.put<uint64_t>(size); e.put<uint64_t>(rows);
+    e.bytes(new_name); e.bytes(col); e.put<int32_t>(field_id); e.put<uint32_t>(gran); e.put<uint32_t>(nvals);
+    e.put<uint64_t>(e.b.size() + 8);
+    e.b.append(b.data() + postings_offset, b.size() - 8 - postings_offset);
+    const uint32_t crc = starrocks::crc32c::Value(e.b.data(), e.b.size());
+    e.put<uint32_t>(crc); e.b.append("RAPX", 4);
+    return e.b;
+}
+
+TEST_F(RapIndexTest, KeyOfUnpartitionedPathIsBasename) { // a
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/x.parquet"), "x.parquet");
+    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/x.parquet"), "x.parquet");
+}
+
+TEST_F(RapIndexTest, KeyOfPartitionedPathKeepsPartitionDirs) { // b
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/day=1/bucket=2/x.parquet"), "day=1/bucket=2/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/user_id_bucket=49/f_10_0_0.parquet"), "user_id_bucket=49/f_10_0_0.parquet");
+}
+
+TEST_F(RapIndexTest, KeyUsesLastDataSegment) { // c
+    EXPECT_EQ(RapIndex::key_of("gs://b/data/t/data/p=data/x.parquet"), "p=data/x.parquet");
+}
+
+TEST_F(RapIndexTest, KeyWithoutDataRootIsBasename) { // d
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/other/x.parquet"), "x.parquet");
+    EXPECT_EQ(RapIndex::key_of("x.parquet"), "x.parquet");
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/"), "");
+}
+
+// e. Two copies of the fixture file with the SAME basename under data/b=0/ and data/b=1/, one sidecar per KEY under
+//    the sidecar directory (re-keyed so the stored name is the key), none for data/b=2/: each consult finds its own
+//    sidecar (READY, narrowed, rows identical) and the third is ABSENT. Under the basename rule one path would serve
+//    all three (or none): the discriminating case for mutant G1.
+TEST_F(RapIndexTest, TwoFilesSameBasenameDifferentPartitionsEachReady) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / ("rap_2g_" + std::to_string(::getpid()));
+    for (const char* b : {"b=0", "b=1", "b=2"}) fs::create_directories(tmp / "data" / b);
+    fs::create_directories(tmp / "rapx" / "b=0");
+    fs::create_directories(tmp / "rapx" / "b=1");
+    const std::string f0 = _fixture_dir + "/" + kFile0;
+    const std::string p0 = (tmp / "data" / "b=0" / kFile0).string(), p1 = (tmp / "data" / "b=1" / kFile0).string(),
+                      p2 = (tmp / "data" / "b=2" / kFile0).string();
+    fs::copy_file(f0, p0); fs::copy_file(f0, p1); fs::copy_file(f0, p2);
+    std::ifstream in(_index_dir + "/" + kFile0 + RapIndex::kSuffix, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_GT(bytes.size(), 100u);
+    for (const char* b : {"b=0", "b=1"}) {
+        std::ofstream out((tmp / "rapx" / b / (kFile0 + ".model" + RapIndex::kSuffix)).string(), std::ios::binary);
+        const std::string keyed = rekey_sidecar(bytes, std::string(b) + "/" + kFile0);
+        out.write(keyed.data(), static_cast<std::streamsize>(keyed.size()));
+    }
+    const std::string dir = (tmp / "rapx").string();
+    std::string diag;
+    const Result base = run(p0, {"2203129G"}, "");
+    ASSERT_FALSE(base.rows.empty());
+    for (const std::string& p : {p0, p1}) {
+        const Result idx = run(p, {"2203129G"}, dir);
+        EXPECT_TRUE(same_multiset(idx.rows, base.rows, &diag)) << p << ": " << diag;
+        EXPECT_EQ(idx.stats_delta.rap_index_consulted, 2) << p;
+        EXPECT_EQ(idx.stats_delta.rap_index_ready, 2) << p << ": the sidecar under the file's own partition prefix must load READY";
+        EXPECT_EQ(idx.stats_delta.rap_index_unusable, 0) << p;
+        EXPECT_LT(idx.planned_bytes, base.planned_bytes) << p;
+    }
+    const Result none = run(p2, {"2203129G"}, dir);
+    EXPECT_TRUE(same_multiset(none.rows, base.rows, &diag)) << diag;
+    EXPECT_EQ(none.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(none.stats_delta.rap_index_ready, 0) << "no sidecar under b=2/: ABSENT, not another partition's";
+    EXPECT_EQ(none.stats_delta.rap_index_unusable, 0);
+    EXPECT_EQ(none.planned_bytes, base.planned_bytes);
+    fs::remove_all(tmp);
+}
+
 } // namespace starrocks::parquet

@@ -34,7 +34,7 @@ public:
     enum class State { ABSENT, UNUSABLE, READY };
 
     struct Identity {
-        std::string file_name; // basename of the data file
+        std::string file_name; // KEY of the data file (key_of): its path under the table's data/ root, or the basename
         uint64_t file_size = 0;
         uint64_t file_rows = 0;
         std::string column;
@@ -60,6 +60,12 @@ public:
     static std::string cache_key(bool negative, const std::string& file_key, const std::string& column,
                                  const std::string& generation, const std::string& directory);
     static constexpr uint32_t kVersion = 1;
+    // slice 2g (F-COLLISION): the KEY of a data file is its path relative to the table's data/ root -- the part after
+    // the LAST "/data/" segment; a path without one keeps the basename. The sink names files per partition
+    // directory, so a basename is not unique on a partitioned table; the key is. It names the sidecar object
+    // (<dir>/<key>.<column>.rapx), is the identity stored in the sidecar, and is the FE manifest's file name
+    // (RapCoverage.keyOf applies the same rule).
+    static std::string key_of(const std::string& path);
 
     // Load `path` through `fs` (null = FileSystem::Default()). Never throws; a missing file is ABSENT,
     // any other open / read error and anything that is not a valid, identity-matching sidecar is

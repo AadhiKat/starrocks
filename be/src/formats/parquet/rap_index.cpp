@@ -64,6 +64,13 @@ std::string RapIndex::cache_key(bool negative, const std::string& file_key, cons
     return k;
 }
 
+std::string RapIndex::key_of(const std::string& path) {
+    const auto pos = path.rfind("/data/");
+    if (pos != std::string::npos && pos + 6 < path.size()) return path.substr(pos + 6);
+    const auto slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
 RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const Identity& expect) {
     if (fs == nullptr) fs = FileSystem::Default();
     // slice 2e (deployed check D3-c): the HDFS-backed remote filesystems open LAZILY -- a missing object is not

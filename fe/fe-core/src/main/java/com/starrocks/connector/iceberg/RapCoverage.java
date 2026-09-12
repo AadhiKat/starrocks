@@ -79,7 +79,7 @@ public class RapCoverage {
     private final boolean active;                 // a manifest for THIS snapshot was loaded and parsed
     private final long snapshotId;
     private final String column;
-    private final Map<String, Covered> files = new HashMap<>();   // basename -> identity
+    private final Map<String, Covered> files = new HashMap<>();   // key (path under data/) -> identity; slice 2g
     private final Set<String> matching = new HashSet<>();         // basenames in M (null postings -> M = C)
     private final boolean hasPostings;
     private final boolean predicateUsable;        // EQ / IN literal(s) on `column` were found
@@ -301,14 +301,25 @@ public class RapCoverage {
     }
 
     /** The completeness rule for one planned data file. */
+    /**
+     * slice 2g (F-COLLISION): the key of a data file -- its path after the LAST "/data/" segment, partition
+     * directories included; a path without one keeps the basename. The BE's RapIndex::key_of is the same rule.
+     */
+    public static String keyOf(String loc) {
+        int pos = loc.lastIndexOf("/data/");
+        if (pos >= 0 && pos + 6 < loc.length()) {
+            return loc.substring(pos + 6);
+        }
+        int slash = loc.lastIndexOf('/');
+        return slash >= 0 ? loc.substring(slash + 1) : loc;
+    }
+
     public Decision decide(DataFile file) {
         consulted++;
         if (!active || file == null) {
             return Decision.KEEP;
         }
-        String loc = file.location();
-        int slash = loc.lastIndexOf('/');
-        String base = slash >= 0 ? loc.substring(slash + 1) : loc;
+        String base = keyOf(file.location()); // slice 2g: the path under data/, not the basename
         Covered c = files.get(base);
         if (c == null) {
             return Decision.KEEP; // uncovered: P − C is always scanned

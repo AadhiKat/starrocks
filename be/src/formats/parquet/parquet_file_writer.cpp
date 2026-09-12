@@ -14,6 +14,7 @@
 
 #include "formats/parquet/parquet_file_writer.h"
 
+#include "formats/parquet/rap_index.h"
 #include "formats/parquet/rap_sidecar_builder.h"
 #include <algorithm>
 #include <sstream>
@@ -130,9 +131,9 @@ FileCommitResult ParquetFileWriter::close() {
 void ParquetFileWriter::_write_rap_sidecars(FileCommitResult* result) {
     if (_rap_builders.empty() || _rap_fs == nullptr) return;
     int64_t t0 = MonotonicNanos();
-    std::string base = _location;
-    const auto slash = base.find_last_of('/');
-    if (slash != std::string::npos) base = base.substr(slash + 1);
+    // slice 2g (F-COLLISION): the sidecar is keyed by the file's path under data/ (partition directories included) and
+    // mirrored under the sidecar directory; the parent prefix is created for filesystems that need one
+    const std::string base = parquet::RapIndex::key_of(_location);
     const uint64_t rows = static_cast<uint64_t>(result->file_statistics.record_count);
     const uint64_t size = static_cast<uint64_t>(result->file_statistics.file_size);
     std::vector<std::string> written_paths;
@@ -140,6 +141,10 @@ void ParquetFileWriter::_write_rap_sidecars(FileCommitResult* result) {
         const std::string path = builder->sidecar_path(_rap_dir, base);
         const std::string bytes = builder->encode(base, size, rows);
         auto st = [&]() -> Status {
+            const auto psl = path.find_last_of('/');
+            if (base.find('/') != std::string::npos && psl != std::string::npos) {
+                RETURN_IF_ERROR(_rap_fs->create_dir_recursive(path.substr(0, psl)));
+            }
             ASSIGN_OR_RETURN(auto file, _rap_fs->new_writable_file(WritableFileOptions{.mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE}, path));
             RETURN_IF_ERROR(file->append(Slice(bytes)));
             return file->close();

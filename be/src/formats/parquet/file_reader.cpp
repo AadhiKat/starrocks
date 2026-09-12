@@ -156,9 +156,9 @@ void FileReader::_maybe_consult_rap_index_impl() {
             }
         }
         if (!supported) continue;
-        std::string base = _file->filename();
-        const auto slash = base.find_last_of('/');
-        if (slash != std::string::npos) base = base.substr(slash + 1);
+        // slice 2g (F-COLLISION): the file's KEY -- its path under the table's data/ root -- not its basename, which
+        // the sink reuses across partition directories (256 files, 86 basenames on the bucketed fixture)
+        const std::string base = RapIndex::key_of(_file->filename());
         int32_t field_id = -1;
         const auto& schema = _file_metadata->schema();
         const int32_t fidx = schema.get_field_idx_by_column_name(col);

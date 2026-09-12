@@ -400,6 +400,31 @@ public class RapCoverageTest extends TableTestBase {
     }
 
     @Test
+    public void testKeyOfIsThePathUnderData() { // slice 2g a-d
+        Assertions.assertEquals("x.parquet", RapCoverage.keyOf("gs://b/t/data/x.parquet"));
+        Assertions.assertEquals("day=1/bucket=2/x.parquet", RapCoverage.keyOf("gs://b/t/data/day=1/bucket=2/x.parquet"));
+        Assertions.assertEquals("p=data/x.parquet", RapCoverage.keyOf("gs://b/data/t/data/p=data/x.parquet"));
+        Assertions.assertEquals("x.parquet", RapCoverage.keyOf("gs://b/t/other/x.parquet"));
+    }
+
+    @Test
+    public void testDecideMatchesPlannedFileByRelativeKey() { // slice 2g h
+        DataFile p0 = DataFiles.builder(PartitionSpec.unpartitioned()).withPath("gs://bucket/warehouse/db/t/data/b=0/x.parquet")
+                .withFileSizeInBytes(1000).withRecordCount(100).withFormat("PARQUET").build();
+        DataFile p1 = DataFiles.builder(PartitionSpec.unpartitioned()).withPath("gs://bucket/warehouse/db/t/data/b=1/x.parquet")
+                .withFileSizeInBytes(2000).withRecordCount(200).withFormat("PARQUET").build();
+        String m = "{\"version\": 1, \"table_uuid\": \"" + UUID + "\", \"snapshot_id\": " + SNAP + ", \"column\": \"model\", "
+                + "\"field_id\": 15, \"granularity_rows\": 20000, \"files\": [{\"name\": \"b=0/x.parquet\", \"size\": 1000, \"rows\": 100}, "
+                + "{\"name\": \"b=1/x.parquet\", \"size\": 2000, \"rows\": 200}], \"postings\": {\"v\": [0], \"w\": [1]}}";
+        RapCoverage c = RapCoverage.fromJson(m, UUID, SNAP, eq("model", "v"));
+        Assertions.assertTrue(c.isActive());
+        Assertions.assertEquals(RapCoverage.Decision.KEEP, c.decide(p0));
+        Assertions.assertEquals(RapCoverage.Decision.DROP, c.decide(p1));
+        Assertions.assertEquals(0, c.getIdentityMismatch());
+        Assertions.assertEquals(2, c.getCovered());
+    }
+
+    @Test
     public void testExtractLiterals() {
         Assertions.assertEquals(Arrays.asList("v"), RapCoverage.extractLiterals(eq("model", "v"), "model"));
         Assertions.assertEquals(Arrays.asList("v", "w"), RapCoverage.extractLiterals(in(false, "model", "v", "w"), "model"));

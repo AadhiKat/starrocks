@@ -265,7 +265,9 @@ public class RapCoverageTest extends TableTestBase {
             if (files.length() > 0) {
                 files.append(", ");
             }
-            files.append("{\"name\": \"").append(loc.substring(loc.lastIndexOf('/') + 1)).append("\", \"size\": ")
+            // slice 2g v2: the manifest names a file by its KEY (the builder's rule); TableTestBase's fixtures have no
+            // data/ root, so under v2 that is the full path, not the basename
+            files.append("{\"name\": \"").append(RapCoverage.keyOf(loc)).append("\", \"size\": ")
                     .append(f.fileSizeInBytes()).append(", \"rows\": ").append(f.recordCount()).append("}");
         }
         return "{\"version\": 1, \"table_uuid\": \"" + uuid + "\", \"snapshot_id\": " + snap + ", \"column\": \"data\", "

@@ -300,10 +300,11 @@ public class RapCoverage {
         return null;
     }
 
-    /** The completeness rule for one planned data file. */
     /**
      * slice 2g (F-COLLISION): the key of a data file -- its path after the LAST "/data/" segment, partition
-     * directories included; a path without one keeps the basename. The BE's RapIndex::key_of is the same rule.
+     * directories included; a path without one is keyed by its full path minus its scheme (v2, m36 review: the
+     * basename would alias equal-size, equal-row-count files under different custom roots). The BE's
+     * RapIndex::key_of is the same rule.
      */
     public static String keyOf(String loc) {
         int pos = loc.lastIndexOf("/data/");
@@ -319,6 +320,7 @@ public class RapCoverage {
         return p;
     }
 
+    /** The completeness rule for one planned data file. */
     public Decision decide(DataFile file) {
         consulted++;
         if (!active || file == null) {

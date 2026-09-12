@@ -418,8 +418,10 @@ public class RapCoverageTest extends TableTestBase {
         DataFile p1 = DataFiles.builder(PartitionSpec.unpartitioned()).withPath("gs://bucket/custom/p=1/x.parquet")
                 .withFileSizeInBytes(1000).withRecordCount(100).withFormat("PARQUET").build();
         String m = "{\"version\": 1, \"table_uuid\": \"" + UUID + "\", \"snapshot_id\": " + SNAP + ", \"column\": \"model\", "
-                + "\"field_id\": 15, \"granularity_rows\": 20000, \"files\": [{\"name\": \"bucket/custom/p=0/x.parquet\", \"size\": 1000, \"rows\": 100}, "
-                + "{\"name\": \"bucket/custom/p=1/x.parquet\", \"size\": 1000, \"rows\": 100}], \"postings\": {\"v\": [0], \"w\": [1]}}";
+                + "\"field_id\": 15, \"granularity_rows\": 20000, \"files\": ["
+                + "{\"name\": \"bucket/custom/p=0/x.parquet\", \"size\": 1000, \"rows\": 100}, "
+                + "{\"name\": \"bucket/custom/p=1/x.parquet\", \"size\": 1000, \"rows\": 100}], "
+                + "\"postings\": {\"v\": [0], \"w\": [1]}}";
         RapCoverage c = RapCoverage.fromJson(m, UUID, SNAP, eq("model", "v"));
         Assertions.assertTrue(c.isActive());
         Assertions.assertEquals(RapCoverage.Decision.KEEP, c.decide(p0));
@@ -435,7 +437,8 @@ public class RapCoverageTest extends TableTestBase {
         DataFile p1 = DataFiles.builder(PartitionSpec.unpartitioned()).withPath("gs://bucket/warehouse/db/t/data/b=1/x.parquet")
                 .withFileSizeInBytes(2000).withRecordCount(200).withFormat("PARQUET").build();
         String m = "{\"version\": 1, \"table_uuid\": \"" + UUID + "\", \"snapshot_id\": " + SNAP + ", \"column\": \"model\", "
-                + "\"field_id\": 15, \"granularity_rows\": 20000, \"files\": [{\"name\": \"b=0/x.parquet\", \"size\": 1000, \"rows\": 100}, "
+                + "\"field_id\": 15, \"granularity_rows\": 20000, \"files\": ["
+                + "{\"name\": \"b=0/x.parquet\", \"size\": 1000, \"rows\": 100}, "
                 + "{\"name\": \"b=1/x.parquet\", \"size\": 2000, \"rows\": 200}], \"postings\": {\"v\": [0], \"w\": [1]}}";
         RapCoverage c = RapCoverage.fromJson(m, UUID, SNAP, eq("model", "v"));
         Assertions.assertTrue(c.isActive());

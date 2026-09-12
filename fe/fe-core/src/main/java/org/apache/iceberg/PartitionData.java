@@ -66,6 +66,20 @@ public class PartitionData
         }
     }
 
+    // Pinned to the serialVersionUID that upstream org.apache.iceberg.PartitionData computes
+    // (iceberg-core 1.10.x, verified identical in 1.10.0 and 1.10.1). This class deliberately
+    // shadows the upstream one in-package to add the schema cache above, and the extra static
+    // initializer changes the JVM's *computed* UID. That is invisible until something
+    // Java-serializes a PartitionData between two classloaders where one side sees this copy
+    // (fe-core-main.jar, which wins on the FE classpath) and the other sees upstream's
+    // (iceberg-core.jar in the BE's reader libs). The Fluss connector's IcebergSplit handoff does
+    // exactly that, and failed with:
+    //   InvalidClassException: org.apache.iceberg.PartitionData; local class incompatible:
+    //   stream serialVersionUID = 5861549261575484086, local = -2455556416558591026
+    // The serialized field set here is identical to upstream (partitionType, size, data,
+    // stringSchema; schema is transient), so pinning the UID makes the two wire-compatible.
+    private static final long serialVersionUID = -2455556416558591026L;
+
     private final Types.StructType partitionType;
     private final int size;
     private final Object[] data;

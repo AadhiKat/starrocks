@@ -284,11 +284,12 @@ public class FlussMetadata implements ConnectorMetadata {
         FlussTable flussTable = (FlussTable) table;
         TableInfo tableInfo = flussTable.getTableInfo();
         TableConfig tableConfig = tableInfo.getTableConfig();
+        DataLakeFormat lakeFormat = tableConfig.getDataLakeFormat().orElse(null);
         if (!tableConfig.isDataLakeEnabled()
-                || tableConfig.getDataLakeFormat().orElse(null) != DataLakeFormat.PAIMON) {
+                || (lakeFormat != DataLakeFormat.PAIMON && lakeFormat != DataLakeFormat.ICEBERG)) {
             throw new StarRocksConnectorException(
                     "Fluss table %s.%s.%s is not supported. StarRocks only supports reading Fluss tables with " +
-                            "'table.datalake.enabled' = 'true' and 'table.datalake.format' = 'paimon'",
+                            "'table.datalake.enabled' = 'true' and 'table.datalake.format' = 'paimon' or 'iceberg'",
                     catalogName, flussTable.getCatalogDBName(), flussTable.getCatalogTableName());
         }
 

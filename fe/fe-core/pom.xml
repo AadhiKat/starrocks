@@ -728,6 +728,17 @@ under the License.
             <groupId>org.apache.fluss</groupId>
             <artifactId>fluss-lake-paimon</artifactId>
         </dependency>
+        <!-- Required on the FE classpath, not just the BE reader's. FlussMetadata resolves the
+             LakeSource during split planning via
+             LakeStoragePluginSetUp.fromDataLakeFormat(format, null), which calls
+             ServiceLoader.load(LakeStoragePlugin.class, LakeStoragePlugin.class.getClassLoader()),
+             i.e. the loader that loaded fluss-common. Without this jar in fe/lib, catalog
+             creation and SHOW TABLES both succeed and the first real query then fails at
+             planning with "No LakeStoragePlugin available for data lake format: iceberg". -->
+        <dependency>
+            <groupId>org.apache.fluss</groupId>
+            <artifactId>fluss-lake-iceberg</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.apache.fluss</groupId>
             <artifactId>fluss-flink-common</artifactId>

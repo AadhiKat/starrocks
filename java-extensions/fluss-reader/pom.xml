@@ -15,6 +15,16 @@
         <java-extensions.home>${basedir}/../</java-extensions.home>
         <fluss.version>0.9.1-incubating</fluss.version>
         <paimon.version>1.3.1</paimon.version>
+        <!-- NOTE: iceberg.version is deliberately NOT overridden here. It is inherited from
+             java-extensions/pom.xml (1.10.0), which matches fe/pom.xml (1.10.0). Fluss 0.9.1
+             itself builds against 1.10.1, but the FE serializes the IcebergSplit (including
+             org.apache.iceberg.PartitionData) and the BE reader deserializes it via plain Java
+             serialization, so any version difference across that boundary is fatal:
+               InvalidClassException: org.apache.iceberg.PartitionData; local class incompatible:
+               stream serialVersionUID = 5861549261575484086, local = -2455556416558591026
+             PartitionData's serialVersionUID changed between 1.10.0 and 1.10.1, so FE and BE
+             MUST agree. "Patch-level skew is harmless" does not hold once Java serialization
+             crosses the FE/BE boundary. -->
     </properties>
 
     <dependencies>
@@ -77,6 +87,52 @@
             <artifactId>fluss-lake-paimon</artifactId>
             <version>${fluss.version}</version>
         </dependency>
+
+        <dependency>
+            <groupId>org.apache.fluss</groupId>
+            <artifactId>fluss-lake-iceberg</artifactId>
+            <version>${fluss.version}</version>
+        </dependency>
+
+        <!-- Iceberg pinned to the inherited ${iceberg.version} (1.10.0), matching fe/pom.xml.
+             This ALONE is not sufficient: see strip-shaded-iceberg.py in fluss-local/. The
+             shaded fluss-lake-iceberg jar must also have its unrelocated org/apache/iceberg
+             classes removed, otherwise the BE resolves PartitionData from the shaded 1.10.1 copy
+             while the FE resolves it from iceberg-core-1.10.0, and the split handoff fails with
+             InvalidClassException on mismatched serialVersionUID. -->
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-core</artifactId>
+            <version>${iceberg.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-api</artifactId>
+            <version>${iceberg.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-common</artifactId>
+            <version>${iceberg.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-bundled-guava</artifactId>
+            <version>${iceberg.version}</version>
+        </dependency>
+
+        <!-- Historical note on why the explicit deps above are required.
+             fluss-lake-iceberg-0.9.1-incubating.jar is a 36MB SHADED uber-jar carrying ~6270
+             org/apache/iceberg/* classes UNRELOCATED, including org.apache.iceberg.PartitionData
+             (built against Iceberg 1.10.1). Adding iceberg-core et al. puts a SECOND, different
+             PartitionData on the classpath, and whichever wins depends on classpath order. FE and
+             BE then resolve different copies and the split handoff dies with:
+               InvalidClassException: org.apache.iceberg.PartitionData; local class incompatible:
+               stream serialVersionUID = 5861549261575484086, local = -2455556416558591026
+             Relying solely on the bundled copy keeps a single definition in the reader.
+             NOTE FOR UPSTREAM: an unrelocated shaded jar is a packaging bug in fluss-lake-iceberg;
+             it collides with any host that already ships Iceberg (StarRocks ships 1.10.0 for its
+             own iceberg catalog). Worth filing against Fluss. -->
 
         <dependency>
             <groupId>org.apache.fluss</groupId>

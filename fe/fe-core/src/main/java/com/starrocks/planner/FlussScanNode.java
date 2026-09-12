@@ -43,8 +43,10 @@ import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.type.Type;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.flink.source.split.SourceSplitSerializer;
+import org.apache.fluss.lake.iceberg.source.IcebergLakeSource;
 import org.apache.fluss.lake.paimon.source.PaimonLakeSource;
 import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -153,7 +155,8 @@ public class FlussScanNode extends ScanNode {
 
         THdfsScanRange hdfsScanRange = new THdfsScanRange();
         hdfsScanRange.setUse_fluss_jni_reader(true);
-        hdfsScanRange.setFluss_split_info(encodeSplitToString(split));
+        hdfsScanRange.setFluss_split_info(encodeSplitToString(split,
+                flussTable.getTableInfo().getTableConfig().getDataLakeFormat().orElse(null)));
         hdfsScanRange.setJni_predicate_info(predicateInfo);
         hdfsScanRange.setFile_length(1);
         hdfsScanRange.setLength(1);
@@ -254,14 +257,28 @@ public class FlussScanNode extends ScanNode {
     private static final Base64.Encoder BASE64_ENCODER =
             Base64.getUrlEncoder().withoutPadding();
 
-    public static String encodeSplitToString(SourceSplitBase t) {
+    public static String encodeSplitToString(SourceSplitBase t, DataLakeFormat lakeFormat) {
         try {
-            LakeSource lakeSource = new PaimonLakeSource(null, null);
+            // The LakeSource here exists ONLY to supply the split serializer, so a config-less
+            // instance is fine (both implementations' constructors are plain field assignments).
+            // It must however match the table's lake format: SourceSplitSerializer delegates to
+            // lakeSource.getSplitSerializer(), which is typed to the concrete split class, so a
+            // Paimon serializer handed an IcebergSplit throws
+            //   ClassCastException: IcebergSplit cannot be cast to PaimonSplit
+            LakeSource lakeSource = createSplitSerializerSource(lakeFormat);
             SourceSplitSerializer serializer = new SourceSplitSerializer(lakeSource);
             byte[] bytes = serializer.serialize(t);
             return new String(BASE64_ENCODER.encode(bytes), UTF_8);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private static LakeSource createSplitSerializerSource(DataLakeFormat lakeFormat) {
+        if (lakeFormat == DataLakeFormat.ICEBERG) {
+            return new IcebergLakeSource(null, null);
+        }
+        // Default to Paimon, preserving prior behaviour when the format is absent.
+        return new PaimonLakeSource(null, null);
     }
 }

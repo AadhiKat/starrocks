@@ -28,9 +28,11 @@ import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.flink.source.split.SourceSplitSerializer;
+import org.apache.fluss.lake.iceberg.source.IcebergLakeSource;
 import org.apache.fluss.lake.paimon.source.PaimonLakeSource;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.row.InternalRow;
@@ -145,17 +147,24 @@ public class FlussSplitScanner extends ConnectorScanner {
 
             initOffHeapTableWriter(requiredTypes, requiredFields, fetchSize);
 
-            String dataLakePrefix = "table.datalake.paimon.";
-            Map<String, String> paimonProps = new HashMap<>();
+            // Resolve the lake format from the Fluss table itself rather than assuming Paimon.
+            // TableInfo is already available here (fetched above for the row type), so this needs
+            // no extra scanner param and no FE-side plumbing.
+            DataLakeFormat lakeFormat = table.getTableInfo().getTableConfig().getDataLakeFormat()
+                    .orElseThrow(() -> new IllegalStateException(String.format(
+                            "Fluss table %s.%s has no 'table.datalake.format'; cannot build a lake source.",
+                            dbName, tableName)));
+            // DataLakeFormat.toString() is overridden to the lowercase value ("paimon"/"iceberg"),
+            // so this yields e.g. "table.datalake.iceberg." -- matching the catalog properties.
+            String dataLakePrefix = "table.datalake." + lakeFormat + ".";
+            Map<String, String> lakeProps = new HashMap<>();
             for (Map.Entry<String, String> entry : conf.toMap().entrySet()) {
                 if (entry.getKey().startsWith(dataLakePrefix)) {
-                    paimonProps.put(entry.getKey().substring(dataLakePrefix.length()), entry.getValue());
+                    lakeProps.put(entry.getKey().substring(dataLakePrefix.length()), entry.getValue());
                 }
             }
-            Configuration paimonConfig = Configuration.fromMap(paimonProps);
-            @SuppressWarnings("unchecked")
-            LakeSource<LakeSplit> lakeSource = (LakeSource<LakeSplit>) (LakeSource<?>)
-                    new PaimonLakeSource(paimonConfig, TablePath.of(dbName, tableName));
+            LakeSource<LakeSplit> lakeSource = createLakeSource(
+                    lakeFormat, Configuration.fromMap(lakeProps), TablePath.of(dbName, tableName));
             List<Predicate> lakePredicates = decodeLakePredicates(predicateInfo);
             if (!lakePredicates.isEmpty()) {
                 lakeSource.withFilters(lakePredicates);
@@ -236,6 +245,26 @@ public class FlussSplitScanner extends ConnectorScanner {
             String msg = "Failed to get the next off-heap table chunk for " + dbName + "." + tableName;
             LOG.error(msg, e);
             throw new IOException(msg, e);
+        }
+    }
+
+    /**
+     * Build the lake source for the table's tiered format. Fluss's {@code LakeSource} SPI is
+     * format-neutral and both implementations share the same {@code (Configuration, TablePath)}
+     * constructor, so everything downstream of this call -- withFilters, withProject, the split
+     * serializer, and both delegate scanners -- is unchanged.
+     */
+    @SuppressWarnings("unchecked")
+    private static LakeSource<LakeSplit> createLakeSource(
+            DataLakeFormat format, Configuration lakeConfig, TablePath tablePath) {
+        switch (format) {
+            case PAIMON:
+                return (LakeSource<LakeSplit>) (LakeSource<?>) new PaimonLakeSource(lakeConfig, tablePath);
+            case ICEBERG:
+                return (LakeSource<LakeSplit>) (LakeSource<?>) new IcebergLakeSource(lakeConfig, tablePath);
+            default:
+                throw new UnsupportedOperationException(
+                        "StarRocks cannot read Fluss tables tiered to lake format: " + format);
         }
     }
 

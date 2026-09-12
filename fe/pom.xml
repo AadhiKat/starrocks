@@ -1496,6 +1496,11 @@ under the License.
             </dependency>
             <dependency>
                 <groupId>org.apache.fluss</groupId>
+                <artifactId>fluss-lake-iceberg</artifactId>
+                <version>${fluss.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.fluss</groupId>
                 <artifactId>fluss-flink-common</artifactId>
                 <version>${fluss.version}</version>
             </dependency>

@@ -142,7 +142,9 @@ ADD_BE_LIB(FormatParquet
         parquet/meta_helper.cpp
         parquet/group_reader.cpp
         parquet/file_reader.cpp
+        parquet/rap_index.cpp
         parquet/file_writer.cpp
+        parquet/rap_sidecar_builder.cpp
         parquet/chunk_writer.cpp
         parquet/level_builder.cpp
         parquet/column_chunk_writer.cpp

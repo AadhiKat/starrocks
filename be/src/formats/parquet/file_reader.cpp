@@ -34,6 +34,13 @@
 #include "exprs/chunk_predicate_evaluator.h"
 #include "formats/parquet/metadata.h"
 #include "formats/parquet/predicate_filter_evaluator.h"
+#include "common/config.h"
+#include "formats/parquet/rap_index.h"
+#include "cache/mem_cache/page_cache.h"
+#include "common/runtime_profile.h"
+#include "storage_primitive/column_predicate.h"
+#include "types/datum.h"
+#include "types/logical_type.h"
 #include "formats/parquet/utils.h"
 #include "fs/fs.h"
 #include "gen_cpp/parquet_types.h"
@@ -84,8 +91,209 @@ Status FileReader::init(FormatScanContext* ctx) {
         _runtime_filter_scan_range_pruner =
                 std::make_shared<RuntimeScanRangePruner>(*_scanner_ctx->runtime_filter_scan_range_pruner);
     }
+    _maybe_consult_rap_index();
+    if (_rap_ready && _rap_ranges.empty()) {
+        // a READY index says no row of this file matches the EQ / IN literal(s)
+        _is_file_filtered = true;
+        return Status::OK();
+    }
     RETURN_IF_ERROR(_init_group_readers());
     return Status::OK();
+}
+
+
+// RAP / lake-index slice m1. Consult a per-file sidecar index for EQ / IN predicates on the
+// indexed column, directly under the root AND of the predicate tree, BEFORE any row group is
+// prepared. READY -> the matching pages' row ranges (intersected with any transport hint) become
+// this file's selected ranges; an empty result means no row of this file matches. ABSENT ->
+// nothing. UNUSABLE -> counted, logged, and the scan proceeds unindexed and complete.
+void FileReader::_maybe_consult_rap_index() {
+    // CX-28: the WHOLE consult is timed -- cache lookup, any load, the postings lookup -- so a
+    // warm-cache consult has a measured cost rather than an inferred zero.
+    int64_t consult_ns = 0;
+    {
+        SCOPED_RAW_TIMER(&consult_ns);
+        _maybe_consult_rap_index_impl();
+    }
+    if (_scanner_ctx != nullptr && _scanner_ctx->stats != nullptr) _scanner_ctx->stats->rap_index_consult_ns += consult_ns;
+}
+
+void FileReader::_maybe_consult_rap_index_impl() {
+    _rap_ready = false;
+    _rap_ranges.clear();
+    const std::string& dir = config::rap_index_dir;
+    if (dir.empty() || _scanner_ctx == nullptr || _scanner_ctx->predicate_tree == nullptr ||
+        _scanner_ctx->predicate_tree->empty() || _file_metadata == nullptr) {
+        return;
+    }
+    FormatScannerStats* stats = _scanner_ctx->stats;
+    const PredicateTree& tree = *_scanner_ctx->predicate_tree;
+    const auto& root = tree.root();
+    const auto& cid_to_preds = tree.compound_node_context(root.id()).cid_to_col_preds(root);
+    for (const auto& [cid, preds] : cid_to_preds) {
+        std::string col;
+        for (const auto& mc : _scanner_ctx->materialized_columns) {
+            if (mc.slot_id() == static_cast<SlotId>(cid)) {
+                col = std::string(mc.name());
+                break;
+            }
+        }
+        if (col.empty()) continue;
+        std::vector<std::string> values;
+        bool supported = false;
+        for (const ColumnPredicate* p : preds) {
+            if (p == nullptr || p->type_info() == nullptr || !is_string_type(p->type_info()->type())) continue;
+            if (p->type() == PredicateType::kEQ) {
+                const Datum d = p->value();
+                if (d.is_null()) continue;
+                values.emplace_back(d.get_slice().to_string());
+                supported = true;
+            } else if (p->type() == PredicateType::kInList) {
+                for (const Datum& d : p->values()) {
+                    if (!d.is_null()) values.emplace_back(d.get_slice().to_string());
+                }
+                supported = true;
+            }
+        }
+        if (!supported) continue;
+        std::string base = _file->filename();
+        const auto slash = base.find_last_of('/');
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        int32_t field_id = -1;
+        const auto& schema = _file_metadata->schema();
+        const int32_t fidx = schema.get_field_idx_by_column_name(col);
+        if (fidx >= 0 && schema.exist_filed_id()) field_id = schema.get_stored_column_by_field_idx(fidx)->field_id;
+        if (stats != nullptr) stats->rap_index_consulted++;
+        // slice m2a: registered-state reuse. The parsed sidecar is cached in the reader's bounded page
+        // cache under the SAME identity StarRocks keys its footer cache with (CacheType::INDEX prefix
+        // "ix"). A hit skips the load entirely; a different file, or a rewritten one (size/mtime),
+        // misses by construction. UNUSABLE / ABSENT are not cached (re-examined on the next consult).
+        std::shared_ptr<RapIndex> index;
+        PageCacheHandle rap_cache_handle;
+        std::string rap_cache_key, rap_neg_key;
+        const bool cache_on = (_cache != nullptr && _scanner_ctx->options.use_file_metacache);
+        if (cache_on) {
+            // CX-27: the key is per (file identity, column) -- one file may carry indexes on
+            // several columns, and a hit must never hand one column's postings to another's predicate.
+            // slice 2f: the generation joins the key -- bumping rap_index_generation invalidates every entry
+            // slice 2f v2 (CX-45): both keys through RapIndex::cache_key -- disjoint namespaces, length-prefixed fields
+            const std::string file_key = ParquetUtils::get_file_cache_key(CacheType::INDEX, _file->filename(),
+                                                                          _datacache_options.modification_time, _file_size);
+            const std::string generation = std::string(config::rap_index_generation);
+            rap_cache_key = RapIndex::cache_key(false, file_key, col, generation, "");
+            if (_cache->lookup(rap_cache_key, &rap_cache_handle)) {
+                auto cached = *(reinterpret_cast<const std::shared_ptr<RapIndex>*>(rap_cache_handle.data()));
+                // CX-27: a cached object is applicable only if its identity matches what the loader
+                // would have validated -- same column, compatible field id, same file identity
+                const auto& id = cached->identity();
+                const bool compatible = id.column == col && id.file_name == base && id.file_size == _file_size &&
+                                        id.file_rows == static_cast<uint64_t>(_file_metadata->num_rows()) &&
+                                        (field_id < 0 || id.field_id < 0 || id.field_id == field_id);
+                if (compatible) {
+                    index = cached;
+                    if (stats != nullptr) stats->rap_index_cache_hit++;
+                } else {
+                    if (stats != nullptr) stats->rap_index_cache_incompatible++;
+                    // fall through to the load path, which refuses the mismatch and leaves the scan unindexed
+                }
+            }
+            if (index == nullptr) {
+                // slice 2f: a refused consult is remembered per DIRECTORY (absence is a fact about a directory, not
+                // about the file -- D3-e attempt 1); a hit here skips every filesystem call and repeats the outcome
+                rap_neg_key = RapIndex::cache_key(true, file_key, col, generation, dir);
+                PageCacheHandle neg_handle;
+                if (_cache->lookup(rap_neg_key, &neg_handle)) {
+                    const auto* neg = reinterpret_cast<const RapIndex::NegativeEntry*>(neg_handle.data());
+                    if (stats != nullptr) {
+                        stats->rap_index_negative_hit++;
+                        if (neg->unusable) stats->rap_index_unusable++;
+                        if (stats->rap_index_reason.empty() && !neg->reason.empty()) {
+                            stats->rap_index_reason = std::string(neg->unusable ? "unusable: " : "absent: ") + neg->reason;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        // slice 2f: remember a refusal under the negative key (small: a flag and the reason)
+        auto remember_negative = [&](bool unusable, const std::string& reason) {
+            if (!cache_on) return;
+            auto deleter = [](const starrocks::CacheKey& key, void* value) { delete (RapIndex::NegativeEntry*)value; };
+            MemCacheWriteOptions options;
+            options.evict_probability = _datacache_options.datacache_evict_probability;
+            auto* entry = new RapIndex::NegativeEntry{unusable, reason};
+            PageCacheHandle h;
+            Status st = _cache->insert(rap_neg_key, (void*)entry, static_cast<int64_t>(64 + reason.size()), deleter, options, &h);
+            if (!st.ok()) delete entry;
+        };
+        if (index == nullptr) {
+            RapIndex::Result res;
+            {
+                int64_t load_ns = 0;
+                {
+                    SCOPED_RAW_TIMER(&load_ns);
+                    // slice 2c: sidecars are read through the scan's own FileSystem (a gs:// dir works like a
+                    // local one); the per-column name <basename>.<column>.rapx is tried first, then the
+                    // milestone-1 name <basename>.rapx
+                    const RapIndex::Identity expect{base, _file_size, static_cast<uint64_t>(_file_metadata->num_rows()), col, field_id};
+                    // slice 2d: the DIRECTORY chooses the filesystem. A local directory (no scheme, or file://)
+                    // is read through the default filesystem even when the data file is remote -- the deployed
+                    // check's first attempts opened a local dir through the GCS filesystem and judged every
+                    // sidecar UNUSABLE. A remote directory (gs://, s3://, hdfs://) keeps slice 2c's behaviour:
+                    // the scan's own filesystem, with the data file's credentials.
+                    std::string rap_dir = dir;
+                    FileSystem* rap_fs = _scanner_ctx->fs;
+                    if (rap_dir.find("://") == std::string::npos) {
+                        rap_fs = nullptr; // FileSystem::Default()
+                    } else if (rap_dir.compare(0, 7, "file://") == 0) {
+                        rap_fs = nullptr;
+                        rap_dir = rap_dir.substr(7);
+                    }
+                    res = RapIndex::load(rap_fs, rap_dir + "/" + base + "." + col + RapIndex::kSuffix, expect);
+                    if (res.state == RapIndex::State::ABSENT) {
+                        res = RapIndex::load(rap_fs, rap_dir + "/" + base + RapIndex::kSuffix, expect);
+                    }
+                }
+                if (stats != nullptr) stats->rap_index_load_ns += load_ns;
+            }
+            if (res.state == RapIndex::State::ABSENT) {
+                // slice 2e: the first non-READY outcome explains itself in the profile (RapIndexConsultReason)
+                if (stats != nullptr && stats->rap_index_reason.empty() && !res.reason.empty()) {
+                    stats->rap_index_reason = "absent: " + res.reason;
+                }
+                remember_negative(false, res.reason); // slice 2f
+                return;
+            }
+            if (res.state == RapIndex::State::UNUSABLE) {
+                if (stats != nullptr) stats->rap_index_unusable++;
+                if (stats != nullptr && stats->rap_index_reason.empty()) stats->rap_index_reason = "unusable: " + res.reason;
+                remember_negative(true, res.reason); // slice 2f
+                LOG(WARNING) << "RAP index unusable for " << base << " (" << col << "): " << res.reason << "; scanning unindexed";
+                return;
+            }
+            index = std::shared_ptr<RapIndex>(std::move(res.index));
+            if (cache_on) {
+                if (stats != nullptr) stats->rap_index_cache_miss++;
+                auto deleter = [](const starrocks::CacheKey& key, void* value) { delete (std::shared_ptr<RapIndex>*)value; };
+                MemCacheWriteOptions options;
+                options.evict_probability = _datacache_options.datacache_evict_probability;
+                auto capture = std::make_unique<std::shared_ptr<RapIndex>>(index);
+                // size estimate: values plus 16 bytes per range plus a small per-value overhead
+                const int64_t approx = static_cast<int64_t>(index->approx_bytes());
+                Status st = _cache->insert(rap_cache_key, (void*)(capture.get()), approx, deleter, options, &rap_cache_handle);
+                if (st.ok()) capture.release();
+            }
+        }
+        if (stats != nullptr) stats->rap_index_ready++;
+        auto ranges = index->lookup(values);
+        if (!_scanner_ctx->selected_row_ranges.empty()) {
+            ranges = RapIndex::intersect(_scanner_ctx->selected_row_ranges, ranges);
+        }
+        if (stats != nullptr) stats->rap_index_ranges += static_cast<int>(ranges.size());
+        _rap_ranges = std::move(ranges);
+        _rap_ready = true;
+        return; // one indexed column per file in milestone 1
+    }
 }
 
 std::shared_ptr<MetaHelper> FileReader::_build_meta_helper() {
@@ -172,6 +380,14 @@ Status FileReader::_build_split_tasks() {
 bool FileReader::_filter_group(const GroupReaderPtr& group_reader) {
     bool& filtered = group_reader->get_is_group_filtered();
     filtered = false;
+    // astra CX-11: a row-range hint that selects nothing inside this group filters it
+    // outright. This runs before predicate evaluation because it holds regardless of
+    // whether any predicate exists -- with no predicates _filter_group() would
+    // otherwise keep the group and pass an empty range to page selection.
+    if (group_reader->hint_excludes_group()) {
+        filtered = true;
+        return filtered;
+    }
     DCHECK(_scanner_ctx->predicate_tree != nullptr);
     const PredicateTree& predicate_tree = *_scanner_ctx->predicate_tree;
     auto visitor = PredicateFilterEvaluator{predicate_tree, group_reader.get(),
@@ -192,8 +408,14 @@ bool FileReader::_filter_group(const GroupReaderPtr& group_reader) {
             // no rows selected, the whole row group can be filtered
             filtered = true;
         } else if (sparse_range.value()->span_size() < group_reader->get_row_group_metadata()->num_rows) {
-            // some pages have been filtered
-            group_reader->get_range() = sparse_range.value().value();
+            // some pages have been filtered. astra CX-11: INTERSECT with whatever the
+            // row-range transport already selected instead of overwriting it, so the
+            // two pruning sources compose.
+            group_reader->intersect_range(sparse_range.value().value());
+            if (group_reader->get_range().span_size() == 0) {
+                // hint and predicate pruning are disjoint: nothing left in this group
+                filtered = true;
+            }
         }
     }
     return filtered;
@@ -289,6 +511,13 @@ Status FileReader::_init_group_readers() {
     _group_reader_param.file_size = _file_size;
     _group_reader_param.datacache_options = &_datacache_options;
     _group_reader_param.scan_range_id = _scanner_ctx->scan_range_id;
+    // RAP row-range transport: empty stays nullptr so the no-hint path is untouched.
+    _group_reader_param.selected_row_ranges =
+            _scanner_ctx->selected_row_ranges.empty() ? nullptr : &_scanner_ctx->selected_row_ranges;
+    // RAP slice m1: a READY index's ranges (already intersected with any transport hint) take over.
+    if (_rap_ready && !_rap_ranges.empty()) {
+        _group_reader_param.selected_row_ranges = &_rap_ranges;
+    }
 
     int64_t row_group_first_row = 0;
     // select and create row group readers.

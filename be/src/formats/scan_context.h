@@ -44,6 +44,7 @@ namespace starrocks {
 class ExprContext;
 class PredicateTree;
 class RuntimeScanRangePruner;
+class FileSystem; // RAP / lake-index slice 2c
 struct FileScanSplitContext;
 class TIcebergSchema;
 
@@ -154,6 +155,18 @@ struct FormatScannerStats {
     int page_index_tried_counter = 0;
     int page_index_filter_group_counter = 0;
     int page_index_success_counter = 0;
+    // RAP / lake-index slice m1
+    int rap_index_consulted = 0;
+    int rap_index_ready = 0;
+    int rap_index_unusable = 0;
+    int rap_index_ranges = 0;
+    int rap_index_cache_hit = 0;
+    int rap_index_cache_miss = 0;
+    int64_t rap_index_load_ns = 0;   // cold parse time, reported separately
+    int rap_index_cache_incompatible = 0;   // CX-27: a hit whose identity did not match the predicate column
+    int64_t rap_index_consult_ns = 0;       // CX-28: the whole consult, request-time
+    std::string rap_index_reason;           // slice 2e: first non-READY consult outcome ("absent: ..." / "unusable: ...")
+    int rap_index_negative_hit = 0;         // slice 2f: a refused consult answered from the cache (no filesystem call)
 };
 
 // Immutable scan options derived from the query plan node, embedded by value
@@ -219,6 +232,14 @@ struct FormatColumnInfo {
     const TypeDescriptor& slot_type() const { return slot_desc->type(); }
 };
 
+// RAP / lake-index row-range transport: a half-open interval of absolute row
+// positions within one data file, [start_row, end_row). Thrift-free mirror of
+// TRowRange so format readers do not depend on THdfsScanRange.
+struct RowRangeHint {
+    int64_t start_row = 0;
+    int64_t end_row = 0;
+};
+
 struct FormatScanContext {
     FormatScannerOptions options;
     FormatScannerStats* stats = nullptr;
@@ -267,6 +288,14 @@ struct FormatScanContext {
     int64_t scan_range_offset = 0;
     int64_t scan_range_length = std::numeric_limits<int64_t>::max();
     int32_t scan_range_id = -1;
+    // RAP / lake-index row-range transport. Converted from
+    // THdfsScanRange.selected_row_ranges at the scanner boundary. Absolute,
+    // ascending, non-overlapping half-open row intervals within the data file;
+    // empty means "no hint" and the scan is unchanged.
+    std::vector<RowRangeHint> selected_row_ranges;
+    // RAP / lake-index slice 2c: the scan's FileSystem, so a sidecar next to the data file is read
+    // through the same connector (gs://, hdfs://, local). Null -> FileSystem::Default().
+    FileSystem* fs = nullptr;
     std::map<int32_t, TExprMinMaxValue> min_max_values;
     std::map<int32_t, TExpr> extended_column_exprs;
     std::optional<int64_t> first_row_id;

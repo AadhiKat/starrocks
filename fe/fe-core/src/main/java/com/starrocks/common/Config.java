@@ -101,6 +101,11 @@ public class Config extends ConfigBase {
      */
     @ConfField
     public static String sys_log_dir = Config.STARROCKS_HOME_DIR + "/log";
+
+    // RAP / lake-index slice 2b: directory holding per-snapshot index manifests
+    // (<dir>/<table_uuid>/<snapshot_id>.rapm.json). Empty = the FE consults no manifest.
+    @ConfField(mutable = true)
+    public static String rap_manifest_dir = "";
     @ConfField
     public static String sys_log_level = "INFO";
     @ConfField

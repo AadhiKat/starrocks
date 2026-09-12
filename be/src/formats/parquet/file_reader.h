@@ -118,6 +118,12 @@ private:
     FormatScanContext* _scanner_ctx = nullptr;
     SharedBufferedInputStream* _sb_stream = nullptr;
     GroupReaderParam _group_reader_param;
+    // RAP / lake-index slice m1: ranges produced by a READY sidecar index (already intersected
+    // with any transport hint). _rap_ready with an empty vector means no row of this file matches.
+    std::vector<RowRangeHint> _rap_ranges;
+    bool _rap_ready = false;
+    void _maybe_consult_rap_index();
+    void _maybe_consult_rap_index_impl();
     std::shared_ptr<MetaHelper> _meta_helper = nullptr;
     SkipRowsContextPtr _skip_rows_ctx = nullptr;
     std::shared_ptr<RuntimeScanRangePruner> _runtime_filter_scan_range_pruner;

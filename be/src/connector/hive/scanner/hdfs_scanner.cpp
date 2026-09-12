@@ -40,6 +40,19 @@ Status HdfsScanner::init(RuntimeState* runtime_state, HdfsScannerContext* scanne
     return Status::OK();
 }
 
+void build_row_range_hints(const std::vector<TRowRange>& src, std::vector<RowRangeHint>* dst) {
+    dst->clear();
+    dst->reserve(src.size());
+    for (const auto& r : src) {
+        // Clamp a negative start to 0 rather than rejecting: over-selecting is safe,
+        // under-selecting is not. Drop anything empty or inverted.
+        const int64_t start = std::max<int64_t>(0, r.start_row);
+        if (start < r.end_row) {
+            dst->push_back(RowRangeHint{start, r.end_row});
+        }
+    }
+}
+
 Status HdfsScanner::_build_scanner_context() {
     HdfsScannerContext& ctx = *_scanner_ctx;
 
@@ -71,6 +84,13 @@ Status HdfsScanner::_build_scanner_context() {
     }
     if (ctx.scan_range->__isset.first_row_id) {
         ctx.format_scan_context.first_row_id = ctx.scan_range->first_row_id;
+    }
+    // RAP / lake-index row-range transport. Convert TRowRange -> RowRangeHint here so
+    // format readers never depend on THdfsScanRange. Ranges are dropped if malformed;
+    // an empty result means "no hint" and the scan is unchanged.
+    ctx.format_scan_context.selected_row_ranges.clear();
+    if (ctx.scan_range->__isset.selected_row_ranges) {
+        build_row_range_hints(ctx.scan_range->selected_row_ranges, &ctx.format_scan_context.selected_row_ranges);
     }
 
     Columns& partition_values = ctx.format_scan_context.partition_values;
@@ -133,6 +153,7 @@ Status HdfsScanner::_build_scanner_context() {
     ctx.slot_descs = _scanner_ctx->tuple_desc->slots();
     ctx.format_scan_context.timezone = _runtime_state->timezone();
     ctx.format_scan_context.stats = &_app_stats;
+    ctx.format_scan_context.fs = _scanner_ctx->fs; // RAP / lake-index slice 2c: sidecars read through the scan's filesystem
 
     ScanConjunctsManagerOptions opts;
     opts.conjunct_ctxs_ptr = &_scanner_ctx->format_scan_context.conjuncts.all_ctxs;

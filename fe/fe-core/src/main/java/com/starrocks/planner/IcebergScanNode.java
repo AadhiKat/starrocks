@@ -39,6 +39,7 @@ import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
+import com.starrocks.connector.iceberg.RapCoverage;
 import com.starrocks.sql.plan.HDFSScanNodePredicates;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.THdfsScanNode;
@@ -242,6 +243,12 @@ public class IcebergScanNode extends ScanNode {
         scanRangeSource = new IcebergConnectorScanRangeSource(icebergTable,
                 remoteFileInfoSource, morParams, desc, bucketProperties, partitionIdGenerator, false,
                 scanOptimizeOption.getCanUseMinMaxOpt(), usedForDelete);
+        // RAP / lake-index slice 2b: per-snapshot manifest -> completeness rule on the planned files.
+        // Off unless Config.rap_manifest_dir is set; never consulted for the delete-file scan.
+        if (!usedForDelete && morParams.getScanTaskType() != IcebergMORParams.ScanTaskType.EQ_DELETE) {
+            scanRangeSource.setRapCoverage(RapCoverage.load(icebergTable.getNativeTable(), getBaseSnapshotId(),
+                    icebergJobPlanningPredicate));
+        }
     }
 
     private void setupCloudCredential() {
@@ -362,6 +369,9 @@ public class IcebergScanNode extends ScanNode {
         if (tvrVersionRange != null) {
             output.append(prefix).append("TABLE VERSION: ").append(
                     tvrVersionRange.toString()).append("\n");
+        }
+        if (scanRangeSource != null && scanRangeSource.getRapCoverage() != null) {
+            output.append(prefix).append(scanRangeSource.getRapCoverage().explain()).append("\n");
         }
 
         output.append(prefix).append(String.format("cardinality=%s", cardinality));

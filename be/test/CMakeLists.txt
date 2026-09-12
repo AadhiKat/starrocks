@@ -110,6 +110,7 @@ set(EXEC_FILES
         ./formats/parquet/column_converter_test.cpp
         ./formats/parquet/column_reader_factory_test.cpp
         ./formats/parquet/parquet_file_writer_test.cpp
+        ./formats/parquet/rap_sidecar_builder_test.cpp
         ./formats/parquet/parquet_footer_test.cpp
         ./formats/parquet/parquet_cli_reader.h
         ./formats/parquet/parquet_cli_reader_test.cpp
@@ -118,6 +119,7 @@ set(EXEC_FILES
         ./formats/parquet/parquet_pos_reader_test.cpp
         ./formats/parquet/iceberg_row_id_reader_test.cpp
         ./formats/parquet/page_index_test.cpp
+        ./formats/parquet/rap_index_test.cpp
         ./formats/parquet/dict_encoding_test.cpp
         ./formats/parquet/statistics_helper_test.cpp
         ./http/default_path_handlers_test.cpp

@@ -14,6 +14,15 @@
 
 #include "formats/parquet/parquet_file_writer.h"
 
+#include "formats/parquet/rap_sidecar_builder.h"
+#include <algorithm>
+#include <sstream>
+#include <unordered_map>
+
+#include "common/config.h"
+#include "base/time/time.h"
+#include "fs/fs.h"
+
 #include <fmt/core.h>
 #include <glog/logging.h>
 #include <parquet/exception.h>
@@ -32,6 +41,7 @@
 
 #include "base/failpoint/fail_point.h"
 #include "column/column_helper.h"
+#include "column/chunk.h"
 #include "common/http/content_type.h"
 #include "common/thread/priority_thread_pool.hpp"
 #include "common/util/debug_util.h"
@@ -63,6 +73,18 @@ Status ParquetFileWriter::write(Chunk* chunk) {
     }
 
     RETURN_IF_ERROR(_rowgroup_writer->write(chunk));
+    // RAP slice 3a: observe the WRITTEN values -- the very ColumnPtr the row-group writer's evaluation produced
+    // for this chunk (memoized by _eval_func). astra CX-36: never evaluate a second time; a stateful or failing
+    // evaluator would otherwise index values the file does not hold, or fail after the data was written.
+    for (auto& [idx, builder] : _rap_builders) {
+        auto it = _rap_eval_cache.find(idx);
+        if (it == _rap_eval_cache.end() || it->second.first != chunk) {
+            return Status::InternalError("RAP export: indexed column was not evaluated by the row-group writer");
+        }
+        builder->observe(*it->second.second, _rap_rows_seen);
+    }
+    _rap_eval_cache.clear();
+    _rap_rows_seen += static_cast<int64_t>(chunk->num_rows());
 
     FAIL_POINT_TRIGGER_EXECUTE(parquet_writer_rowgroup_write_failed, { _writer_options->rowgroup_size = 0; });
     if (_rowgroup_writer->estimated_buffered_bytes() >= _writer_options->rowgroup_size) {
@@ -96,10 +118,56 @@ FileCommitResult ParquetFileWriter::close() {
     if (result.io_status.ok()) {
         result.file_statistics = _statistics(_writer->metadata().get(), _writer_options->column_ids.has_value());
         result.file_statistics.file_size = _output_stream->Tell().MoveValueUnsafe();
+        _write_rap_sidecars(&result);
     }
 
     _writer = nullptr;
     return result;
+}
+
+// RAP slice 3a. Advisory: a failed sidecar never fails the data file (its absence is the ordinary scan);
+// a rolled-back data file takes its sidecars with it.
+void ParquetFileWriter::_write_rap_sidecars(FileCommitResult* result) {
+    if (_rap_builders.empty() || _rap_fs == nullptr) return;
+    int64_t t0 = MonotonicNanos();
+    std::string base = _location;
+    const auto slash = base.find_last_of('/');
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    const uint64_t rows = static_cast<uint64_t>(result->file_statistics.record_count);
+    const uint64_t size = static_cast<uint64_t>(result->file_statistics.file_size);
+    std::vector<std::string> written_paths;
+    for (auto& [idx, builder] : _rap_builders) {
+        const std::string path = builder->sidecar_path(_rap_dir, base);
+        const std::string bytes = builder->encode(base, size, rows);
+        auto st = [&]() -> Status {
+            ASSIGN_OR_RETURN(auto file, _rap_fs->new_writable_file(WritableFileOptions{.mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE}, path));
+            RETURN_IF_ERROR(file->append(Slice(bytes)));
+            return file->close();
+        }();
+        if (!st.ok()) {
+            _rap_stats.failures++;
+            LOG(WARNING) << "RAP sidecar not written for " << base << " (" << builder->column() << "): " << st.message() << "; the file scans unindexed";
+            continue;
+        }
+        _rap_stats.sidecars_written++;
+        _rap_stats.sidecar_bytes += static_cast<int64_t>(bytes.size());
+        written_paths.push_back(path);
+    }
+    _rap_stats.build_ns += MonotonicNanos() - t0;
+    if (!written_paths.empty()) {
+        auto orig = result->rollback_action;
+        auto fs = _rap_fs;
+        result->rollback_action = [orig, fs, written_paths]() {
+            if (orig) orig();
+            for (const auto& p : written_paths) WARN_IF_ERROR(ignore_not_found(fs->delete_file(p)), "fail to delete sidecar");
+        };
+    }
+}
+
+void ParquetFileWriter::set_rap_export(std::shared_ptr<FileSystem> fs, std::string dir, std::vector<std::string> columns) {
+    _rap_fs = std::move(fs);
+    _rap_dir = std::move(dir);
+    _rap_columns = std::move(columns);
 }
 
 int64_t ParquetFileWriter::get_written_bytes() {
@@ -271,7 +339,33 @@ Status ParquetFileWriter::init() {
     for (auto& e : _column_evaluators) {
         RETURN_IF_ERROR(e->init());
     }
-    _eval_func = [&](Chunk* chunk, size_t col_idx) { return _column_evaluators[col_idx]->evaluate(chunk); };
+    // RAP slice 3a: one builder per listed column that exists in this file and is a string column
+    _rap_builders.clear();
+    if (_rap_fs != nullptr && !_rap_dir.empty()) {
+        for (size_t i = 0; i < _column_names.size(); ++i) {
+            if (std::find(_rap_columns.begin(), _rap_columns.end(), _column_names[i]) == _rap_columns.end()) continue;
+            if (!_type_descs[i].is_string_type()) continue;
+            int32_t field_id = -1;
+            if (_writer_options->column_ids.has_value() && i < _writer_options->column_ids->size()) {
+                field_id = (*_writer_options->column_ids)[i].field_id;
+            }
+            _rap_builders.emplace_back(i, std::make_unique<RapSidecarBuilder>(_column_names[i], field_id));
+        }
+    }
+    _eval_func = [&](Chunk* chunk, size_t col_idx) -> StatusOr<ColumnPtr> {
+        // RAP slice 3a (astra CX-36): an indexed column is evaluated ONCE per chunk. The row-group writer's call lands
+        // here first and its result is kept for the sidecar builder, so both see the same ColumnPtr and a second
+        // evaluation never happens.
+        const bool indexed = std::any_of(_rap_builders.begin(), _rap_builders.end(),
+                                         [&](const auto& b) { return b.first == col_idx; });
+        if (indexed) {
+            auto it = _rap_eval_cache.find(col_idx);
+            if (it != _rap_eval_cache.end() && it->second.first == chunk) return it->second.second;
+        }
+        auto r = _column_evaluators[col_idx]->evaluate(chunk);
+        if (indexed && r.ok()) _rap_eval_cache[col_idx] = std::make_pair(chunk, r.value());
+        return r;
+    };
 
     auto status = [&]() {
         if (_writer_options->column_ids.has_value()) {
@@ -380,6 +474,22 @@ StatusOr<WriterAndStream> ParquetFileWriterFactory::create(const std::string& pa
     auto writer = std::make_unique<ParquetFileWriter>(path, parquet_output_stream, _column_names, types,
                                                       std::move(column_evaluators), _compression_type, _parsed_options,
                                                       rollback_action, _nullable);
+    {
+        // RAP slice 3a: index at export, off unless both configs are set
+        const std::string rap_dir = config::rap_export_index_dir;
+        const std::string rap_cols = config::rap_export_index_columns;
+        if (!rap_dir.empty() && !rap_cols.empty()) {
+            std::vector<std::string> cols;
+            std::stringstream ss(rap_cols);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                item.erase(0, item.find_first_not_of(" \t"));
+                item.erase(item.find_last_not_of(" \t") + 1);
+                if (!item.empty()) cols.push_back(item);
+            }
+            writer->set_rap_export(_fs, rap_dir, std::move(cols));
+        }
+    }
     return WriterAndStream{
             .stream = std::move(async_output_stream),
             .writer = std::move(writer),

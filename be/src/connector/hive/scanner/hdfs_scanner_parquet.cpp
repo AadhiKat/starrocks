@@ -136,11 +136,31 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     RuntimeProfile::Counter* statistics_success_counter = nullptr;
     RuntimeProfile::Counter* page_index_tried_counter = nullptr;
     RuntimeProfile::Counter* page_index_success_counter = nullptr;
+    RuntimeProfile::Counter* rap_index_consulted = nullptr;
+    RuntimeProfile::Counter* rap_index_ready = nullptr;
+    RuntimeProfile::Counter* rap_index_unusable = nullptr;
+    RuntimeProfile::Counter* rap_index_ranges = nullptr;
+    RuntimeProfile::Counter* rap_index_cache_hit = nullptr;
+    RuntimeProfile::Counter* rap_index_cache_miss = nullptr;
+    RuntimeProfile::Counter* rap_index_load_timer = nullptr;
+    RuntimeProfile::Counter* rap_index_cache_incompatible = nullptr;
+    RuntimeProfile::Counter* rap_index_consult_timer = nullptr;
+    RuntimeProfile::Counter* rap_index_negative_hit = nullptr;
     RuntimeProfile::Counter* page_index_filter_group_counter = nullptr;
     RuntimeProfile::Counter* bloom_filter_tried_counter = nullptr;
     RuntimeProfile::Counter* bloom_filter_success_counter = nullptr;
 
     request_bytes_read = ADD_CHILD_COUNTER(root, "RequestBytesRead", TUnit::BYTES, kParquetProfileSectionPrefix);
+    rap_index_consulted = ADD_CHILD_COUNTER(root, "RapIndexConsulted", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_index_ready = ADD_CHILD_COUNTER(root, "RapIndexReady", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_index_unusable = ADD_CHILD_COUNTER(root, "RapIndexUnusable", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_index_ranges = ADD_CHILD_COUNTER(root, "RapIndexRanges", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_index_cache_hit = ADD_CHILD_COUNTER(root, "RapIndexCacheHit", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_index_cache_miss = ADD_CHILD_COUNTER(root, "RapIndexCacheMiss", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_index_load_timer = ADD_CHILD_TIMER(root, "RapIndexLoadTime", kParquetProfileSectionPrefix);
+    rap_index_cache_incompatible = ADD_CHILD_COUNTER(root, "RapIndexCacheIncompatible", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_index_consult_timer = ADD_CHILD_TIMER(root, "RapIndexConsultTime", kParquetProfileSectionPrefix);
+    rap_index_negative_hit = ADD_CHILD_COUNTER(root, "RapIndexNegativeHit", TUnit::UNIT, kParquetProfileSectionPrefix);
     request_bytes_read_uncompressed =
             ADD_CHILD_COUNTER(root, "RequestBytesReadUncompressed", TUnit::BYTES, kParquetProfileSectionPrefix);
 
@@ -239,6 +259,20 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     COUNTER_UPDATE(statistics_success_counter, _app_stats.statistics_success_counter);
     COUNTER_UPDATE(page_index_tried_counter, _app_stats.page_index_tried_counter);
     COUNTER_UPDATE(page_index_success_counter, _app_stats.page_index_success_counter);
+    COUNTER_UPDATE(rap_index_consulted, _app_stats.rap_index_consulted);
+    COUNTER_UPDATE(rap_index_ready, _app_stats.rap_index_ready);
+    COUNTER_UPDATE(rap_index_unusable, _app_stats.rap_index_unusable);
+    COUNTER_UPDATE(rap_index_ranges, _app_stats.rap_index_ranges);
+    COUNTER_UPDATE(rap_index_cache_hit, _app_stats.rap_index_cache_hit);
+    COUNTER_UPDATE(rap_index_cache_miss, _app_stats.rap_index_cache_miss);
+    COUNTER_UPDATE(rap_index_load_timer, _app_stats.rap_index_load_ns);
+    COUNTER_UPDATE(rap_index_cache_incompatible, _app_stats.rap_index_cache_incompatible);
+    COUNTER_UPDATE(rap_index_consult_timer, _app_stats.rap_index_consult_ns);
+    COUNTER_UPDATE(rap_index_negative_hit, _app_stats.rap_index_negative_hit);
+    // slice 2e: the first non-READY consult outcome, as an info string (absent when every consult was READY)
+    if (!_app_stats.rap_index_reason.empty()) {
+        root->add_info_string("RapIndexConsultReason", _app_stats.rap_index_reason.substr(0, 200));
+    }
     COUNTER_UPDATE(page_index_filter_group_counter, _app_stats.page_index_filter_group_counter);
     COUNTER_UPDATE(bloom_filter_tried_counter, _app_stats.bloom_filter_tried_counter);
     COUNTER_UPDATE(bloom_filter_success_counter, _app_stats.bloom_filter_success_counter);

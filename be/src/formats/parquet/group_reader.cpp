@@ -94,13 +94,92 @@ Status GroupReader::init() {
     RETURN_IF_ERROR(_create_column_readers());
     _process_columns_and_conjunct_ctxs();
     _range = SparseRange<uint64_t>(_row_group_first_row, _row_group_first_row + _row_group_metadata->num_rows);
+    _apply_selected_row_ranges();
     return Status::OK();
+}
+
+// RAP / lake-index row-range transport.
+//
+// Narrow _range to the intersection of this row group's span with the externally
+// supplied row ranges. prepare() calls select_offset_index() precisely when
+// _range.span_size() differs from the row-group row count, so intersecting here is
+// all that is needed to make pages be skipped rather than fetched.
+//
+// Conservative by construction: an empty or absent hint leaves _range untouched, and
+// a hint that selects nothing inside this row group leaves an empty range, which
+// prunes the whole group. Ranges outside this group are ignored rather than treated
+// as an error, because one file's hint is shared by all of its row groups.
+void GroupReader::_apply_selected_row_ranges() {
+    if (_param.selected_row_ranges == nullptr || _param.selected_row_ranges->empty()) {
+        return;
+    }
+    const uint64_t group_begin = _row_group_first_row;
+    const uint64_t group_end = _row_group_first_row + _row_group_metadata->num_rows;
+
+    SparseRange<uint64_t> hinted;
+    bool any_valid = false;
+    for (const auto& r : *_param.selected_row_ranges) {
+        if (r.start_row >= r.end_row || r.end_row <= 0) {
+            continue; // empty, malformed, or wholly negative interval
+        }
+        any_valid = true;
+        const auto begin = std::max<uint64_t>(group_begin, static_cast<uint64_t>(std::max<int64_t>(0, r.start_row)));
+        const auto end = std::min<uint64_t>(group_end, static_cast<uint64_t>(r.end_row));
+        if (begin < end) {
+            hinted.add(Range<uint64_t>(begin, end));
+        }
+    }
+    // If every interval was malformed, treat the hint as ABSENT rather than as "nothing
+    // matches". Over-selecting only costs IO; under-selecting drops rows, so a garbled
+    // hint must never be able to empty the scan. A hint that is well-formed but simply
+    // does not intersect this row group DOES leave _range empty, which correctly prunes
+    // the group.
+    if (!any_valid) {
+        return;
+    }
+    // astra CX-11: an empty intersection is a LEGITIMATE outcome -- a file-level hint
+    // naturally misses some of that file's row groups. It must NOT be written into
+    // _range: prepare() runs select_offset_index() whenever span_size() != num_rows,
+    // and that function reads range[0] with no size check. Flag the group for
+    // filtering instead and leave _range untouched.
+    if (hinted.span_size() == 0) {
+        _hint_excludes_group = true;
+        return;
+    }
+    _range = hinted;
+}
+
+// astra CX-11: compose, don't replace. Built-in page pruning previously assigned over
+// get_range(), which would erase a transport hint entirely.
+void GroupReader::intersect_range(const SparseRange<uint64_t>& other) {
+    SparseRange<uint64_t> out;
+    const size_t n = _range.size(), m = other.size();
+    size_t i = 0, j = 0;
+    while (i < n && j < m) {
+        const Range<uint64_t> a = _range[i];
+        const Range<uint64_t> b = other[j];
+        const uint64_t begin = std::max(a.begin(), b.begin());
+        const uint64_t end = std::min(a.end(), b.end());
+        if (begin < end) {
+            out.add(Range<uint64_t>(begin, end));
+        }
+        if (a.end() <= b.end()) {
+            ++i;
+        } else {
+            ++j;
+        }
+    }
+    _range = out;
 }
 
 Status GroupReader::prepare() {
     RETURN_IF_ERROR(_prepare_column_readers());
 
-    if (_range.span_size() != get_row_group_metadata()->num_rows) {
+    // astra CX-11: select_offset_index() indexes range[0] unconditionally, so an empty
+    // range must never reach it. An empty selection means the group has no matching
+    // rows and should already have been filtered upstream; this guard is defence in
+    // depth for any other path that could narrow _range to nothing.
+    if (_range.size() != 0 && _range.span_size() != get_row_group_metadata()->num_rows) {
         for (const auto& pair : _column_readers) {
             pair.second->select_offset_index(_range, _row_group_first_row);
         }

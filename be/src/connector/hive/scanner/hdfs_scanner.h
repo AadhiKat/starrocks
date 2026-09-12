@@ -28,6 +28,12 @@
 
 namespace starrocks {
 
+// RAP / lake-index row-range transport: convert THdfsScanRange's TRowRange list into
+// the thrift-free RowRangeHint the format readers consume. Malformed or negative
+// intervals are dropped; an empty result means "no hint" and leaves the scan unchanged.
+// Free function so it is directly unit-testable (astra CX-12).
+void build_row_range_hints(const std::vector<TRowRange>& src, std::vector<RowRangeHint>* dst);
+
 class HdfsScanner {
 public:
     HdfsScanner() = default;

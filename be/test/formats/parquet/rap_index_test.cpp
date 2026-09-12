@@ -250,7 +250,7 @@ public:
         _runtime_state = _pool.add(new RuntimeState(TQueryGlobals()));
         _fragment_dict_state = std::make_unique<FragmentDictState>();
         _runtime_state->set_fragment_dict_state(_fragment_dict_state.get());
-        _fixture_dir = env_or("RAP_FIXTURE_DIR", "/root/fixtures/n5m");
+        _fixture_dir = env_or("RAP_FIXTURE_DIR", "/root/fixtures/n5m/data"); // slice 2g v2: under a data/ root
         _index_dir = env_or("RAP_INDEX_DIR", "/root/fixtures/n5m/idx");
         _saved_dir = config::rap_index_dir;
     }
@@ -1350,7 +1350,7 @@ static std::string rekey_sidecar(const std::string& b, const std::string& new_na
 
 TEST_F(RapIndexTest, KeyOfUnpartitionedPathIsBasename) { // a
     EXPECT_EQ(RapIndex::key_of("gs://b/t/data/x.parquet"), "x.parquet");
-    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/x.parquet"), "x.parquet");
+    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/data/x.parquet"), "x.parquet");
 }
 
 TEST_F(RapIndexTest, KeyOfPartitionedPathKeepsPartitionDirs) { // b
@@ -1362,10 +1362,11 @@ TEST_F(RapIndexTest, KeyUsesLastDataSegment) { // c
     EXPECT_EQ(RapIndex::key_of("gs://b/data/t/data/p=data/x.parquet"), "p=data/x.parquet");
 }
 
-TEST_F(RapIndexTest, KeyWithoutDataRootIsBasename) { // d
-    EXPECT_EQ(RapIndex::key_of("gs://b/t/other/x.parquet"), "x.parquet");
+TEST_F(RapIndexTest, KeyWithoutDataRootIsTheFullPath) { // d (v2: never the basename)
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/other/x.parquet"), "b/t/other/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/x.parquet"), "root/fixtures/n5m/x.parquet");
     EXPECT_EQ(RapIndex::key_of("x.parquet"), "x.parquet");
-    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/"), "");
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/"), "b/t/data/");
 }
 
 // e. Two copies of the fixture file with the SAME basename under data/b=0/ and data/b=1/, one sidecar per KEY under
@@ -1409,6 +1410,51 @@ TEST_F(RapIndexTest, TwoFilesSameBasenameDifferentPartitionsEachReady) {
     EXPECT_EQ(none.stats_delta.rap_index_ready, 0) << "no sidecar under b=2/: ABSENT, not another partition's";
     EXPECT_EQ(none.stats_delta.rap_index_unusable, 0);
     EXPECT_EQ(none.planned_bytes, base.planned_bytes);
+    fs::remove_all(tmp);
+}
+
+// slice 2g v2 (m36 review). j: two custom-root paths with one basename get two keys (the basename fallback gave one).
+TEST_F(RapIndexTest, FallbackKeysDistinguishCustomRoots) {
+    EXPECT_EQ(RapIndex::key_of("gs://b/custom/p=0/x.parquet"), "b/custom/p=0/x.parquet");
+    EXPECT_NE(RapIndex::key_of("gs://b/custom/p=0/x.parquet"), RapIndex::key_of("gs://b/custom/p=1/x.parquet"));
+}
+
+// k. Two byte-identical copies of the fixture (equal size, equal rows) under custom roots with no data/ segment; a sidecar
+//    only for p=0, at its full-path key. p=0 is READY from it; p=1 is ABSENT -- never answered by p=0's sidecar. Under the
+//    basename fallback both paths share one key and one sidecar answers both (the m36 review's aliasing).
+TEST_F(RapIndexTest, TwoEqualFilesUnderCustomRootsNotAliased) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / ("rap_2gv2_" + std::to_string(::getpid()));
+    for (const char* b : {"p=0", "p=1"}) fs::create_directories(tmp / "custom" / b);
+    const std::string f0 = _fixture_dir + "/" + kFile0;
+    const std::string p0 = (tmp / "custom" / "p=0" / kFile0).string(), p1 = (tmp / "custom" / "p=1" / kFile0).string();
+    fs::copy_file(f0, p0); fs::copy_file(f0, p1);
+    ASSERT_EQ(fs::file_size(p0), fs::file_size(p1));
+    const std::string key0 = RapIndex::key_of(p0);
+    ASSERT_NE(key0, kFile0) << "a path without data/ must not be keyed by its basename";
+    ASSERT_NE(key0, RapIndex::key_of(p1));
+    std::ifstream in(_index_dir + "/" + kFile0 + RapIndex::kSuffix, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_GT(bytes.size(), 100u);
+    const std::string dir = (tmp / "rapx").string();
+    const fs::path sc = fs::path(dir) / (key0 + ".model" + RapIndex::kSuffix);
+    fs::create_directories(sc.parent_path());
+    { std::ofstream out(sc.string(), std::ios::binary); const std::string keyed = rekey_sidecar(bytes, key0); out.write(keyed.data(), static_cast<std::streamsize>(keyed.size())); }
+    std::string diag;
+    const Result base = run(p0, {"2203129G"}, "");
+    ASSERT_FALSE(base.rows.empty());
+    const Result idx0 = run(p0, {"2203129G"}, dir);
+    EXPECT_TRUE(same_multiset(idx0.rows, base.rows, &diag)) << diag;
+    EXPECT_EQ(idx0.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(idx0.stats_delta.rap_index_ready, 2) << "p=0 must load its own sidecar under its full-path key";
+    EXPECT_LT(idx0.planned_bytes, base.planned_bytes);
+    const Result idx1 = run(p1, {"2203129G"}, dir);
+    EXPECT_TRUE(same_multiset(idx1.rows, base.rows, &diag)) << diag;
+    EXPECT_EQ(idx1.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(idx1.stats_delta.rap_index_ready, 0) << "p=1 has no sidecar and must not be answered by p=0's";
+    EXPECT_EQ(idx1.stats_delta.rap_index_unusable, 0);
+    EXPECT_EQ(idx1.planned_bytes, base.planned_bytes);
     fs::remove_all(tmp);
 }
 

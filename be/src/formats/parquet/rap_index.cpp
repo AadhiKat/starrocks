@@ -67,8 +67,13 @@ std::string RapIndex::cache_key(bool negative, const std::string& file_key, cons
 std::string RapIndex::key_of(const std::string& path) {
     const auto pos = path.rfind("/data/");
     if (pos != std::string::npos && pos + 6 < path.size()) return path.substr(pos + 6);
-    const auto slash = path.find_last_of('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
+    // slice 2g v2 (m36 review, F-COLLISION): no data/ root -> the FULL path minus its scheme, never the basename, which
+    // aliases equal-size, equal-row-count files under different custom roots and lets one file's postings answer another's
+    std::string p = path;
+    const auto sch = p.find("://");
+    if (sch != std::string::npos) p = p.substr(sch + 3);
+    while (!p.empty() && p.front() == '/') p.erase(0, 1);
+    return p;
 }
 
 RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const Identity& expect) {

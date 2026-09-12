@@ -181,7 +181,7 @@ protected:
         std::string path;
     };
     Written write_file(const std::string& rap_dir, std::vector<std::string> rap_columns, bool with_field_ids = true,
-                       std::unique_ptr<ColumnEvaluator> k_eval = nullptr, const std::string& sub = "") {
+                       std::unique_ptr<ColumnEvaluator> k_eval = nullptr, const std::string& sub = "", const std::string& root = "") {
         const std::vector<TypeDescriptor> types{TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR),
                                                 TypeDescriptor::from_logical_type(LogicalType::TYPE_BIGINT)};
         std::vector<std::unique_ptr<ColumnEvaluator>> evals;
@@ -196,8 +196,9 @@ protected:
         // integers) to plain pages, so planned bytes scale with the rows selected instead of with an 800 KB dictionary
         options->dictionary_pagesize = 1024;
         if (with_field_ids) options->column_ids = std::vector<FileColumnId>{FileColumnId{7, {}}, FileColumnId{8, {}}};
-        if (!sub.empty()) std::filesystem::create_directories(_dir + "/data/" + sub); // slice 2g: a partition directory
-        const std::string path = _dir + "/data/" + sub + "export_" + std::to_string(++_seq) + ".parquet";
+        const std::string base_dir = root.empty() ? _dir + "/data/" : root;   // slice 2g v2: a custom root without data/
+        if (!sub.empty() || !root.empty()) std::filesystem::create_directories(base_dir + sub); // slice 2g: a partition directory
+        const std::string path = base_dir + sub + "export_" + std::to_string(++_seq) + ".parquet";
         auto file = FileSystem::Default()->new_writable_file(path).value();
         auto out = std::make_shared<parquet::ParquetOutputStream>(std::move(file));
         std::string data_path = path;
@@ -560,6 +561,31 @@ TEST_F(RapSidecarBuilderTest, WriterKeysSidecarByPathUnderData) {
     EXPECT_EQ(base_r.rows.size(), 1500u);
     EXPECT_EQ(idx.rows, base_r.rows);
     EXPECT_EQ(idx.ready, 2) << "the reader derives the same key from the data file's path";
+}
+
+// slice 2g v2 (m36 review). g'': a file written under a custom root (no data/ segment) is keyed by its FULL path minus the
+//    leading slash: the sidecar sits under that mirrored prefix, its stored identity is that key, a basename identity is
+//    refused, and the reader finds it by the same rule.
+TEST_F(RapSidecarBuilderTest, WriterKeysSidecarByFullPathWithoutDataRoot) {
+    Written w = write_file(_dir + "/rapx", {"k"}, true, nullptr, "p=1/", _dir + "/custom/");
+    ASSERT_TRUE(w.result.io_status.ok()) << w.result.io_status.message();
+    EXPECT_EQ(w.writer->rap_export_stats().sidecars_written, 1);
+    const std::string key = parquet::RapIndex::key_of(w.path);
+    ASSERT_NE(key, basename(w.path));
+    ASSERT_EQ(key.find("custom/p=1/"), key.size() - std::string("custom/p=1/").size() - basename(w.path).size());
+    const std::string sidecar = _dir + "/rapx/" + key + ".k.rapx";
+    ASSERT_TRUE(std::filesystem::exists(sidecar)) << "the sidecar must sit under the full-path prefix";
+    EXPECT_FALSE(std::filesystem::exists(_dir + "/rapx/" + basename(w.path) + ".k.rapx"));
+    const auto size = static_cast<uint64_t>(w.result.file_statistics.file_size);
+    auto r = parquet::RapIndex::load(sidecar, parquet::RapIndex::Identity{key, size, static_cast<uint64_t>(kRows), "k", 7});
+    ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
+    auto wrong = parquet::RapIndex::load(sidecar, parquet::RapIndex::Identity{basename(w.path), size, static_cast<uint64_t>(kRows), "k", 7});
+    EXPECT_EQ(wrong.state, parquet::RapIndex::State::UNUSABLE);
+    const Read base_r = read(w.path, "V12", "");
+    const Read idx = read(w.path, "V12", _dir + "/rapx");
+    EXPECT_EQ(base_r.rows.size(), 1500u);
+    EXPECT_EQ(idx.rows, base_r.rows);
+    EXPECT_EQ(idx.ready, 2);
 }
 
 } // namespace starrocks::formats

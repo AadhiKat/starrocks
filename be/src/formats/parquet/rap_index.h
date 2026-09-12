@@ -61,7 +61,8 @@ public:
                                  const std::string& generation, const std::string& directory);
     static constexpr uint32_t kVersion = 1;
     // slice 2g (F-COLLISION): the KEY of a data file is its path relative to the table's data/ root -- the part after
-    // the LAST "/data/" segment; a path without one keeps the basename. The sink names files per partition
+    // the LAST "/data/" segment; a path without one is keyed by its FULL path minus its scheme (v2, m36 review: the
+    // basename would alias equal-size, equal-row-count files under different custom roots). The sink names files per partition
     // directory, so a basename is not unique on a partitioned table; the key is. It names the sidecar object
     // (<dir>/<key>.<column>.rapx), is the identity stored in the sidecar, and is the FE manifest's file name
     // (RapCoverage.keyOf applies the same rule).

@@ -310,8 +310,13 @@ public class RapCoverage {
         if (pos >= 0 && pos + 6 < loc.length()) {
             return loc.substring(pos + 6);
         }
-        int slash = loc.lastIndexOf('/');
-        return slash >= 0 ? loc.substring(slash + 1) : loc;
+        // slice 2g v2 (m36 review): no data/ root -> the full path minus its scheme, never the basename
+        int sch = loc.indexOf("://");
+        String p = sch >= 0 ? loc.substring(sch + 3) : loc;
+        while (p.startsWith("/")) {
+            p = p.substring(1);
+        }
+        return p;
     }
 
     public Decision decide(DataFile file) {

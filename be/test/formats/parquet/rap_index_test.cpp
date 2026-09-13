@@ -48,6 +48,13 @@
 #include "fs/fs_memory.h"
 #include "runtime/runtime_state.h"
 #include "types/datum.h"
+// slice 4 fix-up 5: the scan-side builder's attach test is about the runtime-filter pruner the real scanner builds,
+// so the test has to build one exactly as HdfsScanner::_build_scanner_context() does
+#include "compute_env/runtime_range_pruner.hpp"
+#include "exec_primitive/runtime_filter/runtime_filter_probe.h"
+#include "runtime/runtime_filter.h"
+#include "storage_primitive/predicate_parser.h"
+#include "testutil/exprs_test_helper.h"
 
 namespace starrocks::parquet {
 
@@ -474,6 +481,21 @@ protected:
             std::vector<ExprContext*> all = ctx->format_scan_context.conjunct_ctxs_by_slot[pred_slot];
             ParquetUTBase::setup_conjuncts_manager(all, nullptr, td, _runtime_state, ctx);
         }
+        // slice 4 fix-up 5: the pruner, built the way hdfs_scanner.cpp:182-185 builds it -- a ConnectorPredicateParser
+        // over this scan's slots and the conjuncts manager's unarrived-runtime-filter list, which is EMPTY unless the
+        // query carries a runtime filter. The pointer is non-null either way; only kOneFilter makes it non-empty.
+        if (_rf_mode != RfMode::kNoPruner) {
+            auto* parser = _pool.add(new ConnectorPredicateParser(&ctx->slot_descs));
+            auto* rf_list = _pool.add(new UnarrivedRuntimeFilterList());
+            if (_rf_mode == RfMode::kOneFilter) {
+                auto rf = gen_runtime_filter_desc(td->slots()[1]->id()); // event_time, BIGINT
+                EXPECT_TRUE(rf.ok()) << rf.status().message();
+                if (rf.ok()) rf_list->add_unarrived_rf(rf.value(), td->slots()[1], 0);
+            }
+            ctx->predicates.runtime_filter_scan_range_pruner = std::make_unique<RuntimeScanRangePruner>(parser, *rf_list);
+            ctx->format_scan_context.runtime_filter_scan_range_pruner =
+                    ctx->predicates.runtime_filter_scan_range_pruner.get();
+        }
         return ctx;
     }
 
@@ -586,6 +608,30 @@ protected:
     }
     void clear_conjuncts() { _pred_hook = nullptr; }
 
+    // slice 4 fix-up 5 (D13's deployed finding). Which runtime-filter pruner this run's scan context carries.
+    // kNoPruner is the shape every RAP case used before, and NO production scan has it: HdfsScanner::
+    // _build_scanner_context() constructs a RuntimeScanRangePruner unconditionally, so a filter-free query arrives
+    // at the reader with an EMPTY pruner, not with none. kEmptyPruner is that real shape; kOneFilter registers one
+    // push-downable filter, which is the only shape that may refuse a build.
+    enum class RfMode { kNoPruner, kEmptyPruner, kOneFilter };
+    void use_runtime_filter_pruner(RfMode m) { _rf_mode = m; }
+
+    // exactly file_reader_test's descriptor: a broadcast TOPN filter targeting one slot of this scan
+    StatusOr<RuntimeFilterProbeDescriptor*> gen_runtime_filter_desc(SlotId slot_id) {
+        TRuntimeFilterDescription d;
+        d.__set_filter_id(1);
+        d.__set_has_remote_targets(false);
+        d.__set_build_plan_node_id(1);
+        d.__set_build_join_mode(TRuntimeFilterBuildJoinMode::BROADCAST);
+        d.__set_filter_type(TRuntimeFilterBuildType::TOPN_FILTER);
+        TExpr col_ref = ExprsTestHelper::create_column_ref_t_expr<TYPE_BIGINT>(slot_id, true);
+        d.__isset.plan_node_id_to_target_expr = true;
+        d.plan_node_id_to_target_expr.emplace(1, col_ref);
+        auto* desc = _pool.add(new RuntimeFilterProbeDescriptor());
+        RETURN_IF_ERROR(desc->init(&_pool, d, 1, _runtime_state));
+        return desc;
+    }
+
     // slice 4 (P3b): build sidecars for `cols` of `path` with the scan-side builder -- a whole-file, predicate-free read
     Result build_sidecars(const std::string& path, const std::string& dir, const std::string& cols) {
         config::rap_build_index_dir = dir;
@@ -647,6 +693,7 @@ protected:
     FileSystem* _scan_fs = nullptr;  // slice 2c: FileSystem handed to the reader for sidecar reads (null = default)
     std::function<void(TupleDescriptor*, HdfsScannerContext*)> _pred_hook; // slice 4: test-built conjuncts
     SkipRowsContextPtr _skip_rows;                                          // slice 4: a delete filter for the reader
+    RfMode _rf_mode = RfMode::kNoPruner; // slice 4 fix-up 5: which pruner shape this run's scan context carries
     std::string _file_name_override;                                        // slice 2g v4: the data file's name as another namespace sees it
 };
 
@@ -2100,6 +2147,63 @@ TEST_F(RapIndexTest, ScanSideBuilderSkipsPartialReadAndNeverOverwrites) {
     EXPECT_EQ(scan_built.index->num_values(), reference.index->num_values());
     for (const char* v : {"2203129G", "12 Pro", "21061119DG", "V2420"}) {
         const auto a = scan_built.index->lookup({v}), b = reference.index->lookup({v});
+        ASSERT_EQ(a.size(), b.size()) << v;
+        for (size_t i = 0; i < a.size(); ++i) {
+            EXPECT_EQ(a[i].start_row, b[i].start_row) << v;
+            EXPECT_EQ(a[i].end_row, b[i].end_row) << v;
+        }
+    }
+    fs::remove_all(tmp);
+}
+
+// slice 4 fix-up 5 (D13's FIRST DEPLOYED RUN, 2026-09-13): the scan-side builder must attach on the scan shape the
+//    PRODUCTION scanner presents, not the one the unit tests happened to build. Every Hive / Iceberg scan carries a
+//    RuntimeScanRangePruner -- hdfs_scanner.cpp:182-185 constructs one unconditionally, EMPTY when the query has no
+//    runtime filter -- and the attach test refused on the POINTER being non-null. So the builder never attached on the
+//    deployed image: D13's probe of ice_poc.poc_lake.pg_n5000000 recorded `skipped: partial read` on three whole-file,
+//    unnarrowed reads (RuntimeFilterNum 0, FilteredRowGroups 0, one row group per file, all 5,000,000 rows read).
+//    Every RAP case before this one left the pruner null, which is a shape no production scan has, so 66 green tests
+//    and their B1/B2/B3 mutants all passed against a fixture that could not fail this way.
+//    t: an EMPTY pruner -- what a filter-free scan really carries -- does NOT refuse the build. One sidecar is written,
+//       it loads READY against the file's own identity, and its postings equal the reference builder's value by value.
+//    u: a pruner with a push-downable filter REGISTERED does refuse it. The filter can arrive mid-scan and narrow the
+//       read through update_range_if_arrived(), so those postings would be short. Nothing is written.
+//    Mutant B4 reverts the predicate to `!= nullptr` and must turn t red while leaving u green.
+TEST_F(RapIndexTest, ScanSideBuilderAttachesUnderTheEmptyPrunerEveryRealScanCarries) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / ("rap_s4_rf_" + std::to_string(::getpid()));
+    fs::create_directories(tmp);
+    const std::string f0 = _fixture_dir + "/" + kFile0;
+    const std::string key0 = RapIndex::key_of(f0);
+    const fs::path sc = tmp / (key0 + ".model" + RapIndex::kSuffix);
+
+    // u first, so t cannot pass on a sidecar u left behind: one REGISTERED filter refuses the build
+    use_runtime_filter_pruner(RfMode::kOneFilter);
+    g_rap_stats.rap_build_reason.clear();
+    const Result registered = build_sidecars(f0, tmp.string(), "model");
+    EXPECT_EQ(registered.stats_delta.rap_build_written, 0) << "u: a registered runtime filter may narrow the read";
+    EXPECT_GE(registered.stats_delta.rap_build_skipped, 1);
+    EXPECT_EQ(g_rap_stats.rap_build_reason, "partial read");
+    ASSERT_FALSE(fs::exists(sc)) << "u: nothing may be written under a registered filter";
+
+    // t: the same scan with an EMPTY pruner -- the real filter-free shape -- builds
+    use_runtime_filter_pruner(RfMode::kEmptyPruner);
+    g_rap_stats.rap_build_reason.clear();
+    const Result empty_pruner = build_sidecars(f0, tmp.string(), "model");
+    EXPECT_EQ(empty_pruner.stats_delta.rap_build_written, 1)
+            << "t: an empty pruner is what every filter-free production scan carries; reason=" << g_rap_stats.rap_build_reason;
+    EXPECT_EQ(empty_pruner.stats_delta.rap_build_skipped, 0) << "reason=" << g_rap_stats.rap_build_reason;
+    ASSERT_TRUE(fs::exists(sc)) << sc;
+
+    // the bytes are a real sidecar, and they are the SAME postings the reference builder produces
+    auto built = RapIndex::load(sc.string(), RapIndex::Identity{key0, fs::file_size(f0), 2576384, "model", 15});
+    ASSERT_EQ(built.state, RapIndex::State::READY) << built.reason;
+    auto reference = RapIndex::load(sidecar_of(kFile0), RapIndex::Identity{key0, fs::file_size(f0), 2576384, "model", 15});
+    ASSERT_EQ(reference.state, RapIndex::State::READY) << reference.reason;
+    EXPECT_EQ(built.index->num_values(), reference.index->num_values());
+    for (const char* v : {"2203129G", "12 Pro", "21061119DG", "V2420"}) {
+        const auto a = built.index->lookup({v}), b = reference.index->lookup({v});
         ASSERT_EQ(a.size(), b.size()) << v;
         for (size_t i = 0; i < a.size(); ++i) {
             EXPECT_EQ(a[i].start_row, b[i].start_row) << v;

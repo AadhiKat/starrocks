@@ -309,19 +309,25 @@ public class RapCoverage {
     }
 
     /**
-     * slice 2g v3 (fork production-readiness review, PRD-01; m37 review): the key of a data file is its FULL path
-     * minus its scheme and leading slashes -- bucket, table location, partition directories and file name. v2's "path
-     * after the last /data/" dropped the table, so two tables with the same suffix, size and row count could share a
-     * sidecar under one directory, and its relative and fallback keys shared one namespace. One rule, no fallback. The
-     * BE's RapIndex::key_of and the harness's rap_index_build.key_of apply the same rule.
+     * slice 2g v4 (fork production-readiness review PRD-01; m37 and m38 reviews): the key of a data file keeps its
+     * STORAGE NAMESPACE -- "scheme://rest" becomes "scheme/rest" with rest's leading slashes dropped; a location
+     * without a scheme, and a file:// URI, are the local filesystem, "file/rest". Bucket, table location, partition
+     * directories and file name all stay. v2's "path after the last /data/" dropped the table, so two tables with the
+     * same suffix, size and row count could share a sidecar; v3 dropped the scheme, so gs://b/... and s3://b/... (one
+     * bucket name in two stores) shared one. One rule, no fallback. The BE's RapIndex::key_of and the harness's
+     * rap_index_build.key_of apply the same rule.
      */
     public static String keyOf(String loc) {
         int sch = loc.indexOf("://");
+        String scheme = sch >= 0 ? loc.substring(0, sch) : "";
         String p = sch >= 0 ? loc.substring(sch + 3) : loc;
+        if (scheme.isEmpty()) {
+            scheme = "file";
+        }
         while (p.startsWith("/")) {
             p = p.substring(1);
         }
-        return p;
+        return scheme + "/" + p;
     }
 
     /** The completeness rule for one planned data file. */

@@ -100,15 +100,21 @@ std::string RapIndex::cache_key(bool negative, const std::string& file_key, cons
 }
 
 std::string RapIndex::key_of(const std::string& path) {
-    // slice 2g v3 (PRD-01): the FULL path minus its scheme and leading slashes -- never shortened to the part after
-    // /data/ (which dropped the table and let two tables share a sidecar) and never the basename (which the sink reuses
-    // across partition directories). One rule, one namespace: relative keys and fallback keys cannot collide because
-    // there is no fallback.
-    std::string p = path;
-    const auto sch = p.find("://");
-    if (sch != std::string::npos) p = p.substr(sch + 3);
-    while (!p.empty() && p.front() == '/') p.erase(0, 1);
-    return p;
+    // slice 2g v4 (m38 review, F-COLLISION / PRD-01): the key keeps the STORAGE NAMESPACE. `<scheme>://rest` becomes
+    // `<scheme>/rest` with rest's leading slashes dropped; a path without a scheme, and a file:// URI, are the local
+    // filesystem and become `file/rest`. gs://b/t/data/x, s3://b/t/data/x and /b/t/data/x are three objects and get
+    // three keys. Nothing is shortened: v2's "path after the last /data/" dropped the table (two tables with one suffix
+    // shared a sidecar); v3 dropped the scheme (two stores with one bucket name shared a sidecar). A scheme spelled
+    // differently (s3a:// vs s3://) is keyed differently: a miss, never another object's postings.
+    std::string scheme = "file", rest = path;
+    const auto sch = path.find("://");
+    if (sch != std::string::npos) {
+        scheme = path.substr(0, sch);
+        rest = path.substr(sch + 3);
+        if (scheme.empty()) scheme = "file";
+    }
+    while (!rest.empty() && rest.front() == '/') rest.erase(0, 1);
+    return scheme + "/" + rest;
 }
 
 // Slice 2c: read through the scan's own FileSystem (null = the default one), so a sidecar next to
@@ -133,8 +139,8 @@ RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const I
         }
         return unusable("exists: " + std::string(exists.message()));
     }
-    // slice 4 (PRD-02): the byte ceiling is applied BEFORE the read; a filesystem that cannot report the size falls
-    // through to the open / read, whose own failures report themselves
+    // slice 4 (PRD-02): the byte ceiling is applied BEFORE the open where the filesystem can report a size; a filesystem
+    // that cannot (fs_hdfs, fs_s3: NotSupported) is bounded below, on the opened stream, before the payload is touched
     auto size_or = fs->get_file_size(path);
     if (size_or.ok() && static_cast<int64_t>(*size_or) > config::rap_index_max_sidecar_bytes) {
         return unusable("size " + std::to_string(*size_or) + " above rap_index_max_sidecar_bytes " +
@@ -151,9 +157,21 @@ RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const I
         }
         return unusable("open: " + std::string(file_or.status().message()));
     }
-    auto bytes_or = (*file_or)->read_all();
-    if (!bytes_or.ok()) return unusable("read: " + std::string(bytes_or.status().message()));
-    return parse(*bytes_or, expect);
+    // slice 4 fix-up 2 (m38 review, PRD-02): the HDFS-backed (gs://, hdfs://) and S3 filesystems answer get_file_size
+    // with NotSupported, so the ceiling above never fired for a remote sidecar and read_all() sized its allocation from
+    // the stream. The ceiling is applied to the OPENED stream's size as well, before any payload byte is allocated or
+    // read; a stream whose size cannot be established is refused (UNUSABLE, step named) rather than read blind; the
+    // read itself is bounded to the checked size.
+    auto ssize_or = (*file_or)->get_size();
+    if (!ssize_or.ok()) return unusable("size: " + std::string(ssize_or.status().message()));
+    if (*ssize_or < 0 || *ssize_or > config::rap_index_max_sidecar_bytes) {
+        return unusable("size " + std::to_string(*ssize_or) + " above rap_index_max_sidecar_bytes " +
+                        std::to_string(config::rap_index_max_sidecar_bytes));
+    }
+    std::string bytes(static_cast<size_t>(*ssize_or), '\0');
+    Status rs = (*file_or)->read_at_fully(0, bytes.data(), static_cast<int64_t>(bytes.size()));
+    if (!rs.ok()) return unusable("read: " + std::string(rs.message()));
+    return parse(bytes, expect);
 }
 
 RapIndex::Result RapIndex::parse(const std::string& b, const Identity& expect) {

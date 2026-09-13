@@ -163,6 +163,53 @@ public:
         return std::make_unique<RandomAccessFile>(std::make_shared<FailingStream>(url), url);
     }
 };
+// slice 4 fix-up 2 (m38 review, PRD-02): what the HDFS-backed and S3 filesystems really do -- get_file_size answers
+// NotSupported, the open succeeds, and the STREAM knows the size. The stream serves the given bytes only when the size
+// it reports is their true size; a stream reporting any other size fails every read with a sentinel, so a loader that
+// touched the payload before checking the reported size is caught. A negative reported size stands for a stream whose
+// size cannot be established (get_size fails).
+class SentinelStream final : public io::SeekableInputStream {
+public:
+    SentinelStream(std::string bytes, int64_t reported) : _bytes(std::move(bytes)), _reported(reported) {}
+    StatusOr<int64_t> read(void* data, int64_t count) override {
+        ++reads;
+        if (_reported != static_cast<int64_t>(_bytes.size())) return Status::IOError("SENTINEL: payload read before the size check");
+        const int64_t n = std::min<int64_t>(count, static_cast<int64_t>(_bytes.size()) - _pos);
+        if (n > 0) std::memcpy(data, _bytes.data() + _pos, static_cast<size_t>(n));
+        _pos += std::max<int64_t>(n, 0);
+        return std::max<int64_t>(n, 0);
+    }
+    Status skip(int64_t count) override { _pos += count; return Status::OK(); }
+    Status seek(int64_t position) override { _pos = position; return Status::OK(); }
+    StatusOr<int64_t> position() override { return _pos; }
+    StatusOr<int64_t> get_size() override {
+        if (_reported < 0) return Status::IOError("stat failed: size unknown");
+        return _reported;
+    }
+    int reads = 0;
+
+private:
+    std::string _bytes;
+    int64_t _reported;
+    int64_t _pos = 0;
+};
+class NoSizeFs final : public MemoryFileSystem {
+public:
+    NoSizeFs(std::string bytes, int64_t reported) : stream(std::make_shared<SentinelStream>(std::move(bytes), reported)) {}
+    Status path_exists(const std::string& url) override { return Status::OK(); }
+    StatusOr<uint64_t> get_file_size(const std::string& url) override {
+        ++size_calls;
+        return Status::NotSupported("HdfsFileSystem::get_file_size");
+    }
+    using MemoryFileSystem::new_random_access_file;
+    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
+                                                                       const std::string& url) override {
+        ++opens;
+        return std::make_unique<RandomAccessFile>(stream, url);
+    }
+    std::shared_ptr<SentinelStream> stream;
+    int size_calls = 0, opens = 0;
+};
 // a filesystem whose existence check itself fails with something other than NotFound
 class ExistsIoErrorFs final : public MemoryFileSystem {
 public:
@@ -441,7 +488,12 @@ protected:
         {
             auto* ctx = _ctx(path, literals);
             ctx->format_scan_context.selected_row_ranges = hint;
-            auto file = *FileSystem::Default()->new_random_access_file(path);
+            auto raw = *FileSystem::Default()->new_random_access_file(path);
+            // slice 2g v4: a test may present the local bytes under another storage name (gs://..., s3://...) -- the
+            // reader keys the file by the name it is given, exactly as a scan does
+            std::unique_ptr<RandomAccessFile> file = _file_name_override.empty()
+                                                             ? std::move(raw)
+                                                             : std::make_unique<RandomAccessFile>(raw->stream(), _file_name_override);
             auto reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(), std::filesystem::file_size(path), DataCacheOptions(), nullptr, _skip_rows);
             Status st = reader->init(&ctx->format_scan_context);
             EXPECT_TRUE(st.ok()) << st.message();
@@ -465,7 +517,12 @@ protected:
         {
             auto* ctx = _ctx(path, literals);
             ctx->format_scan_context.selected_row_ranges = hint;
-            auto file = *FileSystem::Default()->new_random_access_file(path);
+            auto raw = *FileSystem::Default()->new_random_access_file(path);
+            // slice 2g v4: a test may present the local bytes under another storage name (gs://..., s3://...) -- the
+            // reader keys the file by the name it is given, exactly as a scan does
+            std::unique_ptr<RandomAccessFile> file = _file_name_override.empty()
+                                                             ? std::move(raw)
+                                                             : std::make_unique<RandomAccessFile>(raw->stream(), _file_name_override);
             auto reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(), std::filesystem::file_size(path), DataCacheOptions(), nullptr, _skip_rows);
             Status st = reader->init(&ctx->format_scan_context);
             EXPECT_TRUE(st.ok()) << st.message();
@@ -558,7 +615,12 @@ protected:
         const int64_t b_l = g_rap_stats.rap_index_load_ns, b_cn = g_rap_stats.rap_index_consult_ns;
         {
             auto* ctx = _ctx(path, {literal});
-            auto file = *FileSystem::Default()->new_random_access_file(path);
+            auto raw = *FileSystem::Default()->new_random_access_file(path);
+            // slice 2g v4: a test may present the local bytes under another storage name (gs://..., s3://...) -- the
+            // reader keys the file by the name it is given, exactly as a scan does
+            std::unique_ptr<RandomAccessFile> file = _file_name_override.empty()
+                                                             ? std::move(raw)
+                                                             : std::make_unique<RandomAccessFile>(raw->stream(), _file_name_override);
             auto reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(), std::filesystem::file_size(path), DataCacheOptions(), nullptr, _skip_rows);
             c.ok = reader->init(&ctx->format_scan_context).ok();
         }
@@ -585,6 +647,7 @@ protected:
     FileSystem* _scan_fs = nullptr;  // slice 2c: FileSystem handed to the reader for sidecar reads (null = default)
     std::function<void(TupleDescriptor*, HdfsScannerContext*)> _pred_hook; // slice 4: test-built conjuncts
     SkipRowsContextPtr _skip_rows;                                          // slice 4: a delete filter for the reader
+    std::string _file_name_override;                                        // slice 2g v4: the data file's name as another namespace sees it
 };
 
 // 1. The gate, on synthetic bytes: valid loads READY; every corruption / mismatch is UNUSABLE with
@@ -1138,13 +1201,14 @@ TEST_F(RapIndexTest, LazyMissingIsAbsentBeforeOpen) {
     EXPECT_EQ(lazy.opens, 0) << "a missing sidecar must not be opened (the lazy open would succeed and the read fail)";
 }
 
-// the object exists (or vanished after the check): open succeeds lazily, the read fails -> UNUSABLE, step named
+// the object exists (or vanished after the check): open succeeds lazily, the first thing asked of the stream -- its size,
+// which the ceiling needs (slice 4 fix-up 2) -- fails -> UNUSABLE, step named
 TEST_F(RapIndexTest, ExistsOkThenReadFailsIsUnusable) {
     const RapIndex::Identity id{kFile0, 57495763, 2576384, "model", 15};
     LazyReadFailFs racy;
     auto u = RapIndex::load(&racy, "gs://bucket/rapx/" + kFile0 + ".model" + RapIndex::kSuffix, id);
     EXPECT_EQ(u.state, RapIndex::State::UNUSABLE);
-    EXPECT_EQ(u.reason.rfind("read:", 0), 0u) << u.reason;
+    EXPECT_EQ(u.reason.rfind("size:", 0), 0u) << u.reason;
     EXPECT_NE(u.reason.find("Fail to get path info"), std::string::npos) << u.reason;
 }
 
@@ -1504,21 +1568,23 @@ static std::string rekey_sidecar(const std::string& b, const std::string& new_na
     return e.b;
 }
 
-// slice 2g v3 (PRD-01, m37 review): ONE rule -- the full path minus its scheme and leading slashes. The table
-// location and the bucket are part of the key, so two tables with one suffix cannot share a sidecar, and a "relative"
-// key cannot coincide with a custom-root key (there are no relative keys any more).
-TEST_F(RapIndexTest, KeyOfUnpartitionedPathIsBasename) { // a (v3: the full path)
-    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/x.parquet"), "b/t/data/x.parquet");
-    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/data/x.parquet"), "root/fixtures/n5m/data/x.parquet");
+// slice 2g v4 (PRD-01; m37 and m38 reviews): ONE rule -- `<scheme>/` then the full path with its leading slashes
+// dropped; a scheme-less path and file:// are the local filesystem, `file/`. The storage namespace, the bucket, the table
+// location and the partition directories are all part of the key, so two tables with one suffix cannot share a sidecar,
+// a "relative" key cannot coincide with a custom-root key (there are no relative keys any more), and two stores with one
+// bucket name cannot share a sidecar (the m38 review's gs:// / s3:// / local collision under v3).
+TEST_F(RapIndexTest, KeyOfUnpartitionedPathIsBasename) { // a (v4: the scheme, then the full path)
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/x.parquet"), "gs/b/t/data/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/data/x.parquet"), "file/root/fixtures/n5m/data/x.parquet");
 }
 
-TEST_F(RapIndexTest, KeyOfPartitionedPathKeepsPartitionDirs) { // b (v3: and everything before them)
-    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/day=1/bucket=2/x.parquet"), "b/t/data/day=1/bucket=2/x.parquet");
-    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/user_id_bucket=49/f_10_0_0.parquet"), "b/t/data/user_id_bucket=49/f_10_0_0.parquet");
+TEST_F(RapIndexTest, KeyOfPartitionedPathKeepsPartitionDirs) { // b (v4: and everything before them)
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/day=1/bucket=2/x.parquet"), "gs/b/t/data/day=1/bucket=2/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/user_id_bucket=49/f_10_0_0.parquet"), "gs/b/t/data/user_id_bucket=49/f_10_0_0.parquet");
 }
 
-TEST_F(RapIndexTest, KeyUsesLastDataSegment) { // c (v3: no data/ rule; the two review counterexamples)
-    EXPECT_EQ(RapIndex::key_of("gs://b/data/t/data/p=data/x.parquet"), "b/data/t/data/p=data/x.parquet");
+TEST_F(RapIndexTest, KeyUsesLastDataSegment) { // c (v3/v4: no data/ rule; the two review counterexamples)
+    EXPECT_EQ(RapIndex::key_of("gs://b/data/t/data/p=data/x.parquet"), "gs/b/data/t/data/p=data/x.parquet");
     // PRD-01: two tables, one suffix under data/
     EXPECT_NE(RapIndex::key_of("gs://fixture-bucket/table-a/data/p=0/part.parquet"),
               RapIndex::key_of("gs://fixture-bucket/table-b/data/p=0/part.parquet"));
@@ -1526,11 +1592,25 @@ TEST_F(RapIndexTest, KeyUsesLastDataSegment) { // c (v3: no data/ rule; the two 
     EXPECT_NE(RapIndex::key_of("gs://b/t/data/b/custom/p=0/x.parquet"), RapIndex::key_of("gs://b/custom/p=0/x.parquet"));
 }
 
-TEST_F(RapIndexTest, KeyWithoutDataRootIsTheFullPath) { // d (v2: never the basename)
-    EXPECT_EQ(RapIndex::key_of("gs://b/t/other/x.parquet"), "b/t/other/x.parquet");
-    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/x.parquet"), "root/fixtures/n5m/x.parquet");
-    EXPECT_EQ(RapIndex::key_of("x.parquet"), "x.parquet");
-    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/"), "b/t/data/");
+TEST_F(RapIndexTest, KeyWithoutDataRootIsTheFullPath) { // d (v2: never the basename; v4: the local filesystem is `file/`)
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/other/x.parquet"), "gs/b/t/other/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/x.parquet"), "file/root/fixtures/n5m/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("x.parquet"), "file/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("gs://b/t/data/"), "gs/b/t/data/");
+}
+
+// slice 2g v4 (m38 review, F-COLLISION / PRD-01). gs://, s3:// and the local filesystem are three namespaces and get three
+// keys; file:// IS the local filesystem; a differently spelled scheme (s3a://) is keyed differently -- a miss, never
+// another object's postings.
+TEST_F(RapIndexTest, KeyKeepsTheStorageScheme) {
+    EXPECT_EQ(RapIndex::key_of("gs://fixture-bucket/t/data/p=0/x.parquet"), "gs/fixture-bucket/t/data/p=0/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("s3://fixture-bucket/t/data/p=0/x.parquet"), "s3/fixture-bucket/t/data/p=0/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("/fixture-bucket/t/data/p=0/x.parquet"), "file/fixture-bucket/t/data/p=0/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("file:///fixture-bucket/t/data/p=0/x.parquet"), "file/fixture-bucket/t/data/p=0/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("hdfs://nn:8020/w/t/data/x.parquet"), "hdfs/nn:8020/w/t/data/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("s3a://b/t/data/x.parquet"), "s3a/b/t/data/x.parquet");
+    EXPECT_NE(RapIndex::key_of("gs://fixture-bucket/t/data/p=0/x.parquet"), RapIndex::key_of("s3://fixture-bucket/t/data/p=0/x.parquet"));
+    EXPECT_NE(RapIndex::key_of("gs://fixture-bucket/t/data/p=0/x.parquet"), RapIndex::key_of("/fixture-bucket/t/data/p=0/x.parquet"));
 }
 
 // e. Two copies of the fixture file with the SAME basename under data/b=0/ and data/b=1/, one sidecar per KEY under
@@ -1579,7 +1659,7 @@ TEST_F(RapIndexTest, TwoFilesSameBasenameDifferentPartitionsEachReady) {
 
 // slice 2g v2 (m36 review). j: two custom-root paths with one basename get two keys (the basename fallback gave one).
 TEST_F(RapIndexTest, FallbackKeysDistinguishCustomRoots) {
-    EXPECT_EQ(RapIndex::key_of("gs://b/custom/p=0/x.parquet"), "b/custom/p=0/x.parquet");
+    EXPECT_EQ(RapIndex::key_of("gs://b/custom/p=0/x.parquet"), "gs/b/custom/p=0/x.parquet");
     EXPECT_NE(RapIndex::key_of("gs://b/custom/p=0/x.parquet"), RapIndex::key_of("gs://b/custom/p=1/x.parquet"));
 }
 
@@ -2103,6 +2183,95 @@ TEST_F(RapIndexTest, DeclaredCountsAreBoundedBeforeAllocation) {
         EXPECT_EQ(ok.state, RapIndex::State::READY) << ok.reason;
         fs::remove_all(tmp);
     }
+}
+
+// slice 4 fix-up 2 (m38 review, PRD-02). Through a filesystem that cannot report an object's size (fs_hdfs / fs_s3 answer
+// NotSupported), the ceiling has to come from the OPENED stream before any payload byte is read or allocated: an oversized
+// stream is refused with the size named and ZERO reads; the same object at its true size loads READY through the same
+// filesystem (the control); a stream whose size cannot be established is refused, step named.
+TEST_F(RapIndexTest, RemoteSizeCeilingRefusesBeforeRead) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    std::ifstream in(sidecar_of(kFile0), std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_GT(bytes.size(), 100u);
+    const uint64_t size = std::filesystem::file_size(_fixture_dir + "/" + kFile0);
+    const RapIndex::Identity id{key(kFile0), size, 2576384, "model", 15};
+    const std::string url = "gs://bucket/rapx/" + key(kFile0) + RapIndex::kSuffix;
+    {
+        NoSizeFs big(bytes, config::rap_index_max_sidecar_bytes + 1);
+        auto r = RapIndex::load(&big, url, id);
+        EXPECT_EQ(r.state, RapIndex::State::UNUSABLE) << r.reason;
+        EXPECT_NE(r.reason.find("above rap_index_max_sidecar_bytes"), std::string::npos) << r.reason;
+        EXPECT_EQ(big.size_calls, 1) << "the filesystem was asked first (and could not answer)";
+        EXPECT_EQ(big.opens, 1);
+        EXPECT_EQ(big.stream->reads, 0) << "no payload byte may be read before the reported size is checked";
+    }
+    {
+        NoSizeFs same(bytes, static_cast<int64_t>(bytes.size()));
+        auto ok = RapIndex::load(&same, url, id);
+        EXPECT_EQ(ok.state, RapIndex::State::READY) << ok.reason;
+        EXPECT_GT(same.stream->reads, 0);
+        EXPECT_GT(ok.index->num_values(), 3000u);
+    }
+    {
+        NoSizeFs unknown(bytes, -1);
+        auto u = RapIndex::load(&unknown, url, id);
+        EXPECT_EQ(u.state, RapIndex::State::UNUSABLE) << u.reason;
+        EXPECT_EQ(u.reason.rfind("size:", 0), 0u) << u.reason;
+        EXPECT_EQ(unknown.stream->reads, 0);
+    }
+}
+
+// slice 2g v4 (m38 review, F-COLLISION / PRD-01). The SAME bytes seen through three storage namespaces -- gs://, s3://
+// and the local filesystem -- with one sidecar in a shared local directory, keyed for the gs:// view. Only the gs:// view
+// is READY; the other two are ABSENT (consulted, never answered by another namespace's sidecar), rows equal, bytes equal
+// to the unindexed scan. Under v3 the three views had one key and one sidecar answered all of them.
+TEST_F(RapIndexTest, TwoNamespacesSameBytesNotAliased) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / ("rap_2gv4_" + std::to_string(::getpid()));
+    fs::create_directories(tmp / "data");
+    const std::string f0 = _fixture_dir + "/" + kFile0;
+    const std::string local = (tmp / "data" / kFile0).string();
+    fs::copy_file(f0, local);
+    const std::string rel = local.substr(1); // the path without its leading slash, as a bucket-relative object name
+    const std::string via_gs = "gs://" + rel, via_s3 = "s3://" + rel;
+    ASSERT_NE(RapIndex::key_of(via_gs), RapIndex::key_of(via_s3));
+    ASSERT_NE(RapIndex::key_of(via_gs), RapIndex::key_of(local));
+    ASSERT_NE(RapIndex::key_of(via_s3), RapIndex::key_of(local));
+    std::ifstream in(sidecar_of(kFile0), std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_GT(bytes.size(), 100u);
+    const std::string dir = (tmp / "rapx").string();
+    const fs::path sc = fs::path(dir) / (RapIndex::key_of(via_gs) + ".model" + RapIndex::kSuffix);
+    fs::create_directories(sc.parent_path());
+    {
+        std::ofstream out(sc.string(), std::ios::binary);
+        const std::string keyed = rekey_sidecar(bytes, RapIndex::key_of(via_gs));
+        out.write(keyed.data(), static_cast<std::streamsize>(keyed.size()));
+    }
+    std::string diag;
+    const Result base = run(local, {"2203129G"}, "");
+    ASSERT_FALSE(base.rows.empty());
+    _file_name_override = via_gs;
+    const Result gs = run(local, {"2203129G"}, dir);
+    EXPECT_TRUE(same_multiset(gs.rows, base.rows, &diag)) << diag;
+    EXPECT_EQ(gs.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(gs.stats_delta.rap_index_ready, 2) << "the gs:// view has its own sidecar";
+    EXPECT_EQ(gs.stats_delta.rap_index_unusable, 0);
+    EXPECT_LT(gs.planned_bytes, base.planned_bytes);
+    for (const std::string& other : {via_s3, std::string()}) { // "" = the local name itself
+        _file_name_override = other;
+        const Result r = run(local, {"2203129G"}, dir);
+        const std::string seen_as = other.empty() ? local : other;
+        EXPECT_TRUE(same_multiset(r.rows, base.rows, &diag)) << seen_as << ": " << diag;
+        EXPECT_EQ(r.stats_delta.rap_index_consulted, 2) << seen_as;
+        EXPECT_EQ(r.stats_delta.rap_index_ready, 0) << seen_as << ": another namespace's sidecar must not answer";
+        EXPECT_EQ(r.stats_delta.rap_index_unusable, 0) << seen_as;
+        EXPECT_EQ(r.planned_bytes, base.planned_bytes) << seen_as;
+    }
+    _file_name_override.clear();
+    fs::remove_all(tmp);
 }
 
 } // namespace starrocks::parquet

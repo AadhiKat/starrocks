@@ -18,6 +18,8 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 import com.starrocks.common.Config;
 import com.starrocks.sql.ast.expression.BinaryType;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
@@ -34,7 +36,9 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -43,12 +47,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * RAP / lake-index slice 2b: the per-snapshot manifest and the completeness rule.
  *
  * <p>For a scan at snapshot S over planned files P, the manifest names the files C that carry a
- * registered sidecar index (with each file's identity: basename, size, rows) and, optionally, the
+ * registered sidecar index (with each file's identity: storage-qualified key, size, rows) and, optionally, the
  * postings value -> files for the indexed column. With EQ / IN literals on that column, M is the union
  * of the literals' files and the scan set is M ∪ (P − C): a covered file with no posting is dropped,
  * an uncovered file is ALWAYS kept. Every doubt keeps the file: no manifest for S, unreadable or
@@ -57,12 +62,17 @@ import java.util.Set;
  * <p>Deletes: position and equality deletes remove rows after the read; the index only selects which
  * rows are read; a file with no matching row stays droppable under any delete set.
  *
+ * <p>Manifest v2 uses lowercase hexadecimal RAPX canonical keys with an explicit key type and NULL
+ * file postings. It also supports ordered comparisons, NULL tests and conjunctions on its indexed
+ * column. V1 remains string EQ/IN only. Unsupported shapes keep the ordinary scan.
+ *
  * <p>Disabled unless {@code Config.rap_manifest_dir} is set. A disabled or failed coverage keeps
  * every file and counts nothing but {@code consulted}.
  */
 public class RapCoverage {
     private static final Logger LOG = LogManager.getLogger(RapCoverage.class);
     public static final int VERSION = 1;
+    public static final int TYPED_VERSION = 2;
     public static final String SUFFIX = ".rapm.json";
 
     public enum Decision { KEEP, DROP }
@@ -83,6 +93,8 @@ public class RapCoverage {
     private final Set<String> matching = new HashSet<>();         // basenames in M (null postings -> M = C)
     private final boolean hasPostings;
     private final boolean predicateUsable;        // EQ / IN literal(s) on `column` were found
+    private int manifestKeyType = 0;              // zero denotes a retained v1 manifest
+    private int manifestFieldId = -1;
 
     // counters, readable in EXPLAIN and logs
     private int consulted = 0;
@@ -112,7 +124,38 @@ public class RapCoverage {
             return disabled(snapshotId != null && snapshotId.isPresent() ? snapshotId.get() : -1L);
         }
         String uuid = nativeTable instanceof BaseTable ? ((BaseTable) nativeTable).operations().current().uuid() : null;
-        return load(Config.rap_manifest_dir, nativeTable.io(), uuid, snapshotId, predicate);
+        RapCoverage coverage = load(Config.rap_manifest_dir, nativeTable.io(), uuid, snapshotId, predicate);
+        if (coverage.active && coverage.manifestKeyType != 0) {
+            // A same-name replacement column must not inherit the old field's postings.
+            try {
+                org.apache.iceberg.types.Types.NestedField field = nativeTable.schema().findField(coverage.column);
+                if (field == null || field.fieldId() != coverage.manifestFieldId
+                        || icebergKeyType(field.type()) != coverage.manifestKeyType) {
+                    return disabled(coverage.snapshotId);
+                }
+            } catch (Exception e) {
+                return disabled(coverage.snapshotId);
+            }
+        }
+        return coverage;
+    }
+
+    private static int icebergKeyType(org.apache.iceberg.types.Type type) {
+        switch (type.typeId()) {
+            case STRING:
+                return 1;
+            case INTEGER:
+            case LONG:
+                return 2;
+            case BOOLEAN:
+                return 3;
+            case DATE:
+                return 4;
+            case TIMESTAMP:
+                return ((org.apache.iceberg.types.Types.TimestampType) type).shouldAdjustToUTC() ? 0 : 5;
+            default:
+                return 0;
+        }
     }
 
     /**
@@ -159,8 +202,16 @@ public class RapCoverage {
      */
     public static RapCoverage fromJson(String json, String expectUuid, long expectSnapshot, ScalarOperator predicate) {
         try {
+            // Gson's object model otherwise silently keeps the last duplicate posting field.
+            try (JsonReader reader = new JsonReader(new StringReader(json))) {
+                validateJsonFields(reader, 0);
+                if (reader.peek() != JsonToken.END_DOCUMENT) {
+                    throw new IllegalArgumentException("trailing RAP manifest content");
+                }
+            }
             JsonObject m = JsonParser.parseString(json).getAsJsonObject();
-            if (!m.has("version") || m.get("version").getAsInt() != VERSION) {
+            int version = m.has("version") ? m.get("version").getAsBigDecimal().intValueExact() : -1;
+            if (version != VERSION && version != TYPED_VERSION) {
                 LOG.warn("RAP manifest version unsupported -- ordinary scan");
                 return disabled(expectSnapshot);
             }
@@ -180,14 +231,26 @@ public class RapCoverage {
                 return disabled(expectSnapshot);
             }
             String column = m.get("column").getAsString();
-            List<String> literals = extractLiterals(predicate, column);
+            Set<Integer> typedCandidates = version == TYPED_VERSION ? typedCandidates(m, predicate, column) : null;
+            List<String> literals = version == VERSION ? extractLiterals(predicate, column) : null;
             boolean hasPostings = m.has("postings") && m.get("postings").isJsonObject();
-            RapCoverage c = new RapCoverage(true, expectSnapshot, column, hasPostings, literals != null);
+            RapCoverage c = new RapCoverage(true, expectSnapshot, column, hasPostings,
+                    version == TYPED_VERSION ? typedCandidates != null : literals != null);
+            if (version == TYPED_VERSION) {
+                c.manifestKeyType = m.get("key_type").getAsBigDecimal().intValueExact();
+                c.manifestFieldId = m.get("field_id").getAsBigDecimal().intValueExact();
+                if (c.manifestFieldId <= 0) {
+                    return disabled(expectSnapshot);
+                }
+            }
             JsonArray files = m.getAsJsonArray("files");
             List<String> names = new ArrayList<>();
             for (JsonElement e : files) {
                 JsonObject f = e.getAsJsonObject();
                 String name = f.get("name").getAsString();
+                if (c.files.containsKey(name)) {
+                    return disabled(expectSnapshot);
+                }
                 names.add(name);
                 c.files.put(name, new Covered(f.get("size").getAsLong(), f.get("rows").getAsLong()));
             }
@@ -237,12 +300,74 @@ public class RapCoverage {
                         }
                     }
                 }
+                if (typedCandidates != null) {
+                    for (int index : typedCandidates) {
+                        c.matching.add(names.get(index));
+                    }
+                }
             }
             return c;
         } catch (Exception e) {
-            LOG.warn("RAP manifest malformed: {} -- ordinary scan", e.toString());
+            LOG.warn("RAP manifest malformed ({}) -- ordinary scan", e.getClass().getSimpleName());
             return disabled(expectSnapshot);
         }
+    }
+
+    private static void validateJsonFields(JsonReader reader, int depth) throws IOException {
+        if (depth > 32) {
+            throw new IllegalArgumentException("RAP manifest nesting limit");
+        }
+        if (reader.peek() == JsonToken.BEGIN_OBJECT) {
+            reader.beginObject();
+            Set<String> fields = new HashSet<>();
+            while (reader.hasNext()) {
+                if (!fields.add(reader.nextName())) {
+                    throw new IllegalArgumentException("duplicate RAP manifest field");
+                }
+                validateJsonFields(reader, depth + 1);
+            }
+            reader.endObject();
+        } else if (reader.peek() == JsonToken.BEGIN_ARRAY) {
+            reader.beginArray();
+            while (reader.hasNext()) {
+                validateJsonFields(reader, depth + 1);
+            }
+            reader.endArray();
+        } else {
+            reader.skipValue();
+        }
+    }
+
+    private static Set<Integer> fileIndices(JsonElement entry, int size, boolean allowEmpty) {
+        if (entry == null || !entry.isJsonArray() || (!allowEmpty && entry.getAsJsonArray().isEmpty())) {
+            throw new IllegalArgumentException("invalid RAP file-index array");
+        }
+        Set<Integer> out = new HashSet<>();
+        for (JsonElement value : entry.getAsJsonArray()) {
+            if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
+                throw new IllegalArgumentException("invalid RAP file index");
+            }
+            int index = value.getAsBigDecimal().intValueExact();
+            if (index < 0 || index >= size || !out.add(index)) {
+                throw new IllegalArgumentException("invalid or duplicate RAP file index");
+            }
+        }
+        return out;
+    }
+
+    private static Set<Integer> typedCandidates(JsonObject manifest, ScalarOperator predicate, String column) {
+        int type = manifest.get("key_type").getAsBigDecimal().intValueExact();
+        if (type < 1 || type > 5 || !"hex".equals(manifest.get("key_encoding").getAsString())) {
+            throw new IllegalArgumentException("unsupported RAP typed manifest");
+        }
+        int size = manifest.getAsJsonArray("files").size();
+        TreeMap<String, Set<Integer>> postings = new TreeMap<>();
+        for (Map.Entry<String, JsonElement> entry : manifest.getAsJsonObject("postings").entrySet()) {
+            RapManifestPredicate.validateKey(entry.getKey(), type);
+            postings.put(entry.getKey(), fileIndices(entry.getValue(), size, false));
+        }
+        Set<Integer> nullFiles = fileIndices(manifest.get("null_postings"), size, true);
+        return RapManifestPredicate.matching(predicate, column, type, postings, nullFiles);
     }
 
     /**
@@ -290,19 +415,26 @@ public class RapCoverage {
             if (!column.equalsIgnoreCase(((ColumnRefOperator) in.getChild(0)).getName())) {
                 return;
             }
+            if (RapManifestPredicate.keyType(in.getChild(0).getType()) != 1) {
+                return;
+            }
+            List<String> values = new ArrayList<>();
             for (int i = 1; i < in.getChildren().size(); i++) {
                 ScalarOperator v = in.getChild(i);
-                if (!(v instanceof ConstantOperator) || ((ConstantOperator) v).isNull()) {
+                if (!(v instanceof ConstantOperator) || ((ConstantOperator) v).isNull()
+                        || RapManifestPredicate.keyType(v.getType()) != 1) {
                     return; // a non-constant or NULL member: the FE cannot reason about this IN
                 }
-                out.add(((ConstantOperator) v).getVarchar());
+                values.add(((ConstantOperator) v).getVarchar());
             }
+            out.addAll(values);
         }
     }
 
     private static String literalOn(ScalarOperator col, ScalarOperator val, String column) {
         if (col instanceof ColumnRefOperator && val instanceof ConstantOperator && !((ConstantOperator) val).isNull()
-                && column.equalsIgnoreCase(((ColumnRefOperator) col).getName())) {
+                && column.equalsIgnoreCase(((ColumnRefOperator) col).getName())
+                && RapManifestPredicate.keyType(col.getType()) == 1 && RapManifestPredicate.keyType(val.getType()) == 1) {
             return ((ConstantOperator) val).getVarchar();
         }
         return null;

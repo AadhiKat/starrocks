@@ -1889,6 +1889,55 @@ TEST_F(RapIndexTest, AndAcrossIndexedColumnsIntersects) {
     EXPECT_EQ(on.stats_delta.rap_index_consulted, 4) << "two indexed columns, two passes";
     EXPECT_EQ(on.stats_delta.rap_index_ready, 4);
     EXPECT_LE(on.planned_bytes, eq_only.planned_bytes) << "the intersection cannot read more than the EQ alone";
+
+    // slice 4 fix-up 3 (m39): the arm above did NOT discriminate -- mutant T4 (union instead of intersection) survived
+    // it, because `event_time <= min` is prunable by the reader's own page index, which clamps both arms to the first
+    // event_time page whatever the sidecars say. This arm removes the engine from the comparison: two indexed STRING
+    // columns, neither prunable by row-group stats, dictionary filter or page index (D1 on this fixture: `model = …`
+    // and `brand = …` each read every row of the file with the index off), so the planned IO is the RAP ranges alone.
+    // The two granule sets are DISJOINT -- `model = '2203129G'` occupies 13 of file 0's 20,000-row granules and
+    // `brand = 'RCA'` exactly one, with no row in both (measured read-only on ice_poc.poc_lake.pg_n5000000 at S0,
+    // 2026-09-13) -- so the intersection is empty and the file is filtered with nothing planned, while a union keeps
+    // all 14 granules and plans them. The three sidecar directories (model only, brand only, both) make the claim
+    // quantitative: an intersection reads LESS than either column alone, a union at least as much as each.
+    const fs::path tmp2 = fs::temp_directory_path() / ("rap_s4_and2_" + std::to_string(::getpid()));
+    const std::string both_dir = (tmp2 / "both").string(), model_dir = (tmp2 / "m").string(),
+                      brand_dir = (tmp2 / "b").string();
+    const Result built2 = build_sidecars(f0, both_dir, "model,brand");
+    ASSERT_EQ(built2.stats_delta.rap_build_written, 2);
+    const std::string k0 = RapIndex::key_of(f0);
+    const std::pair<std::string, std::string> copies[] = {{model_dir, "model"}, {brand_dir, "brand"}};
+    for (const auto& [dir, col] : copies) {
+        const fs::path dst = fs::path(dir) / (k0 + "." + col + RapIndex::kSuffix);
+        fs::create_directories(dst.parent_path());
+        fs::copy_file(fs::path(both_dir) / (k0 + "." + col + RapIndex::kSuffix), dst);
+    }
+    use_conjuncts({{2, [](SlotId s, std::vector<TExpr>* t) { ParquetUTBase::append_string_conjunct(TExprOpcode::EQ, s, "2203129G", t); }},
+                   {3, [](SlotId s, std::vector<TExpr>* t) { ParquetUTBase::append_string_conjunct(TExprOpcode::EQ, s, "RCA", t); }}});
+    const Result and_off = run(f0, {}, "");
+    const Result and_model = run(f0, {}, model_dir);
+    const Result and_brand = run(f0, {}, brand_dir);
+    const Result and_both = run(f0, {}, both_dir);
+    clear_conjuncts();
+    // the case is not vacuous: without the index the file is scanned, and the answer is empty either way
+    EXPECT_FALSE(and_off.file_filtered) << "the engine's own pruning must not decide this conjunction by itself";
+    EXPECT_GT(and_off.planned_bytes, 0);
+    EXPECT_TRUE(and_off.rows.empty()) << "no row of this file carries both values";
+    EXPECT_EQ(and_model.stats_delta.rap_index_ready, 2);
+    EXPECT_EQ(and_brand.stats_delta.rap_index_ready, 2);
+    EXPECT_GT(and_model.planned_bytes, 0);
+    EXPECT_GT(and_brand.planned_bytes, 0) << "the brand literal must be present in this file";
+    EXPECT_LT(and_model.planned_bytes, and_off.planned_bytes);
+    EXPECT_LT(and_brand.planned_bytes, and_off.planned_bytes);
+    EXPECT_EQ(and_both.stats_delta.rap_index_consulted, 4);
+    EXPECT_EQ(and_both.stats_delta.rap_index_ready, 4);
+    EXPECT_TRUE(and_both.rows.empty());
+    EXPECT_TRUE(and_both.file_filtered) << "disjoint granule sets intersect to nothing: no row of this file can match";
+    EXPECT_EQ(and_both.planned_bytes, 0);
+    EXPECT_LT(and_both.planned_bytes, and_model.planned_bytes)
+            << "the intersection must read less than either column alone; a union reads at least as much as each";
+    EXPECT_LT(and_both.planned_bytes, and_brand.planned_bytes);
+    fs::remove_all(tmp2);
     fs::remove_all(tmp);
 }
 

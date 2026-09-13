@@ -1,0 +1,26 @@
+{
+  "column": "v",
+  "field_id": 1,
+  "files": [
+    {
+      "name": "gs/b/t/data/a",
+      "rows": 10,
+      "sidecar_sha256": "99ac9c0de1e7a9a653771bb77b65e2fe04679f20b4f79c5d27ae3540a4583f52",
+      "size": 100
+    }
+  ],
+  "granularity_rows": 10,
+  "key_encoding": "hex",
+  "key_type": 2,
+  "null_postings": [
+    0
+  ],
+  "postings": {
+    "8000000000000009": [
+      0
+    ]
+  },
+  "snapshot_id": 1,
+  "table_uuid": "table",
+  "version": 2
+}

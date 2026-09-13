@@ -245,6 +245,8 @@ struct RowRangeHint {
 };
 
 struct FormatScanContext {
+    // Query-bound maintenance attempt; empty preserves the legacy manual build path.
+    std::string rap_build_token;
     FormatScannerOptions options;
     FormatScannerStats* stats = nullptr;
     const FileScanSplitContext* split_context = nullptr;

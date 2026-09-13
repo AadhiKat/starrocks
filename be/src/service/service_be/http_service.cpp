@@ -76,6 +76,7 @@
 #include "http/action/stream_load.h"
 #include "http/action/transaction_stream_load.h"
 #include "http/action/update_config_action.h"
+#include "http/action/rap_build_action.h"
 #include "http/default_path_handlers.h"
 #include "http/download_action.h"
 #include "http/utils.h"
@@ -295,6 +296,11 @@ Status HttpServiceBE::start() {
     auto* update_config_action = new UpdateConfigAction();
     _ev_http_server->register_handler(HttpMethod::POST, "/api/update_config", update_config_action);
     _http_handlers.emplace_back(update_config_action);
+
+    auto* rap_build_action = new RapBuildAction();
+    _ev_http_server->register_handler(HttpMethod::GET, "/api/rap/build", rap_build_action);
+    _ev_http_server->register_handler(HttpMethod::POST, "/api/rap/build", rap_build_action);
+    _http_handlers.emplace_back(rap_build_action);
 
     auto* runtime_filter_cache_action = new RuntimeFilterCacheAction(_env);
     _ev_http_server->register_handler(HttpMethod::GET, "/api/runtime_filter_cache/{action}",

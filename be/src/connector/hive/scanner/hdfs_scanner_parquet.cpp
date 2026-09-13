@@ -28,6 +28,7 @@ namespace starrocks {
 static const std::string kParquetProfileSectionPrefix = "Parquet";
 
 Status HdfsParquetScanner::do_init(RuntimeState* runtime_state, const HdfsScannerContext& scanner_ctx) {
+    _scanner_ctx->format_scan_context.rap_build_token = runtime_state->query_options().rap_build_token;
     if (_scanner_ctx->format_scan_context.split_context != nullptr) {
         auto split_ctx = down_cast<const parquet::SplitContext*>(_scanner_ctx->format_scan_context.split_context);
         _skip_rows_ctx = split_ctx->skip_rows_ctx;

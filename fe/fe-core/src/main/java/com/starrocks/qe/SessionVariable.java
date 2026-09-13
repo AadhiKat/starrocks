@@ -2815,6 +2815,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VariableMgr.VarAttr(name = CATALOG, flag = VariableMgr.SESSION_ONLY)
     private String catalog = InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
 
+    @VariableMgr.VarAttr(name = "rap_build_token", flag = VariableMgr.SESSION_ONLY)
+    private String rapBuildToken = "";
+
     public void setCatalog(String catalog) {
         this.catalog = catalog;
     }
@@ -6595,6 +6598,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     // used for rest api
     public TQueryOptions toThrift() {
         TQueryOptions tResult = new TQueryOptions();
+        if (!rapBuildToken.isEmpty()) {
+            tResult.setRap_build_token(rapBuildToken);
+        }
         tResult.setCatalog(catalog);
         tResult.setMem_limit(maxExecMemByte);
         tResult.setQuery_mem_limit(queryMemLimit);

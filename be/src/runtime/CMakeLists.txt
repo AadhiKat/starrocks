@@ -26,6 +26,7 @@ set(RUNTIME_SRCS
     descriptors.cpp
     descriptors_ext.cpp
     runtime_state.cpp
+    rap_build_gate.cpp
     mem_tracker.cpp
     mem_pool.cpp
     runtime_filter.cpp

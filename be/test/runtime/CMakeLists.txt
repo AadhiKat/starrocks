@@ -33,6 +33,7 @@ set(RUNTIME_TEST_FILES
     load_fail_point_test.cpp
     mysql_table_descriptor_core_test.cpp
     query_statistics_test.cpp
+    rap_build_gate_test.cpp
     runtime_metrics_test.cpp
     # RuntimeEnv::init owns the process-global HLL registers allocator. Keep
     # this before serde_core_test, whose HLL tests exercise that allocator.

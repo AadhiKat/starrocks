@@ -66,6 +66,10 @@ FileReader::~FileReader() = default;
 
 Status FileReader::init(FormatScanContext* ctx) {
     _scanner_ctx = ctx;
+    if (!ctx->rap_build_token.empty()) {
+        _rap_build_lease = RapBuildGate::instance().acquire(ctx->rap_build_token);
+        if (!_rap_build_lease) return Status::Cancelled("RAP build attempt is absent or fenced");
+    }
     if (ctx->options.use_file_metacache) {
         _cache = DataCache::GetInstance()->page_cache();
     }
@@ -413,8 +417,8 @@ void FileReader::_maybe_consult_rap_index_impl() {
 void FileReader::_maybe_attach_rap_builders() {
     _rap_builds.clear();
     _rap_build_dir.clear();
-    const std::string dir = config::rap_build_index_dir;
-    const std::string cols = config::rap_build_index_columns;
+    const std::string dir = _rap_build_lease ? _rap_build_lease->spec().directory : config::rap_build_index_dir;
+    const std::string cols = _rap_build_lease ? _rap_build_lease->spec().column : config::rap_build_index_columns;
     if (dir.empty() || cols.empty() || _scanner_ctx == nullptr || _file_metadata == nullptr) return;
     FormatScannerStats* stats = _scanner_ctx->stats;
     auto skip = [&](const std::string& why) {

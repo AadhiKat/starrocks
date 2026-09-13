@@ -423,6 +423,8 @@ struct TQueryOptions {
   // it even when the scan-range count already reaches pipeline_dop) once its rows exceed this ratio times
   // the per-driver ideal share. Only affects enable_lake_prepared_physical_split_scan. Default 1.5.
   225: optional double lake_tablet_internal_parallel_skew_split_ratio = 1.5;
+  // Query-scoped RAP scan builder. Unknown/fenced tokens reject builder admission.
+  226: optional string rap_build_token;
 }
 
 // A scan range plus the parameters needed to execute that scan.

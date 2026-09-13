@@ -111,6 +111,7 @@ set(EXEC_FILES
         ./formats/parquet/column_reader_factory_test.cpp
         ./formats/parquet/parquet_file_writer_test.cpp
         ./formats/parquet/rap_sidecar_builder_test.cpp
+        ./formats/parquet/rap_build_gate_reader_test.cpp
         ./formats/parquet/parquet_footer_test.cpp
         ./formats/parquet/parquet_cli_reader.h
         ./formats/parquet/parquet_cli_reader_test.cpp

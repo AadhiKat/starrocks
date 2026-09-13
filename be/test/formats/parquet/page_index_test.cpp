@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <map>
 #include <random>
 #include <vector>
 
@@ -357,6 +358,215 @@ TEST_F(PageIndexTest, TestRandomReadWith2PageSize) {
             }
         }
     }
+}
+
+// RAP / lake-index row-range transport.
+//
+// astra CX-12 r1: ranges.size() is not a pruning metric -- an unpruned column emits ONE
+//   whole-chunk range while a pruned one emits a range per selected page plus a
+//   dictionary range, so pruning can INCREASE the count. Compare bytes and contents.
+// astra CX-12 r2: planned ranges must be captured before consumption -- get_next() nulls
+//   out row-group readers on exhaustion.
+// astra CX-12 r3: init() prepares ONLY the first group; later groups are prepared in
+//   get_next(). Collecting straight after init() mixes page-selected ranges (group 0)
+//   with whole-chunk ranges (the rest). Prepare each group, and key bytes by the group's
+//   PHYSICAL first row so a filtered earlier group cannot shift positional comparisons.
+TEST_F(PageIndexTest, TestSelectedRowRangesSkipPages) {
+    const std::string small_page_file = "./be/test/formats/parquet/test_data/page_index_small_page.parquet";
+
+    struct Result {
+        int64_t planned_bytes = 0; // planned IO, not observed storage reads
+        std::map<uint64_t, int64_t> bytes_by_first_row; // keyed by physical group identity
+        size_t groups_kept = 0;
+        size_t rows_returned = 0;
+        std::vector<int32_t> values;
+    };
+
+    // c0 in (5500, 7500). Applied to whichever context needs it.
+    auto apply_predicate = [&](HdfsScannerContext* c) {
+        Utils::SlotDesc min_max_slots[] = {{"c0", TypeDescriptor::from_logical_type(LogicalType::TYPE_INT), 0}, {""}};
+        c->format_scan_context.conjunct_ctxs_by_slot[0].clear();
+        c->format_scan_context.conjuncts.min_max_ctxs.clear();
+        c->min_max_tuple_desc = Utils::create_tuple_descriptor(_runtime_state, &_pool, min_max_slots);
+        std::vector<TExpr> t_conjuncts;
+        ParquetUTBase::append_int_conjunct(TExprOpcode::GT, 0, 5500, &t_conjuncts);
+        ParquetUTBase::append_int_conjunct(TExprOpcode::LT, 0, 7500, &t_conjuncts);
+        ParquetUTBase::create_conjunct_ctxs(&_pool, _runtime_state, &t_conjuncts,
+                                            &c->format_scan_context.conjuncts.min_max_ctxs);
+        ParquetUTBase::create_conjunct_ctxs(&_pool, _runtime_state, &t_conjuncts,
+                                            &c->format_scan_context.conjunct_ctxs_by_slot[0]);
+        Utils::SlotDesc slot_descs[] = {{"c0", TypeDescriptor::from_logical_type(LogicalType::TYPE_INT)}, {""}};
+        TupleDescriptor* td = Utils::create_tuple_descriptor(_runtime_state, &_pool, slot_descs);
+        std::vector<ExprContext*> all;
+        for (auto* e : c->format_scan_context.conjuncts.min_max_ctxs) all.push_back(e);
+        for (auto* e : c->format_scan_context.conjunct_ctxs_by_slot[0]) all.push_back(e);
+        ParquetUTBase::setup_conjuncts_manager(all, nullptr, td, _runtime_state, c);
+    };
+
+    auto run = [&](std::vector<RowRangeHint> hint, bool with_predicate) {
+        Result out;
+
+        // Pass 1: accounting. This reader is never consumed, so released pointers are
+        // unreachable and consumption cannot perturb the measurement.
+        {
+            auto ctx = _create_file_only_c0_context(small_page_file);
+            auto file = _create_file(small_page_file);
+            ctx->format_scan_context.selected_row_ranges = hint;
+            if (with_predicate) apply_predicate(ctx);
+            auto reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                       std::filesystem::file_size(small_page_file));
+            Status st = reader->init(&ctx->format_scan_context);
+            EXPECT_TRUE(st.ok()) << st.message();
+            out.groups_kept = reader->_row_group_readers.size();
+            for (size_t gi = 0; gi < reader->_row_group_readers.size(); ++gi) {
+                auto& rg = reader->_row_group_readers[gi];
+                if (rg == nullptr) continue;
+                if (gi > 0) { // init() already prepared group 0
+                    Status ps = rg->prepare();
+                    EXPECT_TRUE(ps.ok()) << ps.message();
+                }
+                std::vector<SharedBufferedInputStream::IORange> ranges;
+                int64_t end_offset = 0;
+                rg->collect_io_ranges(&ranges, &end_offset);
+                int64_t g = 0;
+                for (const auto& r : ranges) g += r.size;
+                out.bytes_by_first_row[rg->get_row_group_first_row()] = g;
+                out.planned_bytes += g;
+            }
+        }
+
+        // Pass 2: contents, from a separate reader.
+        {
+            auto ctx = _create_file_only_c0_context(small_page_file);
+            auto file = _create_file(small_page_file);
+            ctx->format_scan_context.selected_row_ranges = hint;
+            if (with_predicate) apply_predicate(ctx);
+            auto reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                       std::filesystem::file_size(small_page_file));
+            Status st = reader->init(&ctx->format_scan_context);
+            EXPECT_TRUE(st.ok()) << st.message();
+            while (true) { // an empty chunk must not terminate a multi-group read
+                auto chunk = std::make_shared<Chunk>();
+                chunk->append_column(
+                        ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_INT), true),
+                        chunk->num_columns());
+                Status s2 = reader->get_next(&chunk);
+                if (s2.is_end_of_file()) break;
+                EXPECT_TRUE(s2.ok()) << s2.message();
+                for (size_t r = 0; r < chunk->num_rows(); r++) {
+                    out.values.push_back(chunk->get_column_by_index(0)->get(r).get_int32());
+                }
+                out.rows_returned += chunk->num_rows();
+            }
+        }
+        return out;
+    };
+
+    const Result base = run({}, false);
+    ASSERT_GT(base.rows_returned, 0u);
+    ASSERT_GT(base.planned_bytes, 0);
+    ASSERT_GE(base.bytes_by_first_row.size(), 2u) << "fixture must exercise more than one row group";
+
+    // A narrow band plans fewer bytes and returns exactly those rows.
+    const Result hinted = run({RowRangeHint{5000, 8000}}, false);
+    EXPECT_LT(hinted.planned_bytes, base.planned_bytes);
+    EXPECT_EQ(hinted.rows_returned, 3000u);
+    ASSERT_EQ(hinted.values.size(), 3000u);
+    EXPECT_EQ(hinted.values.front(), 5001); // c0 = arange(1, 20001)
+    EXPECT_EQ(hinted.values.back(), 8000);
+    EXPECT_EQ(std::vector<int32_t>(base.values.begin() + 5000, base.values.begin() + 8000), hinted.values);
+
+    // Disjoint bands.
+    const Result split = run({RowRangeHint{1000, 2000}, RowRangeHint{15000, 16000}}, false);
+    EXPECT_EQ(split.rows_returned, 2000u);
+    EXPECT_LT(split.planned_bytes, base.planned_bytes);
+    ASSERT_EQ(split.values.size(), 2000u);
+    EXPECT_EQ(split.values.front(), 1001);
+    EXPECT_EQ(split.values[1000], 15001);
+    // per PHYSICAL group, and STRICTLY less wherever the group survives in both:
+    // equality would be satisfied by a regression that restores whole-chunk reads.
+    for (const auto& [first_row, bytes] : split.bytes_by_first_row) {
+        auto it = base.bytes_by_first_row.find(first_row);
+        ASSERT_NE(it, base.bytes_by_first_row.end());
+        EXPECT_LT(bytes, it->second) << "row group at first_row=" << first_row
+                                     << " fetched whole chunks despite a partial selection";
+    }
+
+    // A LATER group, partially selected, with earlier groups filtered. This is the case
+    // that catches a regression confined to later-group page selection: positional
+    // comparison would be wrong here, which is why keys are physical first-row values.
+    const Result late_partial = run({RowRangeHint{12000, 13000}}, false);
+    EXPECT_EQ(late_partial.rows_returned, 1000u);
+    ASSERT_EQ(late_partial.bytes_by_first_row.size(), 1u);
+    {
+        const auto& [first_row, bytes] = *late_partial.bytes_by_first_row.begin();
+        auto it = base.bytes_by_first_row.find(first_row);
+        ASSERT_NE(it, base.bytes_by_first_row.end()) << "surviving group must exist in the baseline";
+        EXPECT_LT(bytes, it->second) << "later-group page selection did not reduce planned bytes";
+    }
+
+    // astra CX-11: a hint missing every group must FILTER them, not leave an empty range
+    // for select_offset_index() to index into.
+    const Result none = run({RowRangeHint{9000000, 9000100}}, false);
+    EXPECT_EQ(none.rows_returned, 0u);
+    EXPECT_EQ(none.groups_kept, 0u);
+
+    // No hint is byte-for-byte and content-for-content the previous behaviour.
+    const Result again = run({}, false);
+    EXPECT_EQ(again.planned_bytes, base.planned_bytes);
+    EXPECT_EQ(again.values, base.values);
+
+    // Malformed intervals are ignored; never row loss.
+    const Result bad = run({RowRangeHint{500, 500}, RowRangeHint{900, 100}}, false);
+    EXPECT_EQ(bad.planned_bytes, base.planned_bytes);
+    EXPECT_EQ(bad.values, base.values);
+
+    // astra CX-11 composition, OVERLAPPING: predicate c0 in (5500,7500), hint [6000,9000).
+    const Result pred_only = run({}, true);
+    ASSERT_GT(pred_only.rows_returned, 0u);
+    const Result composed = run({RowRangeHint{6000, 9000}}, true);
+    ASSERT_GT(composed.rows_returned, 0u);
+    for (int32_t v : composed.values) {
+        EXPECT_GT(v, 5500);
+        EXPECT_LT(v, 7500);
+        EXPECT_GT(v, 6000) << "row below the hint start survived: composition replaced instead of intersected";
+    }
+    EXPECT_LT(composed.rows_returned, pred_only.rows_returned);
+
+    // astra CX-11 composition, DISJOINT: predicate (5500,7500) vs hint [8000,9000).
+    const Result disjoint = run({RowRangeHint{8000, 9000}}, true);
+    EXPECT_EQ(disjoint.rows_returned, 0u)
+            << "disjoint predicate and hint returned rows: composition replaced instead of intersected";
+}
+
+// astra CX-12: the scanner-boundary conversion needs its own control, because the test
+// above injects FormatScanContext directly. NOTE: this covers the conversion FUNCTION,
+// not its call site in HdfsScanner::_build_scanner_context(), which remains untested.
+TEST_F(PageIndexTest, TestBuildRowRangeHintsConversion) {
+    auto mk = [](int64_t s, int64_t e) {
+        TRowRange r;
+        r.start_row = s;
+        r.end_row = e;
+        return r;
+    };
+    std::vector<RowRangeHint> out;
+
+    build_row_range_hints({mk(10, 20), mk(30, 40)}, &out);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].start_row, 10);
+    EXPECT_EQ(out[0].end_row, 20);
+    EXPECT_EQ(out[1].start_row, 30);
+
+    build_row_range_hints({mk(5, 5), mk(9, 2), mk(-7, -1)}, &out); // empty/inverted/negative
+    EXPECT_TRUE(out.empty());
+
+    build_row_range_hints({mk(-5, 3)}, &out); // negative start clamped, not rejected
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].start_row, 0);
+    EXPECT_EQ(out[0].end_row, 3);
+
+    build_row_range_hints({}, &out); // output always reset
+    EXPECT_TRUE(out.empty());
 }
 
 TEST_F(PageIndexTest, TestCollectIORangeWithPageIndex) {

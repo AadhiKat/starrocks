@@ -393,6 +393,13 @@ struct TDeletionVectorDescriptor {
 struct THdfsScanRangeExt {
 }
 
+// A half-open interval of absolute row positions within one data file: [start, end).
+// Used by the RAP / lake-index row-range transport on THdfsScanRange.
+struct TRowRange {
+  1: required i64 start_row
+  2: required i64 end_row
+}
+
 // Hdfs scan range
 struct THdfsScanRange {
     // File name (not the full path).  The path is assumed to be relative to the
@@ -522,6 +529,18 @@ struct THdfsScanRange {
 
     // split info serialized by org.apache.paimon.table.source.DataSplit.serialize
     45: optional binary paimon_split_info_binary
+
+    // RAP / lake-index row-range transport.
+    // Absolute row positions within this data file that an external index has
+    // determined may contain matches. Half-open [start, end) intervals, ascending
+    // and non-overlapping. The BE intersects these into GroupReader's SparseRange
+    // before page selection, so non-matching pages are never fetched.
+    //
+    // ADVISORY AND CONSERVATIVE: the ranges may be a superset of the true matches,
+    // and ordinary predicate evaluation still runs on the rows that are read. An
+    // absent or empty list means "no hint" and the scan behaves exactly as before,
+    // which is what keeps this backward compatible with an FE that does not set it.
+    46: optional list<TRowRange> selected_row_ranges
 }
 
 struct TBinlogScanRange {

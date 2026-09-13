@@ -36,7 +36,7 @@ struct ParquetField;
 enum ColumnContentType { VALUE, DICT_CODE };
 
 enum ColumnIOType { INVALID = 0, PAGE_INDEX = 1, PAGES = 2, BLOOM_FILTER = 4 };
-enum CacheType { META, PAGE };
+enum CacheType { META, PAGE, INDEX };
 
 using ColumnIOTypeFlags = int32_t;
 
@@ -69,7 +69,7 @@ public:
     static bool has_non_null_binary_value(const Column* column, size_t num_rows);
 
 private:
-    inline static const std::vector<std::string> cache_key_prefix{"ft", "pg"};
+    inline static const std::vector<std::string> cache_key_prefix{"ft", "pg", "ix"};
 };
 
 // Infer typed descriptor for variant typed_value Parquet field (scalar/array/map/struct).

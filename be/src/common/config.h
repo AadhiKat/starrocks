@@ -1388,6 +1388,24 @@ CONF_mBool(parquet_runtime_filter_push_down_enable, "true");
 CONF_mBool(parquet_reader_enable_adpative_bloom_filter, "true");
 CONF_Double(parquet_page_cache_decompress_threshold, "1.5");
 CONF_mBool(enable_adjustment_page_cache_skip, "true");
+// RAP / lake-index slice m1: directory holding per-file RAPX sidecars (<basename>.rapx). Empty = off.
+CONF_mString(rap_index_dir, "");
+// slice 2f: joins every RAP cache key (READY and negative entries); bump it to invalidate after a sidecar rebuild
+CONF_mString(rap_index_generation, "");
+// RAP / lake-index slice 3a: index at export. A non-empty dir plus a comma-separated column list makes the
+// Parquet writer emit <dir>/<basename>.<column>.rapx next to every data file it closes. Empty = off.
+CONF_mString(rap_export_index_dir, "");
+CONF_mString(rap_export_index_columns, "");
+// RAP / lake-index slice 4 (P3b, scan and build): a non-empty dir plus a comma-separated column list makes a WHOLE-FILE
+// Parquet scan (no predicate, no row-range hint, no delete filter, every row group) build <dir>/<key>.<column>.rapx for
+// the files it reads completely; an existing object is never overwritten. Empty = off.
+CONF_mString(rap_build_index_dir, "");
+CONF_mString(rap_build_index_columns, "");
+// slice 4 (fork production-readiness review, PRD-02): admission limits for sidecars -- a sidecar above the byte ceiling is
+// refused before it is read; a header declaring more values / ranges than this, or more than the body can hold, is
+// refused before any allocation; a builder stops at the distinct-value ceiling and writes nothing.
+CONF_mInt64(rap_index_max_sidecar_bytes, "67108864");
+CONF_mInt64(rap_index_max_values, "4194304");
 
 CONF_Int32(io_coalesce_read_max_buffer_size, "8388608");
 CONF_Int32(io_coalesce_read_max_distance_size, "1048576");

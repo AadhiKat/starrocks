@@ -82,6 +82,16 @@ namespace starrocks::formats {
 
 using FileColumnId = ::starrocks::parquet::FileColumnId;
 
+class RapSidecarBuilder;
+
+// RAP slice 3a: what the writer did for sidecars (reported through the sink profile later)
+struct RapExportStats {
+    int64_t sidecars_written = 0;
+    int64_t sidecar_bytes = 0;
+    int64_t failures = 0;
+    int64_t build_ns = 0;
+};
+
 struct ParquetWriterOptions : FileWriterOptions {
     int64_t dictionary_pagesize = 1024 * 1024; // 1MB
     int64_t page_size = 1024 * 1024;           // 1MB
@@ -125,6 +135,10 @@ public:
 
     FileCommitResult close() override;
 
+    // RAP slice 3a: emit a RAPX sidecar per listed string column into `dir` through `fs` (null/empty = off)
+    void set_rap_export(std::shared_ptr<FileSystem> fs, std::string dir, std::vector<std::string> columns);
+    const RapExportStats& rap_export_stats() const { return _rap_stats; }
+
 private:
     arrow::Result<std::shared_ptr<::parquet::schema::GroupNode>> _make_schema(
             const std::vector<std::string>& file_column_names, const std::vector<TypeDescriptor>& type_descs,
@@ -133,6 +147,7 @@ private:
     static FileStatistics _statistics(const ::parquet::FileMetaData* meta_data, bool has_field_id);
 
     Status _flush_row_group();
+    void _write_rap_sidecars(FileCommitResult* result);
 
     std::shared_ptr<::parquet::WriterProperties> _properties;
     std::shared_ptr<::parquet::schema::GroupNode> _schema;
@@ -151,6 +166,15 @@ private:
     std::shared_ptr<::parquet::ParquetFileWriter> _writer;
     std::shared_ptr<parquet::ChunkWriter> _rowgroup_writer;
     const std::function<void()> _rollback_action;
+
+    // RAP slice 3a
+    std::shared_ptr<FileSystem> _rap_fs;
+    std::string _rap_dir;
+    std::vector<std::string> _rap_columns;
+    std::vector<std::pair<size_t, std::unique_ptr<RapSidecarBuilder>>> _rap_builders; // (column index, builder)
+    int64_t _rap_rows_seen = 0;
+    RapExportStats _rap_stats;
+    std::unordered_map<size_t, std::pair<Chunk*, ColumnPtr>> _rap_eval_cache; // CX-36: one evaluation per chunk per indexed column
 };
 
 class ParquetFileWriterFactory : public FileWriterFactory {

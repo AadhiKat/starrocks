@@ -116,6 +116,19 @@ struct GroupReaderParam {
     // Kept directly in GroupReaderParam for test-compatibility; also used by
     // _get_extended_bigint_value() to read extended_columns from the scan range.
     int32_t scan_range_id = -1;
+
+    // RAP / lake-index row-range transport (from THdfsScanRange.selected_row_ranges,
+    // converted at the scanner boundary so BE internals stay thrift-free).
+    // Absolute, ascending, non-overlapping half-open row intervals for this FILE.
+    // GroupReader::init() intersects them into _range, which makes prepare() run
+    // select_offset_index() and physically skip non-matching pages.
+    //
+    // nullptr or empty == no hint, and the scan is byte-for-byte what it was before.
+    // The hint is ADVISORY: it may over-select, and predicates still evaluate on
+    // whatever is read, so a wrong hint costs IO but cannot change results. A hint
+    // that UNDER-selects would drop rows, which is why the FE side must apply the
+    // completeness rule before ever setting this.
+    const std::vector<RowRangeHint>* selected_row_ranges = nullptr;
 };
 
 class GroupReader {
@@ -150,6 +163,22 @@ private:
     StatusOr<Datum> _get_extended_bigint_value(SlotId slot_id) const;
     StatusOr<ColumnReaderPtr> _create_column_reader(const GroupReaderParam::Column& column);
     void _process_columns_and_conjunct_ctxs();
+    // RAP row-range transport: intersect param.selected_row_ranges into _range.
+    void _apply_selected_row_ranges();
+
+public:
+    // True when a well-formed row-range hint selects nothing inside THIS row group.
+    // The group must then be filtered outright: leaving an empty _range instead would
+    // reach select_offset_index(), which reads range[0] without a size check
+    // (scalar_column_reader.cpp) -- undefined behaviour. astra CX-11.
+    bool hint_excludes_group() const { return _hint_excludes_group; }
+
+    // Intersect an externally computed range into _range, rather than replacing it.
+    // Built-in page pruning must COMPOSE with the transport hint, not erase it.
+    void intersect_range(const SparseRange<uint64_t>& other);
+
+private:
+    bool _hint_excludes_group = false;
     bool _try_to_use_dict_filter(const GroupReaderParam::Column& column, ExprContext* ctx,
                                  std::vector<std::string>& sub_field_path, bool is_decode_needed);
     Status _prepare_column_readers() const;

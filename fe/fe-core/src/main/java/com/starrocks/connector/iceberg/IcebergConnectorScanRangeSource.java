@@ -130,6 +130,8 @@ public class IcebergConnectorScanRangeSource extends ConnectorScanRangeSource {
     private final boolean useMinMaxOpt;
     private final PartitionIdGenerator partitionIdGenerator;
     private final boolean usedForDelete;
+    // RAP / lake-index slice 2b: null = no manifest consulted; otherwise M ∪ (P − C) per data file
+    private RapCoverage rapCoverage = null;
 
     public IcebergConnectorScanRangeSource(IcebergTable table,
                                            RemoteFileInfoSource remoteFileInfoSource,
@@ -165,6 +167,14 @@ public class IcebergConnectorScanRangeSource extends ConnectorScanRangeSource {
         this.partitionIdGenerator = partitionIdGenerator;
         this.useMinMaxOpt = useMinMaxOpt;
         this.usedForDelete = usedForDelete;
+    }
+
+    public void setRapCoverage(RapCoverage coverage) {
+        this.rapCoverage = coverage;
+    }
+
+    public RapCoverage getRapCoverage() {
+        return rapCoverage;
     }
 
     public void clearScannedFiles() {
@@ -209,6 +219,11 @@ public class IcebergConnectorScanRangeSource extends ConnectorScanRangeSource {
                 IcebergRemoteFileInfo icebergRemoteFileInfo = remoteFileInfo.cast();
                 FileScanTask fileScanTask = icebergRemoteFileInfo.getFileScanTask();
                 checkFileFormatSupportedDelete(fileScanTask, usedForDelete);
+                // RAP slice 2b: a covered file whose postings hold no matching row is not scheduled;
+                // an uncovered file, or any doubt, is scanned as before (completeness rule M ∪ (P − C))
+                if (rapCoverage != null && rapCoverage.decide(fileScanTask.file()) == RapCoverage.Decision.DROP) {
+                    continue;
+                }
                 res.addAll(toScanRanges(fileScanTask));
                 if (recordScanFiles) {
                     scannedDataFiles.add(fileScanTask.file());

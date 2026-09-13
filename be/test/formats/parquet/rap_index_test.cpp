@@ -1595,7 +1595,8 @@ TEST_F(RapIndexTest, KeyUsesLastDataSegment) { // c (v3/v4: no data/ rule; the t
 TEST_F(RapIndexTest, KeyWithoutDataRootIsTheFullPath) { // d (v2: never the basename; v4: the local filesystem is `file/`)
     EXPECT_EQ(RapIndex::key_of("gs://b/t/other/x.parquet"), "gs/b/t/other/x.parquet");
     EXPECT_EQ(RapIndex::key_of("/root/fixtures/n5m/x.parquet"), "file/root/fixtures/n5m/x.parquet");
-    EXPECT_EQ(RapIndex::key_of("x.parquet"), "file/x.parquet");
+    // v4b: a relative local path is resolved against the working directory, so it cannot share `/x.parquet`'s key
+    EXPECT_EQ(RapIndex::key_of("x.parquet"), "file" + std::filesystem::current_path().string() + "/x.parquet");
     EXPECT_EQ(RapIndex::key_of("gs://b/t/data/"), "gs/b/t/data/");
 }
 
@@ -2232,6 +2233,66 @@ TEST_F(RapIndexTest, DeclaredCountsAreBoundedBeforeAllocation) {
         EXPECT_EQ(ok.state, RapIndex::State::READY) << ok.reason;
         fs::remove_all(tmp);
     }
+}
+
+// slice 2g v4b (m39 review, F-COLLISION / PRD-01). A relative local path is not an identity on its own: as v4 was first
+// written, `x.parquet` and `/x.parquet` took the same key, so one file's sidecar could be consulted for another file
+// entirely. The key now resolves a relative local path against the working directory. Contract first, then the real
+// reader: the fixture file is presented under a RELATIVE name, from a working directory that is not its own, with two
+// sidecars in the directory -- one keyed by the RESOLVED name (this file's own postings) and one keyed by the
+// UNRESOLVED name, which is what an absolute `/<rel>` would use and which here holds the OTHER fixture file's postings.
+// The resolved one answers; the unresolved one is never consulted, and on its own it is ABSENT rather than another
+// file's index.
+TEST_F(RapIndexTest, RelativeLocalNameDoesNotShareAKeyWithAnAbsoluteOne) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    namespace fs = std::filesystem;
+    EXPECT_EQ(RapIndex::key_of("/x.parquet"), "file/x.parquet");
+    EXPECT_NE(RapIndex::key_of("x.parquet"), RapIndex::key_of("/x.parquet"));
+    EXPECT_NE(RapIndex::key_of("a/b/x.parquet"), RapIndex::key_of("/a/b/x.parquet"));
+    EXPECT_EQ(RapIndex::key_of("file:///x.parquet"), RapIndex::key_of("/x.parquet"));
+    const fs::path tmp = fs::temp_directory_path() / ("rap_rel_" + std::to_string(::getpid()));
+    fs::create_directories(tmp / "work");
+    const std::string f0 = _fixture_dir + "/" + kFile0;
+    const std::string dir = (tmp / "rapx").string();
+    const std::string rel = "rap_rel_" + std::to_string(::getpid()) + ".parquet";
+    const fs::path cwd0 = fs::current_path();
+    fs::current_path(tmp / "work");
+    const std::string resolved = RapIndex::key_of(rel);   // file/<tmp>/work/<rel>
+    const std::string unresolved = "file/" + rel;         // the key an absolute /<rel> would take
+    ASSERT_NE(resolved, unresolved);
+    auto place = [&](const std::string& from_file, const std::string& key) {
+        std::ifstream in(sidecar_of(from_file), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_GT(bytes.size(), 100u);
+        const fs::path sc = fs::path(dir) / (key + ".model" + RapIndex::kSuffix);
+        fs::create_directories(sc.parent_path());
+        std::ofstream out(sc.string(), std::ios::binary);
+        const std::string keyed = rekey_sidecar(bytes, key);
+        out.write(keyed.data(), static_cast<std::streamsize>(keyed.size()));
+        return sc;
+    };
+    const fs::path a = place(kFile0, resolved);   // this file's own postings, at the resolved key
+    place(kFile1, unresolved);                    // the other file's, at the ambiguous key
+    std::string diag;
+    _file_name_override = rel;
+    const Result base = run(f0, {"2203129G"}, "");
+    ASSERT_FALSE(base.rows.empty());
+    const Result on = run(f0, {"2203129G"}, dir);
+    EXPECT_TRUE(same_multiset(on.rows, base.rows, &diag)) << diag;
+    EXPECT_EQ(on.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(on.stats_delta.rap_index_ready, 2) << "the sidecar at the RESOLVED key is this file's";
+    EXPECT_EQ(on.stats_delta.rap_index_unusable, 0) << "the sidecar at the unresolved key must never be opened";
+    EXPECT_LT(on.planned_bytes, base.planned_bytes);
+    fs::remove(a);                                // only the ambiguous sidecar remains
+    const Result miss = run(f0, {"2203129G"}, dir);
+    EXPECT_TRUE(same_multiset(miss.rows, base.rows, &diag)) << diag;
+    EXPECT_EQ(miss.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(miss.stats_delta.rap_index_ready, 0) << "another path's sidecar must not answer this file";
+    EXPECT_EQ(miss.stats_delta.rap_index_unusable, 0) << "it must be ABSENT: the key does not name it at all";
+    EXPECT_EQ(miss.planned_bytes, base.planned_bytes);
+    _file_name_override.clear();
+    fs::current_path(cwd0);
+    fs::remove_all(tmp);
 }
 
 // slice 4 fix-up 4 (m39, raised by Codex's P3b cancellation question). The scan-side builder writes to the directory it

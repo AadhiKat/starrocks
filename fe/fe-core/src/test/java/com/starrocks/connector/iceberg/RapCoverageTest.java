@@ -416,7 +416,12 @@ public class RapCoverageTest extends TableTestBase {
         // m37 review: a relative key and a custom-root key must not share one namespace
         Assertions.assertNotEquals(RapCoverage.keyOf("gs://b/t/data/b/custom/p=0/x.parquet"),
                 RapCoverage.keyOf("gs://b/custom/p=0/x.parquet"));
-        Assertions.assertEquals("file/x.parquet", RapCoverage.keyOf("x.parquet"));
+        // v4b (m39 review): a relative local path is resolved against the working directory, so it cannot take the
+        // same key as the absolute path with the same spelling
+        Assertions.assertEquals("file" + java.nio.file.Paths.get("").toAbsolutePath() + "/x.parquet",
+                RapCoverage.keyOf("x.parquet"));
+        Assertions.assertEquals("file/x.parquet", RapCoverage.keyOf("/x.parquet"));
+        Assertions.assertNotEquals(RapCoverage.keyOf("x.parquet"), RapCoverage.keyOf("/x.parquet"));
         // m38 review (F-COLLISION / PRD-01): gs://, s3:// and the local filesystem are three namespaces and three keys;
         // file:// is the local filesystem; a differently spelled scheme is a different key (a miss, never a wrong answer)
         Assertions.assertEquals("s3/fixture-bucket/t/data/p=0/x.parquet",

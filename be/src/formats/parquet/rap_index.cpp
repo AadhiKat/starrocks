@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
+#include <system_error>
 
 #include "base/hash/crc32c.h"
 #include "common/config.h"
@@ -112,6 +114,21 @@ std::string RapIndex::key_of(const std::string& path) {
         scheme = path.substr(0, sch);
         rest = path.substr(sch + 3);
         if (scheme.empty()) scheme = "file";
+    }
+    // slice 2g v4b (m39 review): a RELATIVE local path is not an identity on its own -- `x.parquet` names a file only
+    // together with the process's working directory, and under the plain rule it took the same key as the absolute
+    // `/x.parquet`. It is resolved against the working directory here, so the two cannot collide. No normalisation is
+    // done (`a/../x` is left alone): a lexical rewrite across a symlink would name a DIFFERENT file, and a key that
+    // merely misses is safe while a key that matches the wrong file is not. If the working directory cannot be read the
+    // path keeps its own namespace, `file-rel/`, which no absolute path can occupy.
+    if (scheme == "file" && !rest.empty() && rest.front() != '/') {
+        std::error_code ec;
+        const std::filesystem::path cwd = std::filesystem::current_path(ec);
+        if (ec) {
+            scheme = "file-rel";
+        } else {
+            rest = cwd.string() + "/" + rest;
+        }
     }
     while (!rest.empty() && rest.front() == '/') rest.erase(0, 1);
     return scheme + "/" + rest;

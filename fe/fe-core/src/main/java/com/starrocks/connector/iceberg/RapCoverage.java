@@ -324,6 +324,12 @@ public class RapCoverage {
         if (scheme.isEmpty()) {
             scheme = "file";
         }
+        // slice 2g v4b (m39 review): a relative local path names a file only together with the process's working
+        // directory, and under the plain rule it took the same key as the absolute path with the same spelling.
+        // Resolve it; do not normalise, since a lexical rewrite across a symlink would name a different file.
+        if ("file".equals(scheme) && !p.isEmpty() && !p.startsWith("/")) {
+            p = java.nio.file.Paths.get("").toAbsolutePath() + "/" + p;
+        }
         while (p.startsWith("/")) {
             p = p.substring(1);
         }

@@ -411,8 +411,8 @@ void FileReader::_maybe_consult_rap_index_impl() {
 // RAP / lake-index slice 4 (P3b, "scan and build"): when rap_build_index_dir names a directory and rap_build_index_columns
 // lists columns, a WHOLE-FILE read builds one sidecar per listed column present in the scan, exactly as the export
 // writer does at close, and writes it to <dir>/<key>.<column>.rapx through the scan's filesystem. Attached only when
-// nothing narrows the read (no predicate tree, no row-range hint, no runtime-filter pruner, no delete filter, every row
-// group of the file in this scan range); anything else records `skipped: partial read` and builds nothing. An existing
+// nothing narrows the read (no predicate tree, no row-range hint, no REGISTERED runtime filter, no delete filter, every
+// row group of the file in this scan range); anything else records `skipped: partial read` and builds nothing. An existing
 // object is never overwritten (a rebuild is a new directory plus a generation bump, slice 2f's rule).
 void FileReader::_maybe_attach_rap_builders() {
     _rap_builds.clear();
@@ -429,7 +429,13 @@ void FileReader::_maybe_attach_rap_builders() {
     };
     if (_no_materialized_column_scan) return; // nothing to observe (count-only scans)
     if ((_scanner_ctx->predicate_tree != nullptr && !_scanner_ctx->predicate_tree->empty()) ||
-        !_scanner_ctx->selected_row_ranges.empty() || _runtime_filter_scan_range_pruner != nullptr ||
+        !_scanner_ctx->selected_row_ranges.empty() ||
+        // slice 4 fix-up 5 (D13's deployed finding): ask the pruner whether it HAS a runtime filter, not whether it
+        // exists. HdfsScanner::_build_scanner_context() constructs one unconditionally for every Hive / Iceberg scan,
+        // empty when the query carries no filter, so testing the pointer refused every production scan there is and
+        // the builder never attached on a real cluster. A registered filter -- arrived or not -- still refuses the
+        // build: update_range_if_arrived() can narrow the read after it has started, and the postings would be short.
+        (_runtime_filter_scan_range_pruner != nullptr && _runtime_filter_scan_range_pruner->has_runtime_filters()) ||
         (_skip_rows_ctx != nullptr && _skip_rows_ctx->has_skip_rows()) ||
         _row_group_readers.size() != _file_metadata->t_metadata().row_groups.size()) {
         skip("partial read");

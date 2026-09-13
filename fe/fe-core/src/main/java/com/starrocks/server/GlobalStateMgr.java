@@ -69,6 +69,7 @@ import com.starrocks.catalog.GlobalFunctionMgr;
 import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.MetaReplayState;
 import com.starrocks.catalog.PartitionAccessTimeMgr;
+import com.starrocks.catalog.PartitionAccessTimePersister;
 import com.starrocks.catalog.RefreshDictionaryCacheTaskDaemon;
 import com.starrocks.catalog.ResourceGroupMgr;
 import com.starrocks.catalog.ResourceMgr;
@@ -92,6 +93,7 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.InvalidConfException;
 import com.starrocks.common.LogCleaner;
+import com.starrocks.common.Pair;
 import com.starrocks.common.StarRocksException;
 import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.io.Text;
@@ -339,6 +341,7 @@ public class GlobalStateMgr {
     private FrontendDaemon labelCleaner; // To clean old LabelInfo, ExportJobInfos
     private LeaderDaemon txnTimeoutChecker; // To abort timeout txns
     private LeaderDaemon taskCleaner;   // To clean expire Task/TaskRun
+    private LeaderDaemon backupSnapshotCleaner;   // To delete backup snapshots whose ttl elapsed
     private FrontendDaemon tableKeeper;   // Maintain internal history tables
     private JournalWriter journalWriter; // leader only: write journal log
     private Daemon replayer;
@@ -414,6 +417,7 @@ public class GlobalStateMgr {
     private final TabletStatMgr tabletStatMgr;
 
     private final PartitionAccessTimeMgr partitionAccessTimeMgr;
+    private final PartitionAccessTimePersister partitionAccessTimePersister;
 
     private AuthenticationMgr authenticationMgr;
     private AuthorizationMgr authorizationMgr;
@@ -721,6 +725,7 @@ public class GlobalStateMgr {
                 new SystemHandler());
         this.lakeAlterPublishExecutor = ThreadPoolManager.newDaemonCacheThreadPool(
                 Config.publish_version_max_threads, "alter-publish", false);
+        this.lakeAlterPublishExecutor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
 
         this.load = new Load();
         this.streamLoadMgr = new StreamLoadMgr();
@@ -762,6 +767,7 @@ public class GlobalStateMgr {
         this.globalTransactionMgr = new GlobalTransactionMgr(this);
         this.tabletStatMgr = new TabletStatMgr();
         this.partitionAccessTimeMgr = new PartitionAccessTimeMgr();
+        this.partitionAccessTimePersister = new PartitionAccessTimePersister();
         this.authenticationMgr = new AuthenticationMgr();
         this.domainResolver = new DomainResolver(authenticationMgr);
         this.authorizationMgr = new AuthorizationMgr(new DefaultAuthorizationProvider());
@@ -1300,6 +1306,7 @@ public class GlobalStateMgr {
 
             // 6. start task cleaner thread
             createTaskCleaner();
+            createBackupSnapshotCleaner();
             createTableKeeper();
         } catch (Exception e) {
             try {
@@ -1403,10 +1410,11 @@ public class GlobalStateMgr {
             if (!haProtocol.fencing()) {
                 throw new Exception("fencing failed. will exit");
             }
-            long maxJournalId = journal.getMaxJournalId();
+            Pair<Long, Long> journalIdRange = journal.getJournalIdRange();
+            long maxJournalId = journalIdRange.second;
             replayJournal(maxJournalId);
             nodeMgr.checkCurrentNodeExist();
-            journalWriter.init(maxJournalId);
+            journalWriter.init(journalIdRange.first, maxJournalId);
         } catch (Exception e) {
             // A failed activation is not rolled back: a half-done activation (lease published, WAL gate
             // open, daemons started, journal writer initialized) cannot be un-done reliably, so fail fast
@@ -1732,6 +1740,7 @@ public class GlobalStateMgr {
         statisticAutoCollector.start();
         taskManager.start();
         taskCleaner.start();
+        backupSnapshotCleaner.start();
         pipeListener.start();
         pipeScheduler.start();
         mvActiveChecker.start();
@@ -1817,6 +1826,9 @@ public class GlobalStateMgr {
         stopOne("mvActiveChecker", () -> mvActiveChecker.stopBestEffort());
         stopOne("pipeScheduler", () -> pipeScheduler.stopBestEffort());
         stopOne("pipeListener", () -> pipeListener.stopBestEffort());
+        if (backupSnapshotCleaner != null) {
+            stopOne("backupSnapshotCleaner", () -> backupSnapshotCleaner.stopBestEffort());
+        }
         if (taskCleaner != null) {
             stopOne("taskCleaner", () -> taskCleaner.stopBestEffort());
         }
@@ -1938,6 +1950,9 @@ public class GlobalStateMgr {
 
         portConnectivityChecker.start();
         tabletStatMgr.start();
+        // Runs on every FE: each flushes its own recorded partition access times; the leader additionally
+        // loads the read-path baseline and GCs the internal table.
+        partitionAccessTimePersister.start();
         // load and export job label cleaner thread
         labelCleaner.start();
         // ES state store
@@ -2437,6 +2452,20 @@ public class GlobalStateMgr {
             protected void runAfterLeaseValid() {
                 doTaskBackgroundJob();
                 setInterval(Config.task_check_interval_second * 1000L);
+            }
+        };
+    }
+
+    public void createBackupSnapshotCleaner() {
+        backupSnapshotCleaner = new LeaderDaemon("BackupSnapshotCleaner",
+                Config.backup_clean_check_interval_seconds * 1000L) {
+            @Override
+            protected void runAfterLeaseValid() {
+                if (Config.enable_backup_snapshot_auto_clean) {
+                    backupHandler.cleanExpiredSnapshots();
+                }
+                // Re-read each round so changing the interval takes effect without a restart.
+                setInterval(Config.backup_clean_check_interval_seconds * 1000L);
             }
         };
     }

@@ -20,6 +20,8 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.alter.reshard.presplit.Estimates;
+import com.starrocks.alter.reshard.presplit.TabletPreSplitCoordinator;
 import com.starrocks.authorization.PrivilegeBuiltinConstants;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.MaterializedIndex;
@@ -287,6 +289,19 @@ public abstract class LakeOnlineRewriteJobBase
      *  AlterCancelException if the rewrite config is incomplete. Called once at the top of runPendingJob,
      *  before stage 1 — the base cannot see subclass config fields. */
     protected abstract void validateRewriteConfig() throws AlterCancelException;
+
+    protected int selectRequestedTabletCount(PendingPartitionPlan plan, int activeComputeNodeCount) {
+        long targetSize = Config.tablet_reshard_target_size;
+        if (targetSize == 0) {
+            int tabletCount = Math.max(1, plan.baseIndex.getTablets().size());
+            LOG.debug("online rewrite job {} preserves {} tablets for partition {} "
+                            + "because automatic resharding is disabled",
+                    jobId, tabletCount, plan.physicalPartitionId);
+            return tabletCount;
+        }
+        Estimates estimates = new Estimates(plan.partitionDataSize, 0L);
+        return TabletPreSplitCoordinator.selectTabletCount(estimates, activeComputeNodeCount, targetSize);
+    }
 
     // ---- Overridable defaults: the range rewrite keeps these; a sibling job may override -----------
 
@@ -1765,15 +1780,16 @@ public abstract class LakeOnlineRewriteJobBase
             }
 
             if (jobState == JobState.PENDING) {
-                // A PENDING job has installed NO durable catalog state yet. On the leader the shadow index
-                // meta + tablets are registered only inside the WAITING_TXN applier (runPendingJob),
+                // A PENDING job has installed no durable shadow catalog state yet. On the leader the shadow
+                // index meta + tablets are registered only inside the WAITING_TXN applier (runPendingJob),
                 // atomically with the WAITING_TXN journal entry, so the only PENDING journal entry (the
                 // initial ALTER log) carries empty partitionStates and nothing installed. Reconstructing
                 // here would call registerShadowIndexMeta with no per-partition shadow index, leaving the
                 // table with a shadow schema that OlapTableSink.createSchema() sees while createPartition()
                 // has no matching partition index -- loads to the table then fail until the job advances.
-                // So replay installs nothing for PENDING; the resuming leader's runPendingJob builds the
-                // shadow fresh.
+                // Replay must still restore the table reservation; the resuming leader's runPendingJob builds
+                // the shadow fresh.
+                table.setState(jobTableState());
                 LOG.info("Replaying PENDING online rewrite job {}; no durable shadow state to reconstruct.", jobId);
             } else if (jobState == JobState.WAITING_TXN || jobState == JobState.RUNNING) {
                 // WAITING_TXN and RUNNING share the same durable catalog state: the shadow index meta is

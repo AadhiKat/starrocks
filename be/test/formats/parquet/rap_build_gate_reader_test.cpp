@@ -112,6 +112,8 @@ TEST(RapBuildGateReaderTest, WholeFileBuildUsesAttemptSettingsAndDrainsAfterClos
         ASSERT_TRUE(gate.fence(before.boot, before.generation + 1, token, "test"));
         EXPECT_EQ(1, gate.snapshot().active_builders);
         // An admitted reader finishes under its captured settings after the fence.
+        size_t rows_read = 0;
+        size_t nulls_read = 0;
         while (true) {
             auto chunk = std::make_shared<Chunk>();
             chunk->append_column(ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_VARCHAR), true),
@@ -119,21 +121,31 @@ TEST(RapBuildGateReaderTest, WholeFileBuildUsesAttemptSettingsAndDrainsAfterClos
             auto status = reader.get_next(&chunk);
             if (status.is_end_of_file()) break;
             ASSERT_TRUE(status.ok()) << status.message();
+            rows_read += chunk->num_rows();
+            const auto& values = chunk->get_column_by_slot_id(tuple->slots()[0]->id());
+            for (size_t row = 0; row < chunk->num_rows(); ++row) nulls_read += values->is_null(row);
         }
+        // The tracked parquet2 fixture has ten non-null values plus its final NULL row.
+        // Keep this independent of the sidecar header: trusting its count would mask a bad builder.
+        EXPECT_EQ(11, rows_read);
+        EXPECT_EQ(1, nulls_read);
         EXPECT_EQ(1, stats.rap_build_written) << stats.rap_build_reason;
         EXPECT_EQ(1, gate.snapshot().active_builders);
         const auto key = RapIndex::key_of(file->filename());
-        auto index = RapIndex::load(output + "/" + key + ".c3.rapx", {key, size, 10, "c3", -1});
+        auto index = RapIndex::load(output + "/" + key + ".c3.rapx", {key, size, 11, "c3", -1});
         ASSERT_EQ(RapIndex::State::READY, index.state) << index.reason;
         EXPECT_EQ(4, index.index->num_values());
         for (const std::string value : {"a", "b", "c", "d"}) {
             const auto ranges = index.index->lookup({value});
             ASSERT_EQ(1, ranges.size());
             EXPECT_EQ(0, ranges[0].start_row);
-            EXPECT_EQ(10, ranges[0].end_row);
+            EXPECT_EQ(11, ranges[0].end_row);
         }
         EXPECT_TRUE(index.index->lookup({"absent"}).empty());
-        EXPECT_TRUE(index.index->null_ranges().empty());
+        const auto null_ranges = index.index->null_ranges();
+        ASSERT_EQ(1, null_ranges.size());
+        EXPECT_EQ(0, null_ranges[0].start_row);
+        EXPECT_EQ(11, null_ranges[0].end_row);
     }
     EXPECT_EQ(0, gate.snapshot().active_builders);
     EXPECT_EQ(nullptr, gate.acquire(token));

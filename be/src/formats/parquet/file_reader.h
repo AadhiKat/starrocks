@@ -132,6 +132,7 @@ private:
         std::unique_ptr<formats::RapSidecarBuilder> builder;
     };
     std::vector<RapBuild> _rap_builds;
+    std::string _rap_build_dir; // slice 4 fix-up 4: captured at attach; a mid-scan config change cannot move the write
     int64_t _rap_build_rows_seen = 0;
     bool _rap_build_done = false;
     void _maybe_attach_rap_builders();

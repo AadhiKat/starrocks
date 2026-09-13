@@ -2234,6 +2234,56 @@ TEST_F(RapIndexTest, DeclaredCountsAreBoundedBeforeAllocation) {
     }
 }
 
+// slice 4 fix-up 4 (m39, raised by Codex's P3b cancellation question). The scan-side builder writes to the directory it
+// attached to, whatever the runtime config says by the time it finishes. Clearing `rap_build_index_dir` mid-scan used to
+// leave the finish path with an empty directory, and `sidecar_path("")` is RELATIVE: the BE created directories and wrote
+// the sidecar under its own working directory. Here the config is cleared after the first chunk; the sidecar must appear
+// in the attached directory and nothing may appear under the process's working directory.
+TEST_F(RapIndexTest, ScanSideBuilderUsesTheDirectoryCapturedAtAttach) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / ("rap_s4_cap_" + std::to_string(::getpid()));
+    fs::create_directories(tmp);
+    const std::string f0 = _fixture_dir + "/" + kFile0;
+    const std::string rel = RapIndex::key_of(f0) + ".model" + RapIndex::kSuffix;
+    const fs::path stray = fs::current_path() / rel; // where an empty directory would send the write
+    ASSERT_FALSE(fs::exists(stray));
+    config::rap_build_index_dir = tmp.string();
+    config::rap_build_index_columns = "model";
+    auto* ctx = _ctx(f0, {});
+    auto file = *FileSystem::Default()->new_random_access_file(f0);
+    auto reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(), fs::file_size(f0),
+                                               DataCacheOptions(), nullptr, _skip_rows);
+    ASSERT_TRUE(reader->init(&ctx->format_scan_context).ok());
+    bool cleared = false;
+    while (true) {
+        auto chunk = std::make_shared<Chunk>();
+        chunk->append_column(ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR), true), 0);
+        chunk->append_column(ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_BIGINT), true), 1);
+        chunk->append_column(ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR), true), 2);
+        chunk->append_column(ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR), true), 3);
+        const Status s = reader->get_next(&chunk);
+        if (s.is_end_of_file()) break;
+        ASSERT_TRUE(s.ok()) << s.message();
+        if (!cleared) { // the operator stops the build while this scan is still reading
+            config::rap_build_index_dir = "";
+            config::rap_build_index_columns = "";
+            cleared = true;
+        }
+    }
+    config::rap_build_index_dir = "";
+    config::rap_build_index_columns = "";
+    EXPECT_TRUE(cleared) << "the file must have produced at least one chunk before end of file";
+    EXPECT_TRUE(fs::exists(tmp / rel)) << "the sidecar belongs in the directory the scan attached to";
+    EXPECT_FALSE(fs::exists(stray)) << "a cleared build directory must never make the BE write under its working directory";
+    if (fs::exists(stray)) { // only the defect creates these; remove the file and any directories it needed
+        std::error_code ec;
+        fs::remove(stray, ec);
+        for (fs::path p = stray.parent_path(); p != fs::current_path() && !p.empty(); p = p.parent_path()) fs::remove(p, ec);
+    }
+    fs::remove_all(tmp);
+}
+
 // slice 4 fix-up 2 (m38 review, PRD-02). Through a filesystem that cannot report an object's size (fs_hdfs / fs_s3 answer
 // NotSupported), the ceiling has to come from the OPENED stream before any payload byte is read or allocated: an oversized
 // stream is refused with the size named and ZERO reads; the same object at its true size loads READY through the same

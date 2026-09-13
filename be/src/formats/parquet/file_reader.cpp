@@ -412,6 +412,7 @@ void FileReader::_maybe_consult_rap_index_impl() {
 // object is never overwritten (a rebuild is a new directory plus a generation bump, slice 2f's rule).
 void FileReader::_maybe_attach_rap_builders() {
     _rap_builds.clear();
+    _rap_build_dir.clear();
     const std::string dir = config::rap_build_index_dir;
     const std::string cols = config::rap_build_index_columns;
     if (dir.empty() || cols.empty() || _scanner_ctx == nullptr || _file_metadata == nullptr) return;
@@ -454,6 +455,8 @@ void FileReader::_maybe_attach_rap_builders() {
         if (fidx >= 0 && schema.exist_filed_id()) field_id = schema.get_stored_column_by_field_idx(fidx)->field_id;
         _rap_builds.push_back(RapBuild{mc.slot_id(), lt, std::make_unique<formats::RapSidecarBuilder>(name, field_id, lt)});
     }
+    // slice 4 fix-up 4: the destination is fixed here, for this scan, and cannot change under it
+    if (!_rap_builds.empty()) _rap_build_dir = dir;
 }
 
 void FileReader::_rap_build_observe(const ChunkPtr& chunk) {
@@ -479,7 +482,15 @@ void FileReader::_rap_build_finish() {
         skip("partial read (rows)");
         return;
     }
-    std::string rap_dir = config::rap_build_index_dir;
+    // slice 4 fix-up 4 (m39, Codex's P3b cancellation question): the directory is the one CAPTURED AT ATTACH, never
+    // re-read here. Re-reading it meant that clearing `rap_build_index_dir` while a scan was in flight left `rap_dir`
+    // empty, and `sidecar_path("")` is a RELATIVE path -- the BE created directories and wrote the sidecar under its own
+    // working directory. A scan writes where it was told to write when it started, or nowhere.
+    std::string rap_dir = _rap_build_dir;
+    if (rap_dir.empty()) {
+        skip("no build directory");
+        return;
+    }
     FileSystem* fs = _scanner_ctx->fs;
     if (rap_dir.find("://") == std::string::npos) {
         fs = FileSystem::Default();

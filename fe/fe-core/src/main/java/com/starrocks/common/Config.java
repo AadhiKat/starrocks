@@ -1606,6 +1606,16 @@ public class Config extends ConfigBase {
     public static int alter_table_timeout_second = 86400; // 1day
 
     /**
+     * On an aggregate table, ALTER TABLE ... ADD COLUMN with neither an aggregate function nor the
+     * KEY keyword is ambiguous, and treating it as a key column changes the table's aggregation key
+     * and rewrites existing data. When false, such a statement is rejected and the error names both
+     * options. When true, the column becomes a key column, which is the behavior before this was
+     * introduced. Mutable, but not persisted across a restart unless set WITH PERSISTENT.
+     */
+    @ConfField(mutable = true)
+    public static boolean allow_implicit_key_column_in_agg_add_column = true;
+
+    /**
      * The alter handler max worker threads
      */
     @ConfField
@@ -3883,6 +3893,23 @@ public class Config extends ConfigBase {
                     "placed for the sample to be representative, so the scheduler discards it and " +
                     "falls back to a full scan. Lower is more conservative. Default: 40")
     public static int lake_scheduler_colocate_group_sample_empty_fallback_percent = 40;
+
+    @ConfField(mutable = true, comment =
+            "How long a shared-data online rewrite keeps retrying one partition's rewrite INSERT after " +
+                    "it fails, before cancelling the whole job. An online rewrite - a range sort-key " +
+                    "schema change, a range rollup, or a materialized view sort-key rewrite - rebuilds " +
+                    "data one partition per alter-scheduler tick, so a compute node restarting or " +
+                    "crashing mid-INSERT fails that one partition; retrying lets the job resume it " +
+                    "instead of discarding every partition it has already rewritten. Should exceed the " +
+                    "time a node takes to come back, and stays far below alter_table_timeout_second " +
+                    "because compaction on the table is deferred for as long as the rewrite runs. It " +
+                    "is spent only by that partition's own failed attempts, each charged for how long " +
+                    "it ran plus one alter_scheduler_interval_millisecond, so waiting on a different " +
+                    "partition does not consume it. A partition always gets at least one retry, even " +
+                    "when that attempt alone costs more than the window. Set to 0 to cancel the job on " +
+                    "the first failure. " +
+                    "Default: 600")
+    public static int lake_online_rewrite_partition_retry_timeout_second = 600;
 
     /**
      * Default lake compaction txn timeout

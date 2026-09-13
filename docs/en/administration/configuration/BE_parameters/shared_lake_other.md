@@ -597,13 +597,22 @@ This topic introduces the following types of BE configurations:
 - Description: Whether to allow the system to clear the corrupted data cache in a shared-data cluster.
 - Introduced in: v3.4
 
+### lake_pk_index_sst_verify_checksum
+
+- Default: true
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether to verify sstable block checksums when reading the cloud-native Primary Key index (point lookups and compaction merges) in a shared-data cluster. When enabled, corrupted bytes (usually from a corrupted local cache copy) deterministically fail as a Corruption error and trigger the corrupted-cache cleanup, instead of being misparsed or silently returning wrong index values. Note that the automatic cleanup of the corrupted cache additionally requires `lake_clear_corrupted_cache_data` to be enabled.
+- Introduced in: v4.1
+
 ### lake_clear_corrupted_cache_meta
 
 - Default: true
 - Type: Boolean
 - Unit: -
 - Is mutable: Yes
-- Description: Whether to allow the system to clear the corrupted metadata cache in a shared-data cluster.
+- Description: Whether to allow the system to clear the corrupted metadata cache in a shared-data cluster. This covers the local cache of tablet metadata files and transaction log files. When a read of such a file fails with a corruption error, the system drops the cached copy and reads the file again from remote storage once.
 - Introduced in: v3.3
 
 ### lake_enable_horizontal_compaction_fill_data_cache

@@ -23,6 +23,7 @@
 #include "column/column_helper.h"
 #include "common/config.h"
 #include "compute_env/global_dict/fragment_dict_state.h"
+#include "connector/hive/scanner/hdfs_scanner_context.h"
 #include "formats/parquet/parquet_test_util/util.h"
 #include "formats/parquet/rap_index.h"
 #include "fs/fs_memory.h"
@@ -85,7 +86,10 @@ TEST(RapBuildGateReaderTest, WholeFileBuildUsesAttemptSettingsAndDrainsAfterClos
     FragmentDictState dict;
     RuntimeState runtime{TQueryGlobals()};
     runtime.set_fragment_dict_state(&dict);
-    FormatScanContext ctx;
+    // Use the production context constructor: it binds the empty predicate tree
+    // required by FileReader::_filter_group even for an unfiltered whole-file read.
+    HdfsScannerContext scanner;
+    auto& ctx = scanner.format_scan_context;
     FormatScannerStats stats;
     std::atomic<int32_t> coalesce{0};
     ctx.stats = &stats;

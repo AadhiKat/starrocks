@@ -18,7 +18,6 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
-#include <algorithm>
 #include <set>
 #include <string>
 
@@ -85,16 +84,26 @@ void RapBuildAction::handle(HttpRequest* req) {
     rapidjson::StringBuffer buffer;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     writer.StartObject();
-    writer.Key("protocol"); writer.Uint(1);
-    writer.Key("ok"); writer.Bool(ok);
-    writer.Key("boot"); writer.String(state.boot.data(), state.boot.size());
-    writer.Key("generation"); writer.Uint64(state.generation);
-    writer.Key("token"); writer.String(state.spec.token.data(), state.spec.token.size());
-    writer.Key("request_sha256"); writer.String(state.spec.request_sha256.data(), state.spec.request_sha256.size());
-    writer.Key("directory"); writer.String(state.spec.directory.data(), state.spec.directory.size());
-    writer.Key("column"); writer.String(state.spec.column.data(), state.spec.column.size());
-    writer.Key("fenced"); writer.Bool(state.fenced);
-    writer.Key("active_builders"); writer.Uint64(state.active_builders);
+    writer.Key("protocol");
+    writer.Uint(1);
+    writer.Key("ok");
+    writer.Bool(ok);
+    writer.Key("boot");
+    writer.String(state.boot.data(), state.boot.size());
+    writer.Key("generation");
+    writer.Uint64(state.generation);
+    writer.Key("token");
+    writer.String(state.spec.token.data(), state.spec.token.size());
+    writer.Key("request_sha256");
+    writer.String(state.spec.request_sha256.data(), state.spec.request_sha256.size());
+    writer.Key("directory");
+    writer.String(state.spec.directory.data(), state.spec.directory.size());
+    writer.Key("column");
+    writer.String(state.spec.column.data(), state.spec.column.size());
+    writer.Key("fenced");
+    writer.Bool(state.fenced);
+    writer.Key("active_builders");
+    writer.Uint64(state.active_builders);
     writer.EndObject();
     req->add_output_header(HttpHeaders::CONTENT_TYPE, "application/json");
     HttpChannel::send_reply(req, ok ? HttpStatus::OK : HttpStatus::CONFLICT, buffer.GetString());

@@ -14,11 +14,17 @@
 
 package com.starrocks.qe;
 
+import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.ast.OriginStatement;
 import com.starrocks.sql.ast.SetType;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SubmitTaskStmt;
 import com.starrocks.sql.ast.SystemVariable;
 import com.starrocks.sql.ast.expression.StringLiteral;
 import com.starrocks.sql.parser.SqlParser;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -40,13 +46,26 @@ public class RapBuildTokenTest {
     }
 
     @Test
-    public void testTaskHintSyntax() {
+    public void testTaskHintSyntax() throws Exception {
         String sql = "SUBMIT TASK poc.rap_build_0123456789abcdef01234567 AS " +
                 "INSERT /*+ SET_VAR(rap_build_token='rap_build_0123456789abcdef01234567') */ " +
                 "INTO blackhole() SELECT v FROM ice_poc.poc_lake.fixture FOR VERSION AS OF 10";
         SubmitTaskStmt task = (SubmitTaskStmt) SqlParser.parse(sql, new SessionVariable()).get(0);
+        task.setOrigStmt(new OriginStatement(sql, 0));
+        // Catalog resolution is outside this transport test. Exercise the real task SQL
+        // extraction and reparsing while supplying its already-checked temporary-table predicate.
+        new MockUp<AnalyzerUtils>() {
+            @Mock
+            public boolean hasTemporaryTables(StatementBase statement) {
+                return false;
+            }
+        };
+        Analyzer.AnalyzerVisitor.analyzeSubmitTaskOnly(task.getInsertStmt(), task, new ConnectContext());
         Assertions.assertTrue(task.getSqlText().contains("rap_build_token='rap_build_0123456789abcdef01234567'"));
-        Assertions.assertFalse(SqlParser.parse(task.getSqlText(), new SessionVariable()).get(0)
-                .getAllQueryScopeHints().isEmpty());
+        StatementBase execution = SqlParser.parse(task.getSqlText(), new SessionVariable()).get(0);
+        Assertions.assertEquals(1, execution.getAllQueryScopeHints().size());
+        SessionVariable executionSession = new SessionVariable();
+        new VariableMgr().applySessionVariable(execution.getAllQueryScopeHints().get(0).getValue(), executionSession);
+        Assertions.assertEquals("rap_build_0123456789abcdef01234567", executionSession.toThrift().getRap_build_token());
     }
 }

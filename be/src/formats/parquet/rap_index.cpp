@@ -2,6 +2,7 @@
 #include "formats/parquet/rap_index.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
@@ -138,7 +139,24 @@ std::string RapIndex::key_of(const std::string& path) {
 // the lake data (gs://...) is opened by the same connector that opened the data file. A missing
 // object is ABSENT; any other open / read failure is UNUSABLE with the status message, so the scan
 // stays complete and the counter shows it.
-RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const Identity& expect) {
+RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const Identity& expect,
+                              LoadStats* stats, int64_t max_bytes) {
+    LoadStats ignored;
+    if (stats == nullptr) stats = &ignored;
+    ++stats->attempts;
+    const int64_t byte_limit = max_bytes < 0 ? config::rap_index_max_sidecar_bytes
+                                           : std::min(max_bytes, config::rap_index_max_sidecar_bytes);
+    auto timed = [](int64_t& ns, auto&& call) {
+        struct Timer {
+            int64_t& elapsed;
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            ~Timer() {
+                elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+            }
+        } timer{ns};
+        return call();
+    };
     if (fs == nullptr) fs = FileSystem::Default();
     // slice 2e (deployed check D3-c): the HDFS-backed remote filesystems open LAZILY -- a missing object is not
     // reported by new_random_access_file but by the first size/read, as a plain IOError (fs_hdfs.cpp getSize ->
@@ -146,7 +164,7 @@ RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const I
     // absent OR undeterminable (fs_hdfs collapses every non-zero hdfsExists into NotFound, so a denied or
     // unreachable sidecar looks like absence there -- the scan proceeds unindexed and the reason names the step);
     // anything else = UNUSABLE with the step named.
-    Status exists = fs->path_exists(path);
+    Status exists = timed(stats->exists_ns, [&] { return fs->path_exists(path); });
     if (!exists.ok()) {
         if (exists.is_not_found()) {
             Result r;
@@ -158,12 +176,12 @@ RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const I
     }
     // slice 4 (PRD-02): the byte ceiling is applied BEFORE the open where the filesystem can report a size; a filesystem
     // that cannot (fs_hdfs, fs_s3: NotSupported) is bounded below, on the opened stream, before the payload is touched
-    auto size_or = fs->get_file_size(path);
-    if (size_or.ok() && static_cast<int64_t>(*size_or) > config::rap_index_max_sidecar_bytes) {
+    auto size_or = timed(stats->size_ns, [&] { return fs->get_file_size(path); });
+    if (size_or.ok() && (byte_limit < 0 || *size_or > static_cast<uint64_t>(byte_limit))) {
         return unusable("size " + std::to_string(*size_or) + " above rap_index_max_sidecar_bytes " +
-                        std::to_string(config::rap_index_max_sidecar_bytes));
+                        std::to_string(byte_limit));
     }
-    auto file_or = fs->new_random_access_file(path);
+    auto file_or = timed(stats->open_ns, [&] { return fs->new_random_access_file(path); });
     if (!file_or.ok()) {
         // slice 2d: the HDFS-backed remote filesystems (gs://, hdfs://) report a missing object as
         // REMOTE_FILE_NOT_FOUND, not NOT_FOUND; both mean "no sidecar here" -- ABSENT, never UNUSABLE
@@ -179,16 +197,20 @@ RapIndex::Result RapIndex::load(FileSystem* fs, const std::string& path, const I
     // the stream. The ceiling is applied to the OPENED stream's size as well, before any payload byte is allocated or
     // read; a stream whose size cannot be established is refused (UNUSABLE, step named) rather than read blind; the
     // read itself is bounded to the checked size.
-    auto ssize_or = (*file_or)->get_size();
+    auto ssize_or = timed(stats->size_ns, [&] { return (*file_or)->get_size(); });
     if (!ssize_or.ok()) return unusable("size: " + std::string(ssize_or.status().message()));
-    if (*ssize_or < 0 || *ssize_or > config::rap_index_max_sidecar_bytes) {
+    if (*ssize_or < 0 || *ssize_or > byte_limit) {
         return unusable("size " + std::to_string(*ssize_or) + " above rap_index_max_sidecar_bytes " +
-                        std::to_string(config::rap_index_max_sidecar_bytes));
+                        std::to_string(byte_limit));
     }
-    std::string bytes(static_cast<size_t>(*ssize_or), '\0');
-    Status rs = (*file_or)->read_at_fully(0, bytes.data(), static_cast<int64_t>(bytes.size()));
+    std::string bytes;
+    Status rs = timed(stats->read_ns, [&] {
+        bytes.resize(static_cast<size_t>(*ssize_or));
+        return (*file_or)->read_at_fully(0, bytes.data(), static_cast<int64_t>(bytes.size()));
+    });
     if (!rs.ok()) return unusable("read: " + std::string(rs.message()));
-    return parse(bytes, expect);
+    stats->bytes += bytes.size();
+    return timed(stats->parse_ns, [&] { return parse(bytes, expect); });
 }
 
 RapIndex::Result RapIndex::parse(const std::string& b, const Identity& expect) {

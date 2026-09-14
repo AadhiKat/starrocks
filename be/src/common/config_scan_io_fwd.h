@@ -132,6 +132,15 @@ CONF_Double(parquet_page_cache_decompress_threshold, "1.5");
 
 CONF_mBool(enable_adjustment_page_cache_skip, "true");
 
+// RAP / lake-index slice m1: directory holding per-file RAPX sidecars (<basename>.rapx). Empty = off.
+CONF_mString(rap_index_dir, "");
+
+// slice 2f: joins every RAP cache key (READY and negative entries); bump it to invalidate after a sidecar rebuild
+CONF_mString(rap_index_generation, "");
+
+// Experimental operator-directed BE-local parsed-index preloading. Disabled by default.
+CONF_mBool(rap_index_preload_enable, "false");
+
 CONF_Int32(io_coalesce_read_max_buffer_size, "8388608");
 
 CONF_Int32(io_coalesce_read_max_distance_size, "1048576");

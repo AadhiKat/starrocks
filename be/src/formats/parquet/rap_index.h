@@ -85,7 +85,19 @@ public:
     // Load `path` through `fs` (null = FileSystem::Default()). Never throws; a missing file is ABSENT,
     // any other open / read error and anything that is not a valid, identity-matching sidecar is
     // UNUSABLE with a reason.
-    static Result load(FileSystem* fs, const std::string& path, const Identity& expect);
+    struct LoadStats {
+        uint64_t attempts = 0;
+        uint64_t bytes = 0;
+        int64_t exists_ns = 0;
+        int64_t open_ns = 0;
+        int64_t size_ns = 0;
+        int64_t read_ns = 0;
+        int64_t parse_ns = 0;
+    };
+    // Optional diagnostics are local to this call, not query/metric objects shared
+    // with a background thread. max_bytes can only tighten the configured ceiling.
+    static Result load(FileSystem* fs, const std::string& path, const Identity& expect,
+                       LoadStats* stats = nullptr, int64_t max_bytes = -1);
     // Same, through the default filesystem.
     static Result load(const std::string& path, const Identity& expect);
     // Same gate over in-memory bytes (tests, and later a cache).
@@ -123,11 +135,17 @@ public:
         return n;
     }
     const Identity& identity() const { return _identity; }
-    // rough resident size, for the cache's accounting
+    // Conservative resident charge, including vector capacity and string storage.
+    // String SSO capacity is counted twice rather than undercharging background loads.
     size_t approx_bytes() const {
-        size_t n = 0;
-        for (size_t i = 0; i < _values.size(); ++i) n += _values[i].size() + 32 + _ranges[i].size() * sizeof(RowRangeHint);
-        return n + _null_ranges.size() * sizeof(RowRangeHint);
+        size_t n = sizeof(*this) + _values.capacity() * sizeof(std::string) +
+                   _ranges.capacity() * sizeof(std::vector<RowRangeHint>) +
+                   _null_ranges.capacity() * sizeof(RowRangeHint) +
+                   _identity.file_name.capacity() + _identity.column.capacity() + 2;
+        for (size_t i = 0; i < _values.size(); ++i) {
+            n += _values[i].capacity() + 1 + _ranges[i].capacity() * sizeof(RowRangeHint);
+        }
+        return n;
     }
 
 private:

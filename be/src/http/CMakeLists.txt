@@ -42,6 +42,7 @@ set(HTTP_SERVICE_FILES
   action/compaction_action.cpp
   action/update_config_action.cpp
   action/rap_build_action.cpp
+  action/rap_index_preload_action.cpp
   action/runtime_filter_cache_action.cpp
   action/query_cache_action.cpp
   action/datacache_action.cpp

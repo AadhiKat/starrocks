@@ -143,6 +143,7 @@ ADD_BE_LIB(FormatParquet
         parquet/group_reader.cpp
         parquet/file_reader.cpp
         parquet/rap_index.cpp
+        parquet/rap_index_cache.cpp
         parquet/file_writer.cpp
         parquet/rap_sidecar_builder.cpp
         parquet/chunk_writer.cpp

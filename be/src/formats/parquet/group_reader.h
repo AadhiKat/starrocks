@@ -176,8 +176,25 @@ public:
     // Built-in page pruning must COMPOSE with the transport hint, not erase it.
     void intersect_range(const SparseRange<uint64_t>& other);
 
+    // True when _range was assigned from the RAP / lake-index row-range transport
+    // (GroupReaderParam::selected_row_ranges), i.e. this row group's ranges are
+    // RAP-provided. False for every read that carries no hint, including one the
+    // upstream page index narrowed, which is what keeps the index-OFF path identical.
+    bool range_from_row_range_hint() const { return _range_from_row_range_hint; }
+
 private:
     bool _hint_excludes_group = false;
+    bool _range_from_row_range_hint = false;
+
+    // RAP sparse-range override for the active/lazy I/O grouping decision. True when
+    // config::rap_index_lazy_coalesce_sparse_threshold is enabled, _range is RAP-provided,
+    // and the selected rows are a smaller fraction of the row group than the threshold.
+    bool _should_separate_lazy_io_for_sparse_rap_range() const;
+
+    // Picks the active/lazy I/O grouping for this row group and records which term decided it.
+    // `adaptive_says_coalesce` is ReadRangePlanner::should_coalesce_active_lazy(); the return
+    // value is the `coalesce_lazy` argument to SharedBufferedInputStream::set_io_ranges().
+    bool _decide_active_lazy_coalesce(bool adaptive_says_coalesce);
     bool _try_to_use_dict_filter(const GroupReaderParam::Column& column, ExprContext* ctx,
                                  std::vector<std::string>& sub_field_path, bool is_decode_needed);
     Status _prepare_column_readers() const;

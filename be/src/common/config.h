@@ -1363,6 +1363,13 @@ CONF_mString(rap_build_index_columns, "");
 // refused before any allocation; a builder stops at the distinct-value ceiling and writes nothing.
 CONF_mInt64(rap_index_max_sidecar_bytes, "67108864");
 CONF_mInt64(rap_index_max_values, "4194304");
+// RAPX v5 (S8): the builder writes value->granule POSTINGS while their exact encoded body is within this percentage of
+// the DATA file's bytes, and a per-granule min/max ZONE MAP otherwise. It is acceptance row S8 (sidecar <= 2 % of the
+// Parquet file) enforced per file at build time rather than a proxy for it: a near-unique column, whose postings
+// approach one entry per row, takes the zone map and costs ~0.014 % instead of 200 %, and a dimension keeps the
+// postings that narrow. Measured at density: `model` 0.3325 %, worst single file 0.4512 %; `event_time` 19.6 % under
+// postings. harness/rap_index_build.py::POSTINGS_BUDGET_PCT must carry the same number.
+CONF_mDouble(rap_index_postings_budget_pct, "1.0");
 
 CONF_Int32(io_coalesce_read_max_buffer_size, "8388608");
 CONF_Int32(io_coalesce_read_max_distance_size, "1048576");

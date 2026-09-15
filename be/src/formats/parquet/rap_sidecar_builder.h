@@ -11,6 +11,22 @@
 //
 // Keys are kept as canonical bytes and sorted bytewise on encode, which is the order the reader requires and, for the
 // typed encodings, the type's own order.
+//
+// RAPX v5 (2026-09-15, acceptance row S8): `encode` now writes the cardinality-aware format, and it is the ONE place
+// both build paths go through -- the export sink (ParquetFileWriter::_write_rap_sidecars) and the scan-and-build path
+// (FileReader) share this object, so they cannot diverge. At encode time the builder already holds everything the
+// decision needs, so it is made on EXACT byte counts rather than an estimate:
+//
+//   1. the granule sets it accumulated ARE v5's postings -- `_buckets` is already key -> ascending granule ordinals --
+//      so both posting encodings (bitmap, delta-varint runs) are measured and the smaller is written;
+//   2. the per-granule min/max ZONE MAP falls out of the same map for free: std::map iterates bytewise ascending, so
+//      the first key to touch a granule is its minimum and the last is its maximum. No extra state during the write.
+//   3. POSTINGS are written while their exact body is within config::rap_index_postings_budget_pct % of the data
+//      file's bytes; otherwise the ZONE MAP. A near-unique column therefore costs ~0.014 % of the file instead of
+//      200 %, and a dimension keeps the postings that narrow.
+//
+// `shape_of` exposes the decision (and the byte counts behind it) so a test can assert the rule rather than the
+// outcome, and `encode` takes an optional forced shape so both shapes can be exercised on the same data.
 #pragma once
 
 #include <cstdint>
@@ -19,6 +35,7 @@
 #include <vector>
 
 #include "column/vectorized_fwd.h"
+#include "formats/parquet/rap_index.h"
 #include "types/logical_type.h"
 
 namespace starrocks::formats {
@@ -40,9 +57,21 @@ public:
     // Observe the written column of one chunk; `first_row` is the absolute row position of its first row.
     void observe(const Column& written, int64_t first_row);
 
-    // Encode the finished file's sidecar bytes (RAPX v2). `file_rows` bounds the last bucket. `file_key` is the
-    // file's key (RapIndex::key_of).
-    std::string encode(const std::string& file_key, uint64_t file_size, uint64_t file_rows) const;
+    // v5: what the selection rule decides for this file, and the byte counts it decided on.
+    struct Choice {
+        parquet::RapIndex::Shape shape = parquet::RapIndex::Shape::POSTINGS;
+        parquet::RapIndex::PostingEncoding encoding = parquet::RapIndex::PostingEncoding::BITMAP;
+        size_t postings_bytes = 0; // exact body bytes under `encoding`, null posting included
+        size_t zonemap_bytes = 0;  // exact body bytes of the zone map
+        uint32_t n_granules = 0;
+    };
+    Choice shape_of(uint64_t file_size, uint64_t file_rows) const;
+
+    // Encode the finished file's sidecar bytes (RAPX v5). `file_rows` bounds the last granule. `file_key` is the
+    // file's key (RapIndex::key_of). With `force` null the selection rule chooses the shape; pass one to write a
+    // named shape on the same data (tests).
+    std::string encode(const std::string& file_key, uint64_t file_size, uint64_t file_rows,
+                       const Choice* force = nullptr) const;
 
     // <dir>/<key>.<column>.rapx -- the per-column name slice 2c's consult tries first
     std::string sidecar_path(const std::string& dir, const std::string& file_key) const;

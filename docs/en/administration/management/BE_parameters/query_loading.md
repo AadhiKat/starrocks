@@ -431,6 +431,15 @@ This topic introduces the following types of BE configurations:
 - Description: A boolean value to control whether to enable the pageindex of Parquet file to improve performance. `true` indicates enabling pageindex, and `false` indicates disabling it.
 - Introduced in: v3.3
 
+### parquet_page_select_min_coverage
+
+- Default: 0.8
+- Type: Double
+- Unit: -
+- Is mutable: Yes
+- Description: Bounds read amplification when the Parquet reader registers I/O ranges for individually selected pages (page index pruning, or externally supplied row ranges). If the selected pages of a column chunk, counting its dictionary page, already cover at least this fraction of the chunk's compressed bytes, the reader registers the whole column chunk as a single I/O range and filters while decoding, instead of registering one range per selected run. This trades bytes for requests: per-page registration reads less but can cost extra remote round trips, which are issued serially inside the decode loop. Decoding is not affected by this setting - unselected pages are skipped either way; only the bytes fetched change. Set it above `1.0` to always register per selected run, or to `0.0` to always read whole chunks.
+- Introduced in: -
+
 ### parquet_reader_bloom_filter_enable
 
 - Default: true

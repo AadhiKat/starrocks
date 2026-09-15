@@ -69,7 +69,28 @@ void RawColumnReader::collect_column_io_range(std::vector<SharedBufferedInputStr
     const auto& column = *get_chunk_metadata();
     if ((types & ColumnIOType::PAGES) != 0) {
         const tparquet::ColumnMetaData& column_metadata = column.meta_data;
-        if (_offset_index_ctx != nullptr && !_offset_index_ctx->page_selected.empty()) {
+        const bool has_page_selection = _offset_index_ctx != nullptr && !_offset_index_ctx->page_selected.empty();
+        // Bounded read amplification. The dictionary page counts towards coverage because BOTH branches
+        // always fetch it, so what per-page registration actually saves is
+        // (total_compressed_size - dict_bytes - selected_page_bytes). Once that saving is small the
+        // whole chunk is registered instead -- the same single range the branch below emits -- and the
+        // reader filters. page_selected and the StoredColumnReaderWithIndex installed by
+        // select_offset_index() are left alone, so only what is FETCHED changes, never what is decoded,
+        // and row positions, deletes and late materialization all still read from the unchanged _range.
+        bool dense_selection = false;
+        if (has_page_selection) {
+            const int64_t chunk_bytes = column_metadata.total_compressed_size;
+            int64_t selected_bytes = _offset_index_ctx->selected_page_bytes();
+            if (column_metadata.__isset.dictionary_page_offset) {
+                selected_bytes += column_metadata.data_page_offset - column_metadata.dictionary_page_offset;
+            }
+            const double min_coverage = config::parquet_page_select_min_coverage;
+            dense_selection = chunk_bytes > 0 && static_cast<double>(selected_bytes) >= min_coverage * chunk_bytes;
+            if (dense_selection && _opts.stats != nullptr) {
+                _opts.stats->page_whole_chunk_fallback += 1;
+            }
+        }
+        if (has_page_selection && !dense_selection) {
             // Per-selected-page registration. The dictionary page is handed to collect_io_range() as
             // the leading range instead of being emitted here, so that it takes part in run merging
             // and gets the same header padding as the data pages: StoredColumnReaderWithIndex calls

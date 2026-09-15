@@ -540,6 +540,7 @@
         "parquet_late_materialization_enable",
         "enable_adjustment_page_cache_skip",
         "parquet_page_cache_decompress_threshold",
+        "parquet_page_select_min_coverage",
         "parquet_push_down_filter_to_decoder_enable",
         "orc_coalesce_read_enable",
         "orc_natural_read_size",

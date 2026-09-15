@@ -119,6 +119,7 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     // io coalesce
     RuntimeProfile::Counter* active_lazy_coalesce_together = nullptr;
     RuntimeProfile::Counter* active_lazy_coalesce_seperately = nullptr;
+    RuntimeProfile::Counter* active_lazy_coalesce_sparse_override = nullptr;
     // page-range registration (per-selected-page path)
     RuntimeProfile::Counter* page_io_range_count = nullptr;
     RuntimeProfile::Counter* page_io_range_merged = nullptr;
@@ -211,6 +212,10 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
                                                       kParquetProfileSectionPrefix);
     active_lazy_coalesce_seperately = ADD_CHILD_COUNTER(root, "GroupActiveLazyColumnIOCoalesceSeperately", TUnit::UNIT,
                                                         kParquetProfileSectionPrefix);
+    // Of the Seperately row groups above, how many the RAP sparse-range override put there. Zero whenever
+    // the index supplied no row ranges, so a non-zero value is itself the statement that the override ran.
+    active_lazy_coalesce_sparse_override = ADD_CHILD_COUNTER(
+            root, "GroupActiveLazyColumnIOCoalesceSparseOverride", TUnit::UNIT, kParquetProfileSectionPrefix);
 
     // How the per-selected-page path turned page selections into registered I/O ranges, and what it
     // cost when it got that wrong. All five are zero on the whole-chunk path, so a non-zero value is
@@ -268,6 +273,7 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     COUNTER_UPDATE(group_dict_decode_timer, _app_stats.group_dict_decode_ns);
     COUNTER_UPDATE(active_lazy_coalesce_together, _app_stats.active_lazy_coalesce_together);
     COUNTER_UPDATE(active_lazy_coalesce_seperately, _app_stats.active_lazy_coalesce_seperately);
+    COUNTER_UPDATE(active_lazy_coalesce_sparse_override, _app_stats.active_lazy_coalesce_sparse_override);
     COUNTER_UPDATE(page_io_range_count, _app_stats.page_io_range_count);
     COUNTER_UPDATE(page_io_range_merged, _app_stats.page_io_range_merged);
     COUNTER_UPDATE(page_whole_chunk_fallback, _app_stats.page_whole_chunk_fallback);

@@ -29,10 +29,25 @@
 namespace starrocks {
 
 // RAP / lake-index row-range transport: convert THdfsScanRange's TRowRange list into
-// the thrift-free RowRangeHint the format readers consume. Malformed or negative
-// intervals are dropped; an empty result means "no hint" and leaves the scan unchanged.
-// Free function so it is directly unit-testable (astra CX-12).
-void build_row_range_hints(const std::vector<TRowRange>& src, std::vector<RowRangeHint>* dst);
+// the thrift-free RowRangeHint the format readers consume. Free function so it is
+// directly unit-testable (astra CX-12).
+//
+// R9 / A1: `TRowRange`'s fields are `optional` on the wire, so a range can arrive with a
+// missing bound. This function is ALL-OR-NOTHING for one file: any defect in any entry --
+// a missing start_row or end_row, a negative position, an empty or inverted interval, or
+// entries that are not strictly ascending and disjoint -- clears `dst`, writes the reason
+// into `*why` (when non-null) and returns false. The caller then leaves the file with no
+// hint at all, which falls back to the sidecar consult / ordinary scan.
+//
+// Why all-or-nothing: a hint may only NARROW the rows read inside a scheduled file, so a
+// partially decoded list would under-select and silently drop rows, whereas dropping the
+// whole list only costs the IO the scan would have done anyway. The strict ascending and
+// disjoint rule is the precondition of RapIndex::intersect(), which two-pointer-merges the
+// transport hint with a sidecar's answer.
+//
+// An empty `src` is "no hint" (not a defect): `dst` is cleared and true is returned.
+bool build_row_range_hints(const std::vector<TRowRange>& src, std::vector<RowRangeHint>* dst,
+                           std::string* why = nullptr);
 
 class HdfsScanner {
 public:

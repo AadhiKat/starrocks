@@ -540,33 +540,43 @@ TEST_F(PageIndexTest, TestSelectedRowRangesSkipPages) {
 }
 
 // astra CX-12: the scanner-boundary conversion needs its own control, because the test
-// above injects FormatScanContext directly. NOTE: this covers the conversion FUNCTION,
-// not its call site in HdfsScanner::_build_scanner_context(), which remains untested.
+// above injects FormatScanContext directly.
+//
+// A1 (2026-09-15): TRowRange's fields became `optional` (the repo forbids `required`), and the
+// conversion became ALL-OR-NOTHING per file -- any absent or malformed entry refuses the whole
+// list with a reason instead of dropping entries, because a partially decoded list would
+// UNDER-select and drop rows. The full matrix (absent bound, malformed, empty, valid) and the
+// CALL SITE now live next to the function, in
+// be/test/connector/hive/scanner/hdfs_scanner_test.cpp (TestRapRowRangeHints*). What remains
+// here is the smoke test that the format-side caller still sees the same shape.
 TEST_F(PageIndexTest, TestBuildRowRangeHintsConversion) {
     auto mk = [](int64_t s, int64_t e) {
         TRowRange r;
-        r.start_row = s;
-        r.end_row = e;
+        r.__set_start_row(s);
+        r.__set_end_row(e);
         return r;
     };
     std::vector<RowRangeHint> out;
+    std::string why;
 
-    build_row_range_hints({mk(10, 20), mk(30, 40)}, &out);
+    EXPECT_TRUE(build_row_range_hints({mk(10, 20), mk(30, 40)}, &out, &why));
     ASSERT_EQ(out.size(), 2u);
     EXPECT_EQ(out[0].start_row, 10);
     EXPECT_EQ(out[0].end_row, 20);
     EXPECT_EQ(out[1].start_row, 30);
 
-    build_row_range_hints({mk(5, 5), mk(9, 2), mk(-7, -1)}, &out); // empty/inverted/negative
+    // empty / inverted / negative: refused as a list, and the reason names which defect was seen first
+    EXPECT_FALSE(build_row_range_hints({mk(10, 20), mk(9, 2)}, &out, &why));
     EXPECT_TRUE(out.empty());
-
-    build_row_range_hints({mk(-5, 3)}, &out); // negative start clamped, not rejected
-    ASSERT_EQ(out.size(), 1u);
-    EXPECT_EQ(out[0].start_row, 0);
-    EXPECT_EQ(out[0].end_row, 3);
-
-    build_row_range_hints({}, &out); // output always reset
+    EXPECT_EQ(why, "empty or inverted range");
+    EXPECT_FALSE(build_row_range_hints({mk(-5, 3)}, &out, &why));
     EXPECT_TRUE(out.empty());
+    EXPECT_EQ(why, "negative row position");
+
+    why.clear();
+    EXPECT_TRUE(build_row_range_hints({}, &out, &why)); // output always reset; empty is "no hint"
+    EXPECT_TRUE(out.empty());
+    EXPECT_TRUE(why.empty());
 }
 
 TEST_F(PageIndexTest, TestCollectIORangeWithPageIndex) {

@@ -147,6 +147,9 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     RuntimeProfile::Counter* rap_index_cache_incompatible = nullptr;
     RuntimeProfile::Counter* rap_index_consult_timer = nullptr;
     RuntimeProfile::Counter* rap_index_negative_hit = nullptr;
+    RuntimeProfile::Counter* rap_plan_hinted = nullptr;        // R7: files served from plan-time row ranges
+    RuntimeProfile::Counter* rap_plan_hint_ranges = nullptr;
+    RuntimeProfile::Counter* rap_plan_hint_refused = nullptr;
     RuntimeProfile::Counter* rap_build_written = nullptr;   // slice 4 (P3b)
     RuntimeProfile::Counter* rap_build_skipped = nullptr;
     RuntimeProfile::Counter* page_index_filter_group_counter = nullptr;
@@ -164,6 +167,13 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     rap_index_cache_incompatible = ADD_CHILD_COUNTER(root, "RapIndexCacheIncompatible", TUnit::UNIT, kParquetProfileSectionPrefix);
     rap_index_consult_timer = ADD_CHILD_TIMER(root, "RapIndexConsultTime", kParquetProfileSectionPrefix);
     rap_index_negative_hit = ADD_CHILD_COUNTER(root, "RapIndexNegativeHit", TUnit::UNIT, kParquetProfileSectionPrefix);
+    // R7: the difference the plan-time hints make is readable here -- RapIndexPlanHinted counts the files the
+    // frontend answered at planning (no sidecar opened, so those files add nothing to RapIndexConsulted), and
+    // RapIndexConsulted keeps counting only the files that still had to ask a sidecar.
+    rap_plan_hinted = ADD_CHILD_COUNTER(root, "RapIndexPlanHinted", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_plan_hint_ranges = ADD_CHILD_COUNTER(root, "RapIndexPlanHintRanges", TUnit::UNIT, kParquetProfileSectionPrefix);
+    rap_plan_hint_refused =
+            ADD_CHILD_COUNTER(root, "RapIndexPlanHintRefused", TUnit::UNIT, kParquetProfileSectionPrefix);
     rap_build_written = ADD_CHILD_COUNTER(root, "RapBuildWritten", TUnit::UNIT, kParquetProfileSectionPrefix);
     rap_build_skipped = ADD_CHILD_COUNTER(root, "RapBuildSkipped", TUnit::UNIT, kParquetProfileSectionPrefix);
     request_bytes_read_uncompressed =
@@ -274,6 +284,13 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     COUNTER_UPDATE(rap_index_cache_incompatible, _app_stats.rap_index_cache_incompatible);
     COUNTER_UPDATE(rap_index_consult_timer, _app_stats.rap_index_consult_ns);
     COUNTER_UPDATE(rap_index_negative_hit, _app_stats.rap_index_negative_hit);
+    COUNTER_UPDATE(rap_plan_hinted, _app_stats.rap_plan_hinted);
+    COUNTER_UPDATE(rap_plan_hint_ranges, _app_stats.rap_plan_hint_ranges);
+    COUNTER_UPDATE(rap_plan_hint_refused, _app_stats.rap_plan_hint_refused);
+    // A1: why a hint list was refused, when one was (absent when every list was well formed)
+    if (!_app_stats.rap_plan_hint_reason.empty()) {
+        root->add_info_string("RapPlanHintReason", _app_stats.rap_plan_hint_reason.substr(0, 200));
+    }
     // slice 2e: the first non-READY consult outcome, as an info string (absent when every consult was READY)
     if (!_app_stats.rap_index_reason.empty()) {
         root->add_info_string("RapIndexConsultReason", _app_stats.rap_index_reason.substr(0, 200));

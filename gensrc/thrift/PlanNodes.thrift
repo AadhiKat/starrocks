@@ -378,9 +378,16 @@ struct TDeletionVectorDescriptor {
 
 // A half-open interval of absolute row positions within one data file: [start, end).
 // Used by the RAP / lake-index row-range transport on THdfsScanRange.
+//
+// Both fields are optional because the repo forbids `required` on the wire (it breaks
+// forward/backward compatibility in both directions and cannot be relaxed later). Ordinals
+// are unchanged. A range that arrives without one of them is NOT half-trusted: the backend
+// refuses the whole hint list for that file and falls back to the ordinary scan, which is
+// safe because a hint may only narrow a read, never remove a file. See
+// be/src/connector/hive/scanner/hdfs_scanner.cpp build_row_range_hints().
 struct TRowRange {
-  1: required i64 start_row
-  2: required i64 end_row
+  1: optional i64 start_row
+  2: optional i64 end_row
 }
 
 // Hdfs scan range

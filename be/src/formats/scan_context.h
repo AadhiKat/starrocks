@@ -167,6 +167,14 @@ struct FormatScannerStats {
     int64_t rap_index_consult_ns = 0;       // CX-28: the whole consult, request-time
     std::string rap_index_reason;           // slice 2e: first non-READY consult outcome ("absent: ..." / "unusable: ...")
     int rap_index_negative_hit = 0;         // slice 2f: a refused consult answered from the cache (no filesystem call)
+    // R7 (plan-time row ranges): the frontend computed this file's row ranges from the per-snapshot manifest it
+    // already read at planning and shipped them on the scan range, so the backend used them and opened NO sidecar.
+    // Counted once per Parquet reader init, i.e. per scan range (a file split into several scan ranges counts once
+    // per split) -- the same unit RapIndexConsulted uses. A hinted file leaves RapIndexConsulted at 0.
+    int rap_plan_hinted = 0;
+    int rap_plan_hint_ranges = 0;           // row ranges carried by those hints, before any row-group intersection
+    int rap_plan_hint_refused = 0;          // A1: hint lists refused whole because an entry was absent or malformed
+    std::string rap_plan_hint_reason;       // first refusal reason ("missing start_row", "negative row position", ...)
     // slice 4 (P3b, scan-side builder): sidecars written / skipped by a whole-file scan with rap_build_index_dir set
     int rap_build_written = 0;
     int rap_build_skipped = 0;

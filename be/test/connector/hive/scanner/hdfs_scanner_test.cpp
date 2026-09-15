@@ -3715,4 +3715,187 @@ TEST_F(HdfsScannerTest, TestParquetLZOFormat) {
     scanner->close();
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// RAP / lake-index plan-time row ranges (R7 / A1): the scanner boundary.
+//
+// TRowRange's fields are `optional` on the wire (the repo forbids `required`), so a range can arrive with a
+// missing bound and a default-constructed member that is indistinguishable from a real 0 except through
+// __isset. build_row_range_hints() is therefore ALL-OR-NOTHING for one file: any absent or malformed entry
+// clears the list, names the defect, and leaves the scan unhinted -- which only costs the IO the scan would
+// have done anyway, whereas trusting half a list would UNDER-select and silently drop rows.
+//
+// The four shapes the deliverable names -- absent bound, malformed, empty list, valid list -- are covered at
+// the FUNCTION and, for accept and refuse, at its CALL SITE in HdfsScanner::_build_scanner_context().
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+TRowRange rap_row_range(int64_t start, int64_t end) {
+    TRowRange r;
+    r.__set_start_row(start);
+    r.__set_end_row(end);
+    return r;
+}
+} // namespace
+
+TEST_F(HdfsScannerTest, TestRapRowRangeHintsAcceptAValidList) {
+    std::vector<RowRangeHint> out;
+    std::string why = "untouched";
+    ASSERT_TRUE(build_row_range_hints({rap_row_range(10, 20), rap_row_range(20, 40)}, &out, &why));
+    EXPECT_EQ(why, "untouched") << "an accepted list must not write a reason";
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].start_row, 10);
+    EXPECT_EQ(out[0].end_row, 20);
+    EXPECT_EQ(out[1].start_row, 20);
+    EXPECT_EQ(out[1].end_row, 40);
+}
+
+TEST_F(HdfsScannerTest, TestRapRowRangeHintsEmptyListIsNoHintNotADefect) {
+    std::vector<RowRangeHint> out = {RowRangeHint{1, 2}}; // must be reset even on the empty input
+    std::string why = "untouched";
+    EXPECT_TRUE(build_row_range_hints({}, &out, &why));
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(why, "untouched");
+}
+
+TEST_F(HdfsScannerTest, TestRapRowRangeHintsRefuseAnAbsentBoundWholeList) {
+    // One well-formed range and one missing a bound. The whole list is refused, and the reason names
+    // WHICH bound was missing -- not merely that something was wrong.
+    TRowRange no_end;
+    no_end.__set_start_row(100);
+    TRowRange no_start;
+    no_start.__set_end_row(200);
+
+    std::vector<RowRangeHint> out;
+    std::string why;
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(0, 10), no_end}, &out, &why));
+    EXPECT_TRUE(out.empty()) << "the valid entry must not survive a refused list";
+    EXPECT_EQ(why, "missing end_row");
+
+    why.clear();
+    EXPECT_FALSE(build_row_range_hints({no_start, rap_row_range(0, 10)}, &out, &why));
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(why, "missing start_row");
+
+    // A field assigned WITHOUT __set_ is exactly the wire shape of an absent field: refused, not read as 0.
+    TRowRange assigned_not_set;
+    assigned_not_set.start_row = 5;
+    assigned_not_set.end_row = 7;
+    why.clear();
+    EXPECT_FALSE(build_row_range_hints({assigned_not_set}, &out, &why));
+    EXPECT_EQ(why, "missing start_row");
+}
+
+TEST_F(HdfsScannerTest, TestRapRowRangeHintsRefuseMalformedWholeList) {
+    std::vector<RowRangeHint> out;
+    std::string why;
+
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(0, 10), rap_row_range(9, 2)}, &out, &why));
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(why, "empty or inverted range");
+
+    why.clear();
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(5, 5)}, &out, &why));
+    EXPECT_EQ(why, "empty or inverted range");
+
+    // A negative start used to be clamped to 0. It is now refused: the producer is the frontend's own
+    // manifest arithmetic, and a negative position means that arithmetic is not what we think it is.
+    why.clear();
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(-5, 3)}, &out, &why));
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(why, "negative row position");
+
+    why.clear();
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(0, -1)}, &out, &why));
+    EXPECT_EQ(why, "negative row position");
+
+    // Unordered / overlapping is refused because RapIndex::intersect() two-pointer-merges this list with a
+    // sidecar's answer and would under-select on an unsorted one.
+    why.clear();
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(30, 40), rap_row_range(10, 20)}, &out, &why));
+    EXPECT_EQ(why, "overlapping or unordered ranges");
+
+    why.clear();
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(10, 30), rap_row_range(20, 40)}, &out, &why));
+    EXPECT_EQ(why, "overlapping or unordered ranges");
+
+    // The reason must be specific, so the null out-param path still refuses.
+    out.assign(1, RowRangeHint{1, 2});
+    EXPECT_FALSE(build_row_range_hints({rap_row_range(9, 2)}, &out, nullptr));
+    EXPECT_TRUE(out.empty());
+}
+
+// The CALL SITE: deleting the conversion from HdfsScanner::_build_scanner_context() leaves this red while
+// the function's own cases above stay green, which is what makes this control specific to the wiring.
+TEST_F(HdfsScannerTest, TestRapRowRangeHintsReachTheScannerContext) {
+    SlotDesc parquet_descs[] = {{"a", TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR)},
+                                {"b", TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR)},
+                                {""}};
+    const std::string parquet_file = "./be/test/exec/test_data/parquet_scanner/lzo_compression.parquet";
+
+    _create_runtime_state("Asia/Shanghai");
+    auto scanner = std::make_shared<HdfsParquetScanner>();
+    auto* range = _create_scan_range(parquet_file, 0, 0);
+    range->__set_selected_row_ranges({rap_row_range(0, 1000), rap_row_range(2000, 3000)});
+    auto* tuple_desc = _create_tuple_desc(parquet_descs);
+    auto* ctx = _create_ctx(parquet_file, range, tuple_desc);
+
+    ASSERT_OK(scanner->init(_runtime_state, ctx));
+    ASSERT_OK(scanner->open(_runtime_state));
+    ASSERT_EQ(ctx->format_scan_context.selected_row_ranges.size(), 2u);
+    EXPECT_EQ(ctx->format_scan_context.selected_row_ranges[0].start_row, 0);
+    EXPECT_EQ(ctx->format_scan_context.selected_row_ranges[0].end_row, 1000);
+    EXPECT_EQ(ctx->format_scan_context.selected_row_ranges[1].start_row, 2000);
+    EXPECT_EQ(ctx->format_scan_context.selected_row_ranges[1].end_row, 3000);
+    EXPECT_EQ(scanner->_app_stats.rap_plan_hint_refused, 0);
+    EXPECT_TRUE(scanner->_app_stats.rap_plan_hint_reason.empty());
+    scanner->close();
+}
+
+TEST_F(HdfsScannerTest, TestRapRowRangeHintsRefusedAtTheScannerContextAreCounted) {
+    SlotDesc parquet_descs[] = {{"a", TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR)},
+                                {"b", TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR)},
+                                {""}};
+    const std::string parquet_file = "./be/test/exec/test_data/parquet_scanner/lzo_compression.parquet";
+
+    _create_runtime_state("Asia/Shanghai");
+    auto scanner = std::make_shared<HdfsParquetScanner>();
+    auto* range = _create_scan_range(parquet_file, 0, 0);
+    TRowRange no_end;
+    no_end.__set_start_row(100);
+    range->__set_selected_row_ranges({rap_row_range(0, 1000), no_end});
+    auto* tuple_desc = _create_tuple_desc(parquet_descs);
+    auto* ctx = _create_ctx(parquet_file, range, tuple_desc);
+
+    ASSERT_OK(scanner->init(_runtime_state, ctx));
+    ASSERT_OK(scanner->open(_runtime_state));
+    EXPECT_TRUE(ctx->format_scan_context.selected_row_ranges.empty())
+            << "a refused list must leave the scan unhinted, not half hinted";
+    EXPECT_EQ(scanner->_app_stats.rap_plan_hint_refused, 1);
+    EXPECT_EQ(scanner->_app_stats.rap_plan_hint_reason, "missing end_row");
+    // The scan still runs, complete and unindexed.
+    READ_SCANNER_ROWS(scanner, 100000);
+    scanner->close();
+}
+
+// An unset field leaves the context empty, and a reused context does not keep a previous scan's hint.
+TEST_F(HdfsScannerTest, TestRapRowRangeHintsAbsentFieldLeavesContextEmpty) {
+    SlotDesc parquet_descs[] = {{"a", TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR)},
+                                {"b", TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR)},
+                                {""}};
+    const std::string parquet_file = "./be/test/exec/test_data/parquet_scanner/lzo_compression.parquet";
+
+    _create_runtime_state("Asia/Shanghai");
+    auto scanner = std::make_shared<HdfsParquetScanner>();
+    auto* range = _create_scan_range(parquet_file, 0, 0);
+    auto* tuple_desc = _create_tuple_desc(parquet_descs);
+    auto* ctx = _create_ctx(parquet_file, range, tuple_desc);
+    ctx->format_scan_context.selected_row_ranges = {RowRangeHint{7, 9}}; // a stale hint on a reused context
+
+    ASSERT_OK(scanner->init(_runtime_state, ctx));
+    ASSERT_OK(scanner->open(_runtime_state));
+    EXPECT_TRUE(ctx->format_scan_context.selected_row_ranges.empty());
+    EXPECT_EQ(scanner->_app_stats.rap_plan_hint_refused, 0);
+    scanner->close();
+}
+
 } // namespace starrocks

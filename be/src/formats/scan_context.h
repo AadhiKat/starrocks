@@ -109,6 +109,29 @@ struct FormatScannerStats {
     // io coalesce
     int64_t active_lazy_coalesce_together = 0;
     int64_t active_lazy_coalesce_seperately = 0;
+    // Row groups put on the separate-buffer path by the RAP sparse-range override
+    // (config::rap_index_lazy_coalesce_sparse_threshold), whatever the adaptive counter said.
+    // Counted only when the row group actually took that path: with io_coalesce_adaptive_lazy_active off,
+    // set_io_ranges() coalesces whatever it is passed, so the override changed nothing and is not counted.
+    // It exists so a run can tell the override apart from the counter ALSO saying "separately":
+    // active_lazy_coalesce_seperately alone cannot, which would let a reverted override look healthy.
+    int64_t active_lazy_coalesce_sparse_override = 0;
+    // Page-range registration (parquet, per-selected-page path only).
+    // `page_io_range_count`  : IORanges emitted for ColumnIOType::PAGES.
+    // `page_io_range_merged` : selected pages (and dictionary pages) absorbed into a
+    //                          preceding range by run merging, i.e. ranges NOT emitted.
+    // `page_whole_chunk_fallback` : column chunks whose selected pages covered at least
+    //                          config::parquet_page_select_min_coverage of the chunk, so the
+    //                          whole chunk was registered instead (deliberately the OFF path).
+    // `page_header_direct_read_count/bytes` : page-header peeks that escaped their registered
+    //                          SharedBuffer and fell through to an unbuffered remote read. The
+    //                          bytes are fetched and then thrown away, so a non-zero count on a
+    //                          range-selected scan is a wasted round trip per affected page.
+    int64_t page_io_range_count = 0;
+    int64_t page_io_range_merged = 0;
+    int64_t page_whole_chunk_fallback = 0;
+    int64_t page_header_direct_read_count = 0;
+    int64_t page_header_direct_read_bytes = 0;
     // page statistics
     bool has_page_statistics = false;
     // page skip

@@ -147,6 +147,13 @@ void GroupReader::_apply_selected_row_ranges() {
         return;
     }
     _range = hinted;
+    // RAP provenance. This assignment is the ONE place a RAP-supplied row range becomes _range,
+    // and both RAP sources converge on it: FileReader hands plan-time hints
+    // (FormatScanContext::selected_row_ranges) and sidecar-consult results (_rap_ranges) to the
+    // SAME field, GroupReaderParam::selected_row_ranges (file_reader.cpp), so neither branch has
+    // to know about the other. Nothing else sets the flag, so a read with no hint -- including one
+    // the upstream page index narrows through intersect_range() below -- leaves it false.
+    _range_from_row_range_hint = true;
 }
 
 // astra CX-11: compose, don't replace. Built-in page pruning previously assigned over
@@ -172,6 +179,67 @@ void GroupReader::intersect_range(const SparseRange<uint64_t>& other) {
     _range = out;
 }
 
+// RAP / lake-index: sparse-range override for the active/lazy I/O grouping decision.
+//
+// ReadRangePlanner::should_coalesce_active_lazy() reads exactly one input -- a cross-file adaptive
+// feedback counter (HiveDataSourceProvider::_lazy_column_coalesce_counter) that ~GroupReader()
+// DECREMENTS for a prepared row group whose lazy columns turned out not to be needed. Whole-file RAP
+// pruning deletes precisely those row groups from the population: a pruned file never constructs a
+// GroupReader and never reaches that destructor. The counter is then fed only increments, parks on
+// "coalesce together", and every surviving row group fetches active AND lazy column bytes in one
+// buffer spanning the gap between them. The index did not make a bad decision; it removed the
+// evidence the decision was learning from.
+//
+// The override restores the intent the counter can no longer express, and ONLY where the index is
+// what narrowed the read. All three terms are required:
+//
+//   * threshold > 0.0                      -- 0.0 makes this a constant false, so the adaptive
+//                                             decision is again the only decision.
+//   * _range_from_row_range_hint           -- _range came from the RAP row-range transport. Without
+//                                             this term the override would also fire on a row group
+//                                             the UPSTREAM page index narrowed (a sort-key predicate
+//                                             on an unindexed scan), which would change the bytes
+//                                             read with the index off.
+//   * span_size() < threshold * num_rows   -- SparseRange::span_size() is the SUM of the selected
+//                                             sub-ranges (storage_primitive/range.h), i.e. the count
+//                                             of selected rows, not end-begin of the outer span.
+//
+// This changes only how registered ranges are grouped into SharedBuffers. It does not touch _range,
+// _skip_rows_ctx, page_selected or the ColumnMaterializer, so decoding, row positions, deletes and
+// late materialization are unaffected either way.
+bool GroupReader::_should_separate_lazy_io_for_sparse_rap_range() const {
+    const double threshold = config::rap_index_lazy_coalesce_sparse_threshold;
+    if (threshold <= 0.0) {
+        return false;
+    }
+    if (!_range_from_row_range_hint) {
+        return false;
+    }
+    if (_row_group_metadata == nullptr || _row_group_metadata->num_rows <= 0) {
+        return false;
+    }
+    const auto selected_rows = static_cast<double>(_range.span_size());
+    const auto group_rows = static_cast<double>(_row_group_metadata->num_rows);
+    return selected_rows < threshold * group_rows;
+}
+
+bool GroupReader::_decide_active_lazy_coalesce(bool adaptive_says_coalesce) {
+    const bool sparse_override = _should_separate_lazy_io_for_sparse_rap_range();
+    const bool coalesce_lazy = adaptive_says_coalesce && !sparse_override;
+    if (coalesce_lazy || !config::io_coalesce_adaptive_lazy_active) {
+        _param.stats->active_lazy_coalesce_together += 1;
+    } else {
+        _param.stats->active_lazy_coalesce_seperately += 1;
+        // Count the override only where it is what produced "separately". With
+        // io_coalesce_adaptive_lazy_active off, set_io_ranges() routes to
+        // _set_io_ranges_all_columns() whatever it is passed, so the override changed nothing.
+        if (sparse_override) {
+            _param.stats->active_lazy_coalesce_sparse_override += 1;
+        }
+    }
+    return coalesce_lazy;
+}
+
 Status GroupReader::prepare() {
     RETURN_IF_ERROR(_prepare_column_readers());
 
@@ -195,12 +263,9 @@ Status GroupReader::prepare() {
         int64_t end_offset = 0;
         collect_io_ranges(&ranges, &end_offset, ColumnIOType::PAGES);
         auto* planner = _column_materializer->read_range_planner();
-        bool coalesce_lazy = planner->should_coalesce_active_lazy();
-        if (coalesce_lazy || !config::io_coalesce_adaptive_lazy_active) {
-            _param.stats->active_lazy_coalesce_together += 1;
-        } else {
-            _param.stats->active_lazy_coalesce_seperately += 1;
-        }
+        // The adaptive counter decides, unless the RAP sparse-range override overrules it; the
+        // counters record which term did. See _decide_active_lazy_coalesce() above.
+        const bool coalesce_lazy = _decide_active_lazy_coalesce(planner->should_coalesce_active_lazy());
         _set_end_offset(end_offset);
         RETURN_IF_ERROR(_param.sb_stream->set_io_ranges(ranges, coalesce_lazy));
     }

@@ -18,6 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -59,12 +60,54 @@ struct ParquetField;
 
 namespace starrocks::parquet {
 
+// How a run of selected pages is turned into SharedBufferedInputStream::IORange entries.
+//
+// The defaults are deliberately INERT: merge_max_distance = -1 can never be satisfied by a
+// non-negative gap, and header_peek_size = 0 adds nothing, so a default-constructed options object
+// reproduces the historical one-IORange-per-selected-page shape byte for byte.
+struct PageIORangeOptions {
+    // Exclusive end of the column chunk these pages live in, i.e.
+    //   (dictionary_page_offset ? dictionary_page_offset : data_page_offset) + total_compressed_size,
+    // which is exactly PageReader::_finish_offset. Padding is clamped to it, so a padded range can
+    // never reach into the next column's chunk -- SharedBufferedInputStream::_sort_and_check_overlap()
+    // rejects overlapping ranges with a RuntimeError that fails the whole row group.
+    int64_t chunk_end = 0;
+    // Selected pages whose gap is at most this many bytes are emitted as ONE IORange. Set it to the
+    // same bound SharedBufferedInputStream::_merge_small_ranges() uses (io_coalesce_read_max_distance_size)
+    // and the emitted ranges describe exactly the buffers the stream would have built anyway, so the
+    // set of bytes fetched does not change -- only the number of range entries, and the padding below.
+    int64_t merge_max_distance = -1;
+    // A run is closed when it would grow past this many bytes from its own start, the same shape as
+    // _merge_small_ranges()'s io_coalesce_read_max_buffer_size span bound. Unbounded by default and
+    // left unbounded by the production caller on purpose -- splitting a run at 8 MB would re-create
+    // the buffer boundary the padding exists to remove, and _set_io_ranges_all_columns() already
+    // gives an oversized range its own dedicated SharedBuffer. Present for tests and for a future
+    // caller that needs the bound.
+    int64_t merge_max_span = std::numeric_limits<int64_t>::max();
+    // Size of PageReader's fixed-size page-header peek. Each emitted range is extended, when needed,
+    // so that a peek taken at the START of the run's LAST page still lands inside the registered
+    // buffer instead of falling through to an unbuffered remote read. Measuring from the last page's
+    // start rather than from the run end is what keeps this from over-reading: when that page is
+    // already larger than the peek -- the common case for a StarRocks-written 1 MB page -- nothing is
+    // added at all. Requires chunk_end; pass parquet::kDefaultPageHeaderSize.
+    int64_t header_peek_size = 0;
+    // Optional counters; see FormatScannerStats::page_io_range_count / page_io_range_merged.
+    int64_t* emitted_ranges = nullptr;
+    int64_t* merged_pages = nullptr;
+};
+
 struct ColumnOffsetIndexCtx {
     tparquet::OffsetIndex offset_index;
     std::vector<bool> page_selected;
     uint64_t rg_first_row;
 
-    void collect_io_range(std::vector<SharedBufferedInputStream::IORange>* ranges, int64_t* end_offset, bool active);
+    void collect_io_range(std::vector<SharedBufferedInputStream::IORange>* ranges, int64_t* end_offset, bool active,
+                          const PageIORangeOptions& opts = PageIORangeOptions());
+
+    // Compressed bytes of the pages currently marked selected. Parquet's compressed_page_size
+    // includes the page header, so this is the exact number of bytes the per-page path must fetch
+    // for the data pages (the dictionary page, which both paths always fetch, is not included).
+    int64_t selected_page_bytes() const;
 
     // be compatible with PARQUET-1850
     bool check_dictionary_page(int64_t data_page_offset) {

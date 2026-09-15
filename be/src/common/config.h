@@ -1344,6 +1344,16 @@ CONF_mBool(parquet_cache_aware_dict_decoder_enable, "true");
 
 CONF_mBool(parquet_reader_enable_adpative_bloom_filter, "true");
 CONF_Double(parquet_page_cache_decompress_threshold, "1.5");
+// Bounded read amplification for the page-selected read path. When the pages selected inside one Parquet
+// column chunk -- its dictionary page included, because BOTH read paths always fetch that -- already cover
+// at least this fraction of the chunk's compressed bytes, the reader registers the WHOLE chunk as a single
+// I/O range and filters, which is exactly what it does when no page selection exists at all. Decoding is
+// unaffected either way: page_selected and StoredColumnReaderWithIndex still skip the unselected pages, so
+// only what is FETCHED changes. The trade is requests against bytes: per-page registration saves
+// (1 - coverage) of the chunk but can cost extra remote round trips, and those round trips are serial,
+// paid inline in the decode loop. Above this coverage the bytes saved cannot repay one of them.
+// Set above 1.0 to disable the fallback entirely; 0.0 makes every selected chunk read whole.
+CONF_mDouble(parquet_page_select_min_coverage, "0.8");
 CONF_mBool(enable_adjustment_page_cache_skip, "true");
 // RAP / lake-index slice m1: directory holding per-file RAPX sidecars (<basename>.rapx). Empty = off.
 CONF_mString(rap_index_dir, "");
@@ -1358,6 +1368,19 @@ CONF_mString(rap_export_index_columns, "");
 // the files it reads completely; an existing object is never overwritten. Empty = off.
 CONF_mString(rap_build_index_dir, "");
 CONF_mString(rap_build_index_columns, "");
+// RAP / lake-index: active/lazy I/O-coalescing override for index-narrowed row groups.
+// When a row group's selected row ranges came from the RAP index and cover less than this fraction of the
+// row group's rows, read active and lazy columns in separate I/O buffers instead of coalescing them.
+// 0.0 disables the override (decision falls back to the adaptive counter).
+//
+// Why it exists: ReadRangePlanner::should_coalesce_active_lazy() reads exactly one input, a cross-file
+// adaptive feedback counter that ~GroupReader() DECREMENTS for a prepared row group whose lazy columns
+// turned out not to be needed. Whole-file index pruning deletes precisely those row groups from the
+// population -- a pruned file never constructs a GroupReader and never reaches that destructor -- so the
+// counter only ever increments, parks on "coalesce together", and every surviving row group fetches active
+// AND lazy column bytes in one buffer spanning the gap between them. The override does not second-guess
+// the counter anywhere the index did not narrow the read.
+CONF_mDouble(rap_index_lazy_coalesce_sparse_threshold, "0.5");
 // slice 4 (fork production-readiness review, PRD-02): admission limits for sidecars -- a sidecar above the byte ceiling is
 // refused before it is read; a header declaring more values / ranges than this, or more than the body can hold, is
 // refused before any allocation; a builder stops at the distinct-value ceiling and writes nothing.

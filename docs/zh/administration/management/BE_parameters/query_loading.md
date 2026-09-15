@@ -419,6 +419,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：是否启用 Parquet 文件的 Bloom Filter 以提高性能。`true` 表示启用 Bloom Filter，`false` 表示禁用。还可以使用系统变量 `enable_parquet_reader_bloom_filter` 在 Session 级别上控制这一行为。Parquet 中的 Bloom Filter 是在**每个行组的列级维护的**。如果 Parquet 文件包含某些列的 Bloom Filter，查询就可以使用这些列上的谓词来有效地跳过行组。
 - 引入版本：v3.5
 
+### parquet_page_select_min_coverage
+
+- 默认值：0.8
+- 类型：Double
+- 单位：-
+- 是否动态：是
+- 描述：限制按页注册 I/O range 时的读放大。当 Parquet reader 为单独选中的页注册 I/O range 时（page index 裁剪，或外部传入的 row range），如果某个 column chunk 中被选中的页（含其字典页）已覆盖该 chunk 压缩字节数的该比例及以上，reader 会改为将整个 column chunk 注册为一个 I/O range，并在解码时过滤，而不是为每一段连续选中的页各注册一个 range。这是以字节换请求：按页注册读取的数据更少，但可能带来额外的远端往返，而这些往返是在解码循环中串行发出的。该参数不影响解码行为——未选中的页在两种方式下都会被跳过，改变的只是实际获取的字节。设置为大于 `1.0` 表示始终按选中页段注册，设置为 `0.0` 表示始终读取整个 chunk。
+- 引入版本：-
+
 ### parquet_reader_bloom_filter_enable
 
 - 默认值：true

@@ -19,7 +19,9 @@
 #include "cache/scan/shared_buffered_input_stream.h"
 #include "column/global_dict/dict_column.h"
 #include "common/compiler_util.h"
+#include "common/config_scan_io_fwd.h"
 #include "formats/parquet/column_reader.h"
+#include "formats/parquet/page_reader.h"
 #include "formats/parquet/parquet_block_split_bloom_filter.h"
 #include "formats/parquet/predicate_filter_evaluator.h"
 #include "formats/parquet/stored_column_reader_with_index.h"
@@ -67,7 +69,28 @@ void RawColumnReader::collect_column_io_range(std::vector<SharedBufferedInputStr
     const auto& column = *get_chunk_metadata();
     if ((types & ColumnIOType::PAGES) != 0) {
         const tparquet::ColumnMetaData& column_metadata = column.meta_data;
-        if (_offset_index_ctx != nullptr && !_offset_index_ctx->page_selected.empty()) {
+        const bool has_page_selection = _offset_index_ctx != nullptr && !_offset_index_ctx->page_selected.empty();
+        // Bounded read amplification. The dictionary page counts towards coverage because BOTH branches
+        // always fetch it, so what per-page registration actually saves is
+        // (total_compressed_size - dict_bytes - selected_page_bytes). Once that saving is small the
+        // whole chunk is registered instead -- the same single range the branch below emits -- and the
+        // reader filters. page_selected and the StoredColumnReaderWithIndex installed by
+        // select_offset_index() are left alone, so only what is FETCHED changes, never what is decoded,
+        // and row positions, deletes and late materialization all still read from the unchanged _range.
+        bool dense_selection = false;
+        if (has_page_selection) {
+            const int64_t chunk_bytes = column_metadata.total_compressed_size;
+            int64_t selected_bytes = _offset_index_ctx->selected_page_bytes();
+            if (column_metadata.__isset.dictionary_page_offset) {
+                selected_bytes += column_metadata.data_page_offset - column_metadata.dictionary_page_offset;
+            }
+            const double min_coverage = config::parquet_page_select_min_coverage;
+            dense_selection = chunk_bytes > 0 && static_cast<double>(selected_bytes) >= min_coverage * chunk_bytes;
+            if (dense_selection && _opts.stats != nullptr) {
+                _opts.stats->page_whole_chunk_fallback += 1;
+            }
+        }
+        if (has_page_selection && !dense_selection) {
             // add dict page
             if (column_metadata.__isset.dictionary_page_offset) {
                 auto r = SharedBufferedInputStream::IORange(
@@ -76,7 +99,36 @@ void RawColumnReader::collect_column_io_range(std::vector<SharedBufferedInputStr
                 ranges->emplace_back(r);
                 *end_offset = std::max(*end_offset, r.offset + r.size);
             }
-            _offset_index_ctx->collect_io_range(ranges, end_offset, active);
+
+            const int64_t chunk_start = column_metadata.__isset.dictionary_page_offset
+                                                ? column_metadata.dictionary_page_offset
+                                                : column_metadata.data_page_offset;
+
+            PageIORangeOptions opts;
+            // Exactly PageReader::_finish_offset for this chunk; padding never crosses it.
+            opts.chunk_end = chunk_start + column_metadata.total_compressed_size;
+            // The same gap bound SharedBufferedInputStream::_merge_small_ranges() applies, so merging
+            // here changes the NUMBER of registered ranges and (padding aside) not which bytes the
+            // stream ends up fetching. The stream's OTHER bound, the 8 MB span, is deliberately NOT
+            // mirrored: re-creating that split here would re-create the buffer boundary the padding
+            // exists to remove, and _set_io_ranges_all_columns() already gives a range larger than
+            // io_coalesce_read_max_buffer_size its own dedicated SharedBuffer -- exactly the treatment
+            // the whole-chunk branch below gets today. One big buffer instead of several costs the
+            // same resident bytes (the decode loop touches all of them and they are released together
+            // when the GroupReader is destroyed) and saves the round trips between them.
+            opts.merge_max_distance = config::io_coalesce_read_max_distance_size;
+            opts.header_peek_size = kDefaultPageHeaderSize;
+            // The dictionary-page range above is deliberately NOT part of the merge. Folding it in
+            // would make every run start at dictionary_page_offset, and on a chunk whose dictionary is
+            // most of its bytes the padded run then reaches the chunk end -- turning a selective read
+            // into a whole-chunk read without the coverage guard ever being consulted. Its own header
+            // peek is unaffected by this change: a dictionary range shorter than the peek was already
+            // relying on the stream coalescing it with the following pages, exactly as before.
+            if (_opts.stats != nullptr) {
+                opts.emitted_ranges = &_opts.stats->page_io_range_count;
+                opts.merged_pages = &_opts.stats->page_io_range_merged;
+            }
+            _offset_index_ctx->collect_io_range(ranges, end_offset, active, opts);
         } else {
             int64_t offset = 0;
             if (column_metadata.__isset.dictionary_page_offset) {

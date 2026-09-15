@@ -119,6 +119,13 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     // io coalesce
     RuntimeProfile::Counter* active_lazy_coalesce_together = nullptr;
     RuntimeProfile::Counter* active_lazy_coalesce_seperately = nullptr;
+    RuntimeProfile::Counter* active_lazy_coalesce_sparse_override = nullptr;
+    // page-range registration (per-selected-page path)
+    RuntimeProfile::Counter* page_io_range_count = nullptr;
+    RuntimeProfile::Counter* page_io_range_merged = nullptr;
+    RuntimeProfile::Counter* page_whole_chunk_fallback = nullptr;
+    RuntimeProfile::Counter* page_header_direct_read_count = nullptr;
+    RuntimeProfile::Counter* page_header_direct_read_bytes = nullptr;
 
     // page statistics
     RuntimeProfile::Counter* has_page_statistics = nullptr;
@@ -215,6 +222,23 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
                                                       kParquetProfileSectionPrefix);
     active_lazy_coalesce_seperately = ADD_CHILD_COUNTER(root, "GroupActiveLazyColumnIOCoalesceSeperately", TUnit::UNIT,
                                                         kParquetProfileSectionPrefix);
+    // Of the Seperately row groups above, how many the RAP sparse-range override put there. Zero whenever
+    // the index supplied no row ranges, so a non-zero value is itself the statement that the override ran.
+    active_lazy_coalesce_sparse_override = ADD_CHILD_COUNTER(
+            root, "GroupActiveLazyColumnIOCoalesceSparseOverride", TUnit::UNIT, kParquetProfileSectionPrefix);
+
+    // How the per-selected-page path turned page selections into registered I/O ranges, and what it
+    // cost when it got that wrong. All five are zero on the whole-chunk path, so a non-zero value is
+    // itself the statement that this scan read pages rather than chunks.
+    page_io_range_count = ADD_CHILD_COUNTER(root, "PageIORangeCounter", TUnit::UNIT, kParquetProfileSectionPrefix);
+    page_io_range_merged =
+            ADD_CHILD_COUNTER(root, "PageIORangeMergedCounter", TUnit::UNIT, kParquetProfileSectionPrefix);
+    page_whole_chunk_fallback =
+            ADD_CHILD_COUNTER(root, "PageWholeChunkFallbackCounter", TUnit::UNIT, kParquetProfileSectionPrefix);
+    page_header_direct_read_count =
+            ADD_CHILD_COUNTER(root, "PageHeaderDirectReadCounter", TUnit::UNIT, kParquetProfileSectionPrefix);
+    page_header_direct_read_bytes =
+            ADD_CHILD_COUNTER(root, "PageHeaderDirectReadBytes", TUnit::BYTES, kParquetProfileSectionPrefix);
 
     has_page_statistics = ADD_CHILD_COUNTER(root, "HasPageStatistics", TUnit::UNIT, kParquetProfileSectionPrefix);
     page_skip = ADD_CHILD_COUNTER(root, "PageSkipCounter", TUnit::UNIT, kParquetProfileSectionPrefix);
@@ -259,6 +283,12 @@ void HdfsParquetScanner::do_update_counter(HdfsScannerProfile* profile) {
     COUNTER_UPDATE(group_dict_decode_timer, _app_stats.group_dict_decode_ns);
     COUNTER_UPDATE(active_lazy_coalesce_together, _app_stats.active_lazy_coalesce_together);
     COUNTER_UPDATE(active_lazy_coalesce_seperately, _app_stats.active_lazy_coalesce_seperately);
+    COUNTER_UPDATE(active_lazy_coalesce_sparse_override, _app_stats.active_lazy_coalesce_sparse_override);
+    COUNTER_UPDATE(page_io_range_count, _app_stats.page_io_range_count);
+    COUNTER_UPDATE(page_io_range_merged, _app_stats.page_io_range_merged);
+    COUNTER_UPDATE(page_whole_chunk_fallback, _app_stats.page_whole_chunk_fallback);
+    COUNTER_UPDATE(page_header_direct_read_count, _app_stats.page_header_direct_read_count);
+    COUNTER_UPDATE(page_header_direct_read_bytes, _app_stats.page_header_direct_read_bytes);
     COUNTER_UPDATE(dict_code_predicate_eval_count, _app_stats.parquet_dict_code_predicate_eval_count);
     int64_t page_stats = _app_stats.has_page_statistics ? 1 : 0;
     COUNTER_UPDATE(has_page_statistics, page_stats);

@@ -133,8 +133,28 @@ Status PageReader::_read_and_deserialize_header(bool need_fill_cache) {
                 page_buf = (const uint8_t*)st.value().data();
                 peek_mode = true;
             } else {
+                // Two different shapes reach this branch and only one of them is free.
+                //
+                //  * NotSupported -- a registered SharedBuffer contains this header but has not
+                //    been filled yet (first touch of a coalesced run), or the stream does not
+                //    implement peek at all. read_at_fully() below then fills / uses that buffer
+                //    and the request stays buffered.
+                //  * anything else (RuntimeError from find_shared_buffer) -- NO registered buffer
+                //    contains [_offset, _offset + allowed_page_size). That happens on the
+                //    page-selected path when the registered ranges hug the selected pages and this
+                //    fixed-size header peek runs past the end of the run. read_at_fully() then
+                //    falls through to an unbuffered remote read (SharedBufferedInputStream's
+                //    _direct_io_* path) whose bytes are discarded: the page's own data is fetched
+                //    again from its buffer a moment later by read_and_decompress_page_data().
+                //    One wasted remote round trip per affected page, so it is counted separately
+                //    from the stream-wide DirectIOCount, which cannot say who caused it.
+                const bool unbuffered_header_read = !need_fill_cache && !st.ok() && !st.status().is_not_supported();
                 TRY_CATCH_BAD_ALLOC(raw::stl_vector_resize_uninitialized(page_buffer, allowed_page_size));
                 RETURN_IF_ERROR(_stream->read_at_fully(_offset, page_buffer->data(), allowed_page_size));
+                if (unbuffered_header_read) {
+                    _opts.stats->page_header_direct_read_count += 1;
+                    _opts.stats->page_header_direct_read_bytes += allowed_page_size;
+                }
                 page_buf = page_buffer->data();
                 auto st = _stream->peek(allowed_page_size);
                 if (st.ok()) {

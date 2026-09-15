@@ -15,6 +15,7 @@
 package com.starrocks.connector.iceberg;
 
 import com.starrocks.common.Config;
+import com.starrocks.connector.iceberg.io.IcebergCachingFileIO;
 import com.starrocks.sql.ast.expression.BinaryType;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
@@ -235,13 +236,51 @@ public class RapManifestCacheTest {
     }
 
     @Test
-    public void testSameLengthRepublishIsMissedWhenTheFileIoExposesOnlyLength() {
-        // The DEPLOYED frontend reads through IcebergCachingFileIO, whose CachingInputFile is private and offers
-        // exists() and getLength() and nothing else. This pins the consequence so it cannot change silently: an
-        // equal-LENGTH same-snapshot republish is NOT seen. Every publication this project has measured changes
-        // the length (C5: 94,766 -> 124,863 bytes), and rap_manifest_cache_capacity = 0 is the way out for a
-        // publisher that cannot promise that. If this case ever starts reporting "refresh", the stamp got
-        // stronger and this expectation -- not the engine -- is what should change.
+    public void testSameLengthRepublishIsSeenThroughTheDeployedCachingFileIo() throws Exception {
+        // The DEPLOYED frontend reads through IcebergCachingFileIO. Its CachingInputFile declares only what
+        // InputFile declares, but it now exposes the file it caches, so the stamp built from it is len+mtime and
+        // an equal-LENGTH same-snapshot republish IS seen. This is the case that used to be pinned as a
+        // limitation; it is now the positive, and the length-only stamp below it is the fallback.
+        File dir = Files.createTempDirectory("rap_cache_caching_").toFile();
+        File tdir = new File(dir, UUID);
+        Assertions.assertTrue(tdir.mkdirs());
+        File manifest = new File(tdir, SNAP + RapCoverage.SUFFIX);
+        Files.write(manifest.toPath(), complete().getBytes(StandardCharsets.UTF_8));
+        Assertions.assertTrue(manifest.setLastModified(1_600_000_000_000L));
+
+        IcebergCachingFileIO io = new IcebergCachingFileIO();
+        io.setConf(new Configuration());
+        io.initialize(new HashMap<>());
+        String dirUri = "file:" + dir.getAbsolutePath();
+        String path = dirUri + "/" + UUID + "/" + SNAP + RapCoverage.SUFFIX;
+
+        RapCoverage before = RapCoverage.load(dirUri, io, UUID, Optional.of(SNAP), eq("v"));
+        Assertions.assertEquals("miss", before.getCache());
+        Assertions.assertEquals(RapCoverage.Decision.KEEP, before.decide(F1));
+        Assertions.assertEquals(RapCoverage.Decision.DROP, before.decide(F2));
+        Assertions.assertEquals("len+mtime", RapManifestCache.stampOf(io.newInputFile(path)).kind(),
+                "the caching FileIO must yield the strong stamp, not length alone");
+
+        // the republish keeps the byte count EXACTLY and changes the meaning: 'v' now posts to f2, not f1
+        Files.write(manifest.toPath(), completeSwapped().getBytes(StandardCharsets.UTF_8));
+        Assertions.assertEquals(complete().length(), completeSwapped().length(), "the two must be the same length");
+        Assertions.assertTrue(manifest.setLastModified(1_600_000_060_000L));
+
+        RapCoverage after = RapCoverage.load(dirUri, io, UUID, Optional.of(SNAP), eq("v"));
+        Assertions.assertEquals("refresh", after.getCache(), "the modification time moved, so the parse is dropped");
+        Assertions.assertEquals(RapCoverage.Decision.DROP, after.decide(F1), "the NEW coverage is what serves");
+        Assertions.assertEquals(RapCoverage.Decision.KEEP, after.decide(F2));
+    }
+
+    @Test
+    public void testSameLengthRepublishIsMissedOnlyWhereTheFileIoExposesNothingButLength() {
+        // The FALLBACK, and all that is left of the limitation: a FileIO whose InputFile offers exists() and
+        // getLength() and nothing else has no way to see an equal-LENGTH same-snapshot republish. The deployed
+        // path is no longer this one -- see testSameLengthRepublishIsSeenThroughTheDeployedCachingFileIo. For a
+        // FileIO that really has no modification time, rap_manifest_cache_capacity = 0 is the way out for a
+        // publisher that cannot promise the length moves (every publication measured here changes it: C5's own,
+        // 94,766 -> 124,863 bytes). If this case ever starts reporting "refresh", the stamp got stronger again
+        // and this expectation -- not the engine -- is what should change.
         CountingFileIO io = new CountingFileIO().put(PATH, complete());
         RapCoverage before = load(io);
         Assertions.assertEquals("miss", before.getCache());

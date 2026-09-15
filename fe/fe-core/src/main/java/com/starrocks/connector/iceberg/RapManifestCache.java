@@ -15,6 +15,7 @@
 package com.starrocks.connector.iceberg;
 
 import com.starrocks.common.Config;
+import com.starrocks.connector.iceberg.io.IcebergCachingFileIO;
 import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.io.InputFile;
 import org.apache.logging.log4j.LogManager;
@@ -54,9 +55,12 @@ import java.util.Map;
  * {@code InputFile} has no generation, ETag or modification time; it has {@code exists()} and
  * {@code getLength()}. When the file is a {@link HadoopInputFile} its {@code getStat()} adds a modification
  * time from the same {@code getFileStatus} call, and the stamp uses it. On the deployed FE the table's
- * {@code FileIO} is {@code IcebergCachingFileIO}, whose {@code CachingInputFile} is private and exposes
- * neither the wrapped file nor a stat, so the stamp there is <b>length only</b>: a republish that changes the
- * content without changing the byte count would be missed. The stamp kind is reported in the plan
+ * {@code FileIO} is {@code IcebergCachingFileIO}, which hands out a {@code CachingInputFile}; that wrapper now
+ * exposes the file it caches ({@code CachingInputFile.wrapped()}), so the deployed stamp is <b>len+mtime</b>
+ * too, and an equal-length same-snapshot republish is seen. <b>Length alone is the fallback</b>, for a
+ * {@code FileIO} that genuinely exposes no modification time: there a republish that changes the content
+ * without changing the byte count is missed, and {@code rap_manifest_cache_capacity = 0} is the way out for a
+ * publisher that cannot promise the length moves. The stamp kind is reported in the plan
  * ({@code cache=hit}/{@code refresh}) and in the log, so a run can see which was used rather than assume.
  *
  * <p><b>Bounds.</b> At most {@code rap_manifest_cache_capacity} manifests and
@@ -209,13 +213,20 @@ public final class RapManifestCache {
      * Probe the object for the freshness signal, using the strongest one this {@link InputFile} exposes.
      * {@code getLength()} is the call the loader already made; {@code HadoopInputFile.getStat()} reuses the
      * {@code FileStatus} that call fetched, so the modification time costs nothing extra where it exists.
+     *
+     * <p>The deployed FE reads through {@code IcebergCachingFileIO}, so the file handed here is a
+     * {@code CachingInputFile} wrapping the real one; it is unwrapped first, which is what makes the deployed
+     * stamp {@code len+mtime} rather than length alone. A {@code FileIO} that exposes no modification time at
+     * all still gets the length-only stamp.
      */
     public static Stamp stampOf(InputFile in) {
         long length = in.getLength();
         long mtime = MTIME_UNKNOWN;
-        if (in instanceof HadoopInputFile) {
+        InputFile stated = in instanceof IcebergCachingFileIO.CachingInputFile
+                ? ((IcebergCachingFileIO.CachingInputFile) in).wrapped() : in;
+        if (stated instanceof HadoopInputFile) {
             try {
-                mtime = ((HadoopInputFile) in).getStat().getModificationTime();
+                mtime = ((HadoopInputFile) stated).getStat().getModificationTime();
                 if (mtime == MTIME_UNKNOWN) {
                     mtime = MTIME_UNKNOWN + 1;   // keep the sentinel meaning "no modification time available"
                 }

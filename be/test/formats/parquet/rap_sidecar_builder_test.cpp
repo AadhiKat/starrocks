@@ -480,6 +480,43 @@ TEST_F(RapSidecarBuilderTest, OffByDefault) {
     EXPECT_TRUE(std::filesystem::is_empty(_dir + "/rapx"));
 }
 
+// 4b. The sidecar builder's outcome rides on the COMMIT RESULT, which is where the sink reads it. Before this there
+// was no counter anywhere in an INSERT's profile that described the export build: the only Rap counters in a 700-line
+// profile sit in CONNECTOR_SCAN and describe the SOURCE read (`s9-export-cost-is-free.md`). NOT COMPILED HERE -- see
+// the v5 note in rap_index_test.cpp.
+TEST_F(RapSidecarBuilderTest, SinkStatsRideOnTheCommitResult) {
+    Written on = write_file(_dir + "/rapx", {"k"});
+    ASSERT_TRUE(on.result.io_status.ok()) << on.result.io_status.message();
+    EXPECT_EQ(on.result.rap_index.attempted, 1) << "one builder reached its write decision";
+    EXPECT_EQ(on.result.rap_index.sidecars_written, 1);
+    EXPECT_EQ(on.result.rap_index.failures, 0);
+    EXPECT_EQ(on.result.rap_index.attempted, on.result.rap_index.sidecars_written + on.result.rap_index.failures)
+            << "attempted must always account for every builder";
+    const std::string sidecar = _dir + "/rapx/" + parquet::RapIndex::key_of(on.path) + ".k.rapx";
+    ASSERT_TRUE(std::filesystem::exists(sidecar));
+    EXPECT_EQ(on.result.rap_index.sidecar_bytes, static_cast<int64_t>(std::filesystem::file_size(sidecar)));
+    EXPECT_GT(on.result.rap_index.build_ns, 0);
+    // the commit result and the writer's own view are the same numbers
+    EXPECT_EQ(on.result.rap_index.sidecars_written, on.writer->rap_export_stats().sidecars_written);
+    EXPECT_EQ(on.result.rap_index.sidecar_bytes, on.writer->rap_export_stats().sidecar_bytes);
+
+    // OFF: no directory, so no builder is even constructed. `attempted == 0` is then a FACT about the run rather than
+    // an absence of reporting -- which is exactly what an OFF arm has to be able to say.
+    Written off = write_file("", {"k"});
+    ASSERT_TRUE(off.result.io_status.ok());
+    EXPECT_EQ(off.result.rap_index.attempted, 0);
+    EXPECT_EQ(off.result.rap_index.sidecars_written, 0);
+    EXPECT_EQ(off.result.rap_index.sidecar_bytes, 0);
+    EXPECT_EQ(off.result.rap_index.failures, 0);
+
+    // a build that was attempted and failed is counted on both sides of the ledger
+    Written bad = write_file("/proc/rap_unwritable_dir", {"k"});
+    EXPECT_TRUE(bad.result.io_status.ok()) << "a failed sidecar never fails the data file";
+    EXPECT_EQ(bad.result.rap_index.attempted, 1);
+    EXPECT_EQ(bad.result.rap_index.sidecars_written, 0);
+    EXPECT_EQ(bad.result.rap_index.failures, 1);
+}
+
 // 5. Rollback removes the data file AND its sidecar.
 TEST_F(RapSidecarBuilderTest, RollbackRemovesSidecar) {
     Written w = write_file(_dir + "/rapx", {"k"});

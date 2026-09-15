@@ -289,12 +289,15 @@ RapSidecarBuilder::Choice RapSidecarBuilder::shape_of(uint64_t file_size, uint64
         ch.zonemap_bytes = static_cast<size_t>(ch.n_granules) * (1 + 2 * w);
     }
 
-    // THE RULE. Postings while they fit the per-file share of the data file that S8 allows; otherwise the zone map.
-    // A file whose size is not known (0 -- synthetic callers only; both real build paths have it at close) falls back
-    // to the structural form the same decision rests on: distinct values above rows / 64 means postings approach one
-    // entry per row.
+    // THE RULE. Postings while their exact body is within BOTH a relative and an absolute bound -- the share of the
+    // data file S8 allows, or a floor below which a sidecar cannot be what breaks a size budget. The floor is there
+    // because the relative term alone is wrong for a SMALL file: the per-value cost does not shrink with the file, and
+    // what a dimension would be traded for is a zone map that narrows almost nothing. A file whose size is not known
+    // (0 -- synthetic callers only; both real build paths have it at close) falls back to the structural form the same
+    // decision rests on: distinct values above rows / 64 means postings approach one entry per row.
     if (file_size > 0) {
-        const double budget = config::rap_index_postings_budget_pct * static_cast<double>(file_size) / 100.0;
+        const double budget = std::max(config::rap_index_postings_budget_pct * static_cast<double>(file_size) / 100.0,
+                                       static_cast<double>(config::rap_index_postings_min_bytes));
         ch.shape = static_cast<double>(ch.postings_bytes) > budget ? parquet::RapIndex::Shape::ZONEMAP
                                                                    : parquet::RapIndex::Shape::POSTINGS;
     } else {

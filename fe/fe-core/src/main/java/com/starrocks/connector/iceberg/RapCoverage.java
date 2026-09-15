@@ -45,6 +45,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -73,6 +74,15 @@ public class RapCoverage {
     private static final Logger LOG = LogManager.getLogger(RapCoverage.class);
     public static final int VERSION = 1;
     public static final int TYPED_VERSION = 2;
+    /**
+     * Manifest v3 = v2 plus per-file ROW RANGES (R7, plan-time prefetch). A v3 manifest carries, next to
+     * {@code postings} (value -> file ordinals), a {@code ranges} object (value -> file ordinal -> [[start, end), ...])
+     * and a {@code null_ranges} object for the NULL posting. The ranges are the same ones the per-file sidecar the
+     * manifest was built from would have answered, so a covered file can be narrowed at PLANNING and the backend
+     * never opens its sidecar. v1 and v2 manifests carry no ranges and therefore produce no hints: exactly today's
+     * behaviour, with the backend consulting the sidecar itself.
+     */
+    public static final int RANGED_VERSION = 3;
     public static final String SUFFIX = ".rapm.json";
 
     public enum Decision { KEEP, DROP }
@@ -95,6 +105,16 @@ public class RapCoverage {
     private final boolean predicateUsable;        // EQ / IN literal(s) on `column` were found
     private int manifestKeyType = 0;              // zero denotes a retained v1 manifest
     private int manifestFieldId = -1;
+
+    // R7: per-file candidate row ranges, keyed the same way as `files`. Non-empty only for a v3 manifest whose
+    // `ranges` section validated AND whose file set agrees with the elimination candidates. Half-open [start, end)
+    // absolute row positions within the data FILE -- not within a split -- because that is what the backend's
+    // GroupReader intersects into each row group (be/src/formats/parquet/group_reader.cpp).
+    private final Map<String, long[][]> hintRanges = new HashMap<>();
+    private boolean hintsUsable = false;
+    private String hintReason = "no ranged manifest";
+    private int hinted = 0;
+    private int hintedRanges = 0;
 
     // counters, readable in EXPLAIN and logs
     private int consulted = 0;
@@ -211,10 +231,13 @@ public class RapCoverage {
             }
             JsonObject m = JsonParser.parseString(json).getAsJsonObject();
             int version = m.has("version") ? m.get("version").getAsBigDecimal().intValueExact() : -1;
-            if (version != VERSION && version != TYPED_VERSION) {
+            if (version != VERSION && version != TYPED_VERSION && version != RANGED_VERSION) {
                 LOG.warn("RAP manifest version unsupported -- ordinary scan");
                 return disabled(expectSnapshot);
             }
+            // v3 is v2 plus row ranges: the same typed keys, key type, field id and NULL postings decide
+            // elimination, and only the extra `ranges` section decides whether plan-time hints are emitted.
+            boolean typed = version == TYPED_VERSION || version == RANGED_VERSION;
             if (!m.has("snapshot_id") || m.get("snapshot_id").getAsLong() != expectSnapshot) {
                 LOG.warn("RAP manifest is for snapshot {} not {} -- ordinary scan",
                         m.has("snapshot_id") ? m.get("snapshot_id").getAsString() : "?", expectSnapshot);
@@ -231,12 +254,12 @@ public class RapCoverage {
                 return disabled(expectSnapshot);
             }
             String column = m.get("column").getAsString();
-            Set<Integer> typedCandidates = version == TYPED_VERSION ? typedCandidates(m, predicate, column) : null;
+            Set<Integer> typedCandidates = typed ? typedCandidates(m, predicate, column) : null;
             List<String> literals = version == VERSION ? extractLiterals(predicate, column) : null;
             boolean hasPostings = m.has("postings") && m.get("postings").isJsonObject();
             RapCoverage c = new RapCoverage(true, expectSnapshot, column, hasPostings,
-                    version == TYPED_VERSION ? typedCandidates != null : literals != null);
-            if (version == TYPED_VERSION) {
+                    typed ? typedCandidates != null : literals != null);
+            if (typed) {
                 c.manifestKeyType = m.get("key_type").getAsBigDecimal().intValueExact();
                 c.manifestFieldId = m.get("field_id").getAsBigDecimal().intValueExact();
                 if (c.manifestFieldId <= 0) {
@@ -306,6 +329,11 @@ public class RapCoverage {
                     }
                 }
             }
+            if (version == RANGED_VERSION) {
+                // R7: never throws, never changes an elimination decision -- it only decides whether this plan
+                // may also ship row ranges, and records why when it may not.
+                c.bindRowRanges(m, names, predicate, typedCandidates);
+            }
             return c;
         } catch (Exception e) {
             LOG.warn("RAP manifest malformed ({}) -- ordinary scan", e.getClass().getSimpleName());
@@ -368,6 +396,187 @@ public class RapCoverage {
         }
         Set<Integer> nullFiles = fileIndices(manifest.get("null_postings"), size, true);
         return RapManifestPredicate.matching(predicate, column, type, postings, nullFiles);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // R7: plan-time row ranges.
+    //
+    // The completeness rule is untouched by everything below. Hints may only NARROW the rows read inside a file
+    // that `decide` already scheduled; they never add, remove or reorder a file, and a file with no hint is read
+    // exactly as it is today. So every failure here -- a missing section, a malformed range, a predicate shape the
+    // range index cannot answer, a disagreement with the elimination candidates -- turns the hints off and leaves
+    // the scan correct and complete, with the reason recorded.
+    // ---------------------------------------------------------------------------------------------------------
+
+    private void bindRowRanges(JsonObject m, List<String> names, ScalarOperator predicate, Set<Integer> candidates) {
+        if (!Config.rap_plan_row_range_hints) {
+            hintReason = "disabled by rap_plan_row_range_hints";
+            return;
+        }
+        if (!hasPostings || !predicateUsable || candidates == null) {
+            hintReason = "no usable postings for this predicate";
+            return;
+        }
+        try {
+            JsonObject postings = m.getAsJsonObject("postings");
+            if (!m.has("ranges") || !m.get("ranges").isJsonObject()) {
+                throw new IllegalArgumentException("v3 manifest without a ranges object");
+            }
+            JsonObject ranges = m.getAsJsonObject("ranges");
+            if (ranges.size() != postings.size()) {
+                throw new IllegalArgumentException("ranges and postings name different values");
+            }
+            NavigableMap<String, Map<Integer, long[][]>> ranged = new TreeMap<>();
+            for (Map.Entry<String, JsonElement> entry : postings.entrySet()) {
+                JsonElement byFile = ranges.get(entry.getKey());
+                if (byFile == null || !byFile.isJsonObject()) {
+                    throw new IllegalArgumentException("a posting value has no ranges object");
+                }
+                ranged.put(entry.getKey(), perFileRanges(byFile.getAsJsonObject(), ordinalsOf(entry.getValue()), names));
+            }
+            if (!m.has("null_ranges") || !m.get("null_ranges").isJsonObject()) {
+                throw new IllegalArgumentException("v3 manifest without a null_ranges object");
+            }
+            Map<Integer, long[][]> nullRanges = perFileRanges(m.getAsJsonObject("null_ranges"),
+                    ordinalsOf(m.get("null_postings")), names);
+
+            Map<Integer, long[][]> selected =
+                    RapManifestPredicate.matchingRanges(predicate, column, manifestKeyType, ranged, nullRanges);
+            if (selected == null) {
+                throw new IllegalArgumentException("predicate shape carries no row ranges");
+            }
+            // The guard that keeps hints and elimination from ever drifting apart: the files the range index
+            // selects must be exactly the files the posting index selected. A divergence is a manifest defect,
+            // and it turns hints off rather than narrowing a read the completeness rule did not sanction.
+            if (!selected.keySet().equals(candidates)) {
+                throw new IllegalArgumentException("range candidates differ from posting candidates");
+            }
+            for (Map.Entry<Integer, long[][]> entry : selected.entrySet()) {
+                // A zero-length intersection means the conjunction matches no row of that file. The posting rule
+                // still schedules it (it is in M), so emit no hint and let the ordinary scan settle it.
+                if (entry.getValue().length > 0) {
+                    hintRanges.put(names.get(entry.getKey()), entry.getValue());
+                }
+            }
+            hintsUsable = true;
+            hintReason = "";
+        } catch (Exception e) {
+            hintRanges.clear();
+            hintsUsable = false;
+            hintReason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            LOG.warn("RAP manifest for snapshot {} carries no usable row ranges ({}) -- files are still eliminated, "
+                    + "and scheduled files are narrowed by the backend sidecar as before", snapshotId, hintReason);
+        }
+    }
+
+    /** The file ordinals of one posting entry; every index was proven an exact integer within [0, files) already. */
+    private static Set<Integer> ordinalsOf(JsonElement postingArray) {
+        Set<Integer> out = new HashSet<>();
+        if (postingArray == null || !postingArray.isJsonArray()) {
+            return out;
+        }
+        for (JsonElement idx : postingArray.getAsJsonArray()) {
+            out.add(idx.getAsJsonPrimitive().getAsBigDecimal().intValueExact());
+        }
+        return out;
+    }
+
+    /**
+     * {@code {"<file ordinal>": [[start, end), ...]}} for one posting value, validated against the file ordinals the
+     * posting itself declares. Throws on any defect; the caller turns hints off and keeps the scan complete.
+     */
+    private Map<Integer, long[][]> perFileRanges(JsonObject byFile, Set<Integer> expected, List<String> names) {
+        Map<Integer, long[][]> out = new HashMap<>();
+        for (Map.Entry<String, JsonElement> entry : byFile.entrySet()) {
+            int ordinal;
+            try {
+                ordinal = new java.math.BigDecimal(entry.getKey()).intValueExact();
+            } catch (NumberFormatException | ArithmeticException e) {
+                throw new IllegalArgumentException("range file ordinal is not an integer");
+            }
+            if (ordinal < 0 || ordinal >= names.size()) {
+                throw new IllegalArgumentException("range file ordinal outside the manifest files");
+            }
+            Covered file = files.get(names.get(ordinal));
+            if (file == null) {
+                throw new IllegalArgumentException("range file ordinal names no covered file");
+            }
+            out.put(ordinal, fileRanges(entry.getValue(), file.rows));
+        }
+        if (!out.keySet().equals(expected)) {
+            throw new IllegalArgumentException("ranges and postings name different files for a value");
+        }
+        return out;
+    }
+
+    /** One file's ranges: a non-empty, ascending, disjoint list of half-open [start, end) inside [0, rows]. */
+    private static long[][] fileRanges(JsonElement element, long rows) {
+        if (element == null || !element.isJsonArray() || element.getAsJsonArray().isEmpty()) {
+            throw new IllegalArgumentException("a file's range list is absent or empty");
+        }
+        JsonArray array = element.getAsJsonArray();
+        long[][] out = new long[array.size()][];
+        long previousEnd = 0;
+        for (int i = 0; i < array.size(); i++) {
+            JsonElement raw = array.get(i);
+            if (!raw.isJsonArray() || raw.getAsJsonArray().size() != 2) {
+                throw new IllegalArgumentException("a row range is not a [start, end) pair");
+            }
+            long start = exactLong(raw.getAsJsonArray().get(0));
+            long end = exactLong(raw.getAsJsonArray().get(1));
+            if (start < 0 || end <= start) {
+                throw new IllegalArgumentException("a row range is negative, empty or inverted");
+            }
+            if (end > rows) {
+                throw new IllegalArgumentException("a row range runs past the file's row count");
+            }
+            if (i > 0 && start < previousEnd) {
+                throw new IllegalArgumentException("row ranges are unordered or overlapping");
+            }
+            out[i] = new long[] {start, end};
+            previousEnd = end;
+        }
+        return out;
+    }
+
+    private static long exactLong(JsonElement element) {
+        if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isNumber()) {
+            throw new IllegalArgumentException("a row position is not a number");
+        }
+        // Gson narrows silently: 0.5 and 2^64 both become 0 through getAsLong(). Decide on the exact decimal, and
+        // name the defect rather than letting BigDecimal's "Rounding necessary" stand as the recorded reason.
+        try {
+            return element.getAsJsonPrimitive().getAsBigDecimal().longValueExact();
+        } catch (ArithmeticException | NumberFormatException e) {
+            throw new IllegalArgumentException("a row position is not an exact integer");
+        }
+    }
+
+    /**
+     * The row ranges to ship on this file's scan range(s), or null when this plan emits no hint for it.
+     *
+     * <p>File-relative and split-independent by construction: the positions are absolute within the data FILE, so
+     * every scan range of a split file carries the same list and the backend intersects it with each row group it
+     * actually reads (GroupReader::_apply_selected_row_ranges). A file gets a hint only when it is covered, its
+     * identity still matches the manifest, and the manifest's ranges bound to this predicate -- the same three
+     * conditions under which {@code decide} was willing to reason about it at all.
+     */
+    public long[][] rowRangesFor(DataFile file) {
+        if (!active || !hintsUsable || file == null) {
+            return null;
+        }
+        String key = keyOf(file.location());
+        Covered c = files.get(key);
+        if (c == null || c.size != file.fileSizeInBytes() || c.rows != file.recordCount()) {
+            return null; // uncovered, or rewritten under the same name: P - C is scanned whole
+        }
+        long[][] ranges = hintRanges.get(key);
+        if (ranges == null || ranges.length == 0) {
+            return null;
+        }
+        hinted++;
+        hintedRanges += ranges.length;
+        return ranges;
     }
 
     /**
@@ -519,5 +728,24 @@ public class RapCoverage {
 
     public int getDropped() {
         return dropped;
+    }
+
+    /** R7: true when this plan may ship row ranges (a v3 manifest whose ranges bound to this predicate). */
+    public boolean hasRowRangeHints() {
+        return hintsUsable;
+    }
+
+    /** Empty when hints are usable; otherwise why this plan ships none. Decided at LOAD time, so it is real. */
+    public String getHintReason() {
+        return hintReason;
+    }
+
+    /** Files this plan hinted, and the row ranges shipped. Decided at SCHEDULING time -- zero while EXPLAIN renders. */
+    public int getHinted() {
+        return hinted;
+    }
+
+    public int getHintedRanges() {
+        return hintedRanges;
     }
 }

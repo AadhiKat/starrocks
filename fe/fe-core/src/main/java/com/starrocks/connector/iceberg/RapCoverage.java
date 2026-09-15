@@ -73,20 +73,31 @@ import java.util.TreeMap;
  *
  * <p><b>Slice 5 (workstream D):</b> everything a manifest establishes before the query's literals are looked at
  * is done once, in {@link #parseManifest}, and kept between plans by {@link RapManifestCache}; a plan pays only
- * {@link #bind}. That split is what the row-range work of workstream A sits inside: the {@code ranges} section is
- * VALIDATED at parse time, with the rest of the document, and only the selection of which ranges this query's
- * literals choose happens per plan.
+ * {@link #bind}. That split is what the row-range work of workstream A sits inside: the {@code granules} section
+ * is VALIDATED -- and turned into row ranges -- at parse time, with the rest of the document, and only the
+ * selection of which ranges this query's literals choose happens per plan.
  */
 public class RapCoverage {
     private static final Logger LOG = LogManager.getLogger(RapCoverage.class);
     public static final int VERSION = 1;
     public static final int TYPED_VERSION = 2;
     /**
-     * Manifest v3 = v2 plus per-file ROW RANGES (R7, plan-time prefetch). A v3 manifest carries, next to
-     * {@code postings} (value -> file ordinals), a {@code ranges} object (value -> file ordinal -> [[start, end), ...])
-     * and a {@code null_ranges} object for the NULL posting. The ranges are the same ones the per-file sidecar the
-     * manifest was built from would have answered, so a covered file can be narrowed at PLANNING and the backend
-     * never opens its sidecar. v1 and v2 manifests carry no ranges and therefore produce no hints: exactly today's
+     * Manifest v3 = v2 plus per-file GRANULE ORDINALS (R7, plan-time prefetch). A v3 manifest carries, next to
+     * {@code postings} (value -> file ordinals), a {@code granules} object (value -> file ordinal -> the granule
+     * ordinals of that file that hold the value), a {@code null_granules} object for the NULL posting, and a
+     * {@code granularity} on every entry of {@code files}.
+     *
+     * <p>Granule {@code g} of a file of {@code rows} rows is {@code [g * granularity, min((g + 1) * granularity,
+     * rows))}, and adjacent granules are coalesced into one range. That reproduces exactly the row ranges the
+     * per-file sidecar the manifest was built from would have answered -- every sidecar's postings are
+     * granule-aligned -- so a covered file can be narrowed at PLANNING and the backend never opens its sidecar,
+     * while one small integer per granule replaces a pair of int64 row positions. On the 1,500-file density
+     * fixture that is 45 MB rather than 175 MB, which is the difference between fitting
+     * {@code rap_manifest_max_bytes} and not.
+     *
+     * <p>The derivation happens ONCE, in {@link #parseRanges}, so everything below it -- {@code matchingRanges},
+     * {@link #rowRangesFor}, {@link #bind} and the backend -- still sees {@code long[][]} row ranges and is
+     * unaffected. v1 and v2 manifests carry no granules and therefore produce no hints: exactly today's
      * behaviour, with the backend consulting the sidecar itself.
      */
     public static final int RANGED_VERSION = 3;
@@ -116,6 +127,11 @@ public class RapCoverage {
 
     /** The hint reason a manifest with no usable postings for THIS plan carries. Decided in {@link #bind}. */
     private static final String HINTS_NO_POSTINGS = "no usable postings for this predicate";
+    /**
+     * The one reason class manifest v3's ordinal form added: a file whose {@code granularity} is missing,
+     * non-numeric, fractional or non-positive names no rows at all, whatever its granule list says.
+     */
+    private static final String NO_GRANULARITY = "a file declares no usable granularity";
 
     private static final class Covered {
         final long size;
@@ -141,7 +157,7 @@ public class RapCoverage {
     private String cache = RapManifestCache.Outcome.NONE.label();
 
     // R7: per-file candidate row ranges for THIS plan's predicate, keyed the same way as `files`. Non-empty only for
-    // a v3 manifest whose `ranges` section validated at parse time AND whose file set agrees with this plan's
+    // a v3 manifest whose `granules` section validated at parse time AND whose file set agrees with this plan's
     // elimination candidates. Half-open [start, end) absolute row positions within the data FILE -- not within a
     // split -- because that is what the backend's GroupReader intersects into each row group
     // (be/src/formats/parquet/group_reader.cpp). The arrays are the cached parse's own: read, never written.
@@ -352,8 +368,9 @@ public class RapCoverage {
         private final Map<String, Covered> files;       // key -> identity
         private final Map<String, int[]> postings;      // v1: value -> file indices; null for a typed manifest
         private final Typed typed;                      // v2 / v3: validated typed postings; null for a v1 manifest
-        // R7, slice 5: the validated `ranges` / `null_ranges` sections of a v3 manifest, value -> file ordinal ->
-        // [[start, end), ...]. Null when this manifest carries none, or when its ranges were REFUSED -- a refusal
+        // R7, slice 5: the validated `granules` / `null_granules` sections of a v3 manifest, already turned into
+        // value -> file ordinal -> [[start, end), ...]. Null when this manifest carries none, or when its granules
+        // were REFUSED -- a refusal
         // is a property of the manifest, not of the query, so it is decided once here and cached with everything
         // else, and `rangeReason` is what every plan bound from it then reports.
         private final NavigableMap<String, Map<Integer, long[][]>> ranged;
@@ -453,7 +470,7 @@ public class RapCoverage {
                 return ParseResult.refused(REASON_UNSUPPORTED_VERSION);
             }
             // v3 is v2 plus row ranges: the same typed keys, key type, field id and NULL postings decide
-            // elimination, and only the extra `ranges` section decides whether plan-time hints are emitted.
+            // elimination, and only the extra `granules` section decides whether plan-time hints are emitted.
             boolean typedManifest = version == TYPED_VERSION || version == RANGED_VERSION;
             if (!m.has("snapshot_id") || m.get("snapshot_id").getAsLong() != expectSnapshot) {
                 LOG.warn("RAP manifest is for snapshot {} not {} -- ordinary scan",
@@ -543,7 +560,7 @@ public class RapCoverage {
                     }
                 }
             }
-            // R7 under slice 5: the `ranges` section is validated HERE, with the rest of the document, because
+            // R7 under slice 5: the `granules` section is validated HERE, with the rest of the document, because
             // nothing about it depends on the query. It never throws and never changes an elimination decision: a
             // defect leaves `ranged` null and records the reason, which is what every plan bound from it reports.
             Ranged ranges = version == RANGED_VERSION && hasPostings
@@ -562,7 +579,7 @@ public class RapCoverage {
     /**
      * Slice 5: bind a parsed manifest to ONE plan's predicate. This is all a cached manifest costs per plan --
      * the literals of the query looked up in the postings, the matching file keys collected, and (v3) the row
-     * ranges those literals select out of the already-validated `ranges`. Everything else was established once
+     * ranges those literals select out of the already-derived `granules`. Everything else was established once
      * in {@link #parseManifest}.
      */
     static RapCoverage bind(Parsed p, ScalarOperator predicate) {
@@ -679,12 +696,13 @@ public class RapCoverage {
     // range index cannot answer, a disagreement with the elimination candidates -- turns the hints off and leaves
     // the scan correct and complete, with the reason recorded.
     //
-    // Slice 5 splits this work the way the rest of the manifest is split: the SECTION is parsed and validated once,
-    // in `parseRanges` (nothing about it depends on the query, so a cache hit re-parses none of it), and only the
-    // SELECTION -- which of those ranges this plan's literals choose -- happens per plan, in `bindRowRanges`.
+    // Slice 5 splits this work the way the rest of the manifest is split: the SECTION is parsed, validated and
+    // turned from granule ordinals into row ranges once, in `parseRanges` (nothing about it depends on the query,
+    // so a cache hit re-derives none of it), and only the SELECTION -- which of those ranges this plan's literals
+    // choose -- happens per plan, in `bindRowRanges`.
     // ---------------------------------------------------------------------------------------------------------
 
-    /** The validated `ranges` / `null_ranges` sections, or the reason they were refused. Immutable, and cached. */
+    /** The row ranges the `granules` / `null_granules` sections name, or the reason they were refused. Cached. */
     private static final class Ranged {
         private final NavigableMap<String, Map<Integer, long[][]>> ranged;
         private final Map<Integer, long[][]> nullRanges;
@@ -707,34 +725,36 @@ public class RapCoverage {
     }
 
     /**
-     * Validate a v3 manifest's `ranges` and `null_ranges` against the postings they must agree with. Never throws:
-     * a defect returns a refusal carrying the reason, which is cached with the parse and reported by every plan
-     * bound from it. This runs ONCE per manifest, not once per plan.
+     * Validate a v3 manifest's `granules` and `null_granules` against the postings they must agree with, and derive
+     * the row ranges they name. Never throws: a defect returns a refusal carrying the reason, which is cached with
+     * the parse and reported by every plan bound from it. This runs ONCE per manifest, not once per plan.
      */
     private static Ranged parseRanges(JsonObject m, List<String> names, Map<String, Covered> covered, long snapshot) {
         try {
+            // Before a single hint: every file must say what a granule ordinal MEANS for it.
+            long[] granularity = granularities(m.getAsJsonArray("files"));
             JsonObject postings = m.getAsJsonObject("postings");
-            if (!m.has("ranges") || !m.get("ranges").isJsonObject()) {
-                throw new IllegalArgumentException("v3 manifest without a ranges object");
+            if (!m.has("granules") || !m.get("granules").isJsonObject()) {
+                throw new IllegalArgumentException("v3 manifest without a granules object");
             }
-            JsonObject ranges = m.getAsJsonObject("ranges");
-            if (ranges.size() != postings.size()) {
-                throw new IllegalArgumentException("ranges and postings name different values");
+            JsonObject granules = m.getAsJsonObject("granules");
+            if (granules.size() != postings.size()) {
+                throw new IllegalArgumentException("granules and postings name different values");
             }
             NavigableMap<String, Map<Integer, long[][]>> ranged = new TreeMap<>();
             for (Map.Entry<String, JsonElement> entry : postings.entrySet()) {
-                JsonElement byFile = ranges.get(entry.getKey());
+                JsonElement byFile = granules.get(entry.getKey());
                 if (byFile == null || !byFile.isJsonObject()) {
-                    throw new IllegalArgumentException("a posting value has no ranges object");
+                    throw new IllegalArgumentException("a posting value has no granules object");
                 }
-                ranged.put(entry.getKey(), Collections.unmodifiableMap(
-                        perFileRanges(byFile.getAsJsonObject(), ordinalsOf(entry.getValue()), names, covered)));
+                ranged.put(entry.getKey(), Collections.unmodifiableMap(perFileRanges(byFile.getAsJsonObject(),
+                        ordinalsOf(entry.getValue()), names, covered, granularity)));
             }
-            if (!m.has("null_ranges") || !m.get("null_ranges").isJsonObject()) {
-                throw new IllegalArgumentException("v3 manifest without a null_ranges object");
+            if (!m.has("null_granules") || !m.get("null_granules").isJsonObject()) {
+                throw new IllegalArgumentException("v3 manifest without a null_granules object");
             }
-            Map<Integer, long[][]> nullRanges = perFileRanges(m.getAsJsonObject("null_ranges"),
-                    ordinalsOf(m.get("null_postings")), names, covered);
+            Map<Integer, long[][]> nullRanges = perFileRanges(m.getAsJsonObject("null_granules"),
+                    ordinalsOf(m.get("null_postings")), names, covered, granularity);
             return Ranged.of(Collections.unmodifiableNavigableMap(ranged), Collections.unmodifiableMap(nullRanges));
         } catch (Exception e) {
             String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
@@ -805,74 +825,121 @@ public class RapCoverage {
     }
 
     /**
-     * {@code {"<file ordinal>": [[start, end), ...]}} for one posting value, validated against the file ordinals the
-     * posting itself declares. Throws on any defect; the caller turns hints off and keeps the scan complete.
+     * Every file's granularity, read PER FILE. The granularity is what turns an ordinal back into rows, so it is
+     * taken from the same record that declares that file's row count rather than from one number for the whole
+     * manifest: a manifest that ever mixes granularities would otherwise be silently wrong, and the top-level
+     * {@code granularity_rows} is a v1/v2 field this frontend has never validated. Missing, non-numeric,
+     * fractional and non-positive are one failure with one reason -- in every case an ordinal cannot be turned
+     * back into rows -- and it is raised before a single hint is derived.
+     */
+    private static long[] granularities(JsonArray files) {
+        long[] out = new long[files.size()];
+        for (int i = 0; i < files.size(); i++) {
+            JsonElement declared = files.get(i).getAsJsonObject().get("granularity");
+            if (declared == null || !declared.isJsonPrimitive() || !declared.getAsJsonPrimitive().isNumber()) {
+                throw new IllegalArgumentException(NO_GRANULARITY);
+            }
+            long granularity;
+            try {
+                granularity = declared.getAsJsonPrimitive().getAsBigDecimal().longValueExact();
+            } catch (ArithmeticException | NumberFormatException e) {
+                throw new IllegalArgumentException(NO_GRANULARITY);
+            }
+            if (granularity <= 0) {
+                throw new IllegalArgumentException(NO_GRANULARITY);
+            }
+            out[i] = granularity;
+        }
+        return out;
+    }
+
+    /**
+     * {@code {"<file ordinal>": [granule ordinal, ...]}} for one posting value, validated against the file ordinals
+     * the posting itself declares. Throws on any defect; the caller turns hints off and keeps the scan complete.
      */
     private static Map<Integer, long[][]> perFileRanges(JsonObject byFile, Set<Integer> expected, List<String> names,
-                                                        Map<String, Covered> covered) {
+                                                        Map<String, Covered> covered, long[] granularity) {
         Map<Integer, long[][]> out = new HashMap<>();
         for (Map.Entry<String, JsonElement> entry : byFile.entrySet()) {
             int ordinal;
             try {
                 ordinal = new java.math.BigDecimal(entry.getKey()).intValueExact();
             } catch (NumberFormatException | ArithmeticException e) {
-                throw new IllegalArgumentException("range file ordinal is not an integer");
+                throw new IllegalArgumentException("granule file ordinal is not an integer");
             }
             if (ordinal < 0 || ordinal >= names.size()) {
-                throw new IllegalArgumentException("range file ordinal outside the manifest files");
+                throw new IllegalArgumentException("granule file ordinal outside the manifest files");
             }
             Covered file = covered.get(names.get(ordinal));
             if (file == null) {
-                throw new IllegalArgumentException("range file ordinal names no covered file");
+                throw new IllegalArgumentException("granule file ordinal names no covered file");
             }
-            out.put(ordinal, fileRanges(entry.getValue(), file.rows));
+            out.put(ordinal, fileGranules(entry.getValue(), file.rows, granularity[ordinal]));
         }
         if (!out.keySet().equals(expected)) {
-            throw new IllegalArgumentException("ranges and postings name different files for a value");
+            throw new IllegalArgumentException("granules and postings name different files for a value");
         }
         return out;
     }
 
-    /** One file's ranges: a non-empty, ascending, disjoint list of half-open [start, end) inside [0, rows]. */
-    private static long[][] fileRanges(JsonElement element, long rows) {
+    /**
+     * One file's granule ordinals, as the ROW RANGES they name. Granule {@code g} is
+     * {@code [g * gran, min((g + 1) * gran, rows))} -- the file's last granule is short and is clipped to
+     * {@code rows} -- and adjacent granules are coalesced, so the result is the non-empty, ascending, disjoint,
+     * non-touching list the rest of the frontend and the backend already expect, and is identical to the list the
+     * sidecar itself holds.
+     *
+     * <p>The list must be non-empty, and every ordinal exactly integral, ascending, unique and inside
+     * [0, ceil(rows / gran)). Those four are what a row-pair manifest spent six checks on: a negative or
+     * out-of-range ordinal is the range that ran past the file, and an unordered or repeated one is the overlap.
+     */
+    private static long[][] fileGranules(JsonElement element, long rows, long gran) {
         if (element == null || !element.isJsonArray() || element.getAsJsonArray().isEmpty()) {
-            throw new IllegalArgumentException("a file's range list is absent or empty");
+            throw new IllegalArgumentException("a file's granule list is absent or empty");
         }
         JsonArray array = element.getAsJsonArray();
+        // rounded UP, and written without `rows + gran` so a huge declared row count cannot overflow
+        long count = rows / gran + (rows % gran == 0 ? 0 : 1);
         long[][] out = new long[array.size()][];
-        long previousEnd = 0;
+        int at = 0;
+        long previous = -1;
         for (int i = 0; i < array.size(); i++) {
-            JsonElement raw = array.get(i);
-            if (!raw.isJsonArray() || raw.getAsJsonArray().size() != 2) {
-                throw new IllegalArgumentException("a row range is not a [start, end) pair");
+            long ordinal = exactOrdinal(array.get(i));
+            if (ordinal < 0 || ordinal >= count) {
+                throw new IllegalArgumentException("a granule ordinal is outside the file's granules");
             }
-            long start = exactLong(raw.getAsJsonArray().get(0));
-            long end = exactLong(raw.getAsJsonArray().get(1));
-            if (start < 0 || end <= start) {
-                throw new IllegalArgumentException("a row range is negative, empty or inverted");
+            if (ordinal <= previous) {
+                throw new IllegalArgumentException("granule ordinals are unordered or repeated");
             }
-            if (end > rows) {
-                throw new IllegalArgumentException("a row range runs past the file's row count");
+            previous = ordinal;
+            long start = ordinal * gran;
+            // the last granule is clipped to the file's rows; every other one is exactly `gran` long
+            long end = ordinal == count - 1 ? rows : start + gran;
+            if (at > 0 && out[at - 1][1] == start) {
+                // Adjacent granules are ONE range. Not observable in a hint: every matchingRanges path ends in
+                // RapManifestPredicate.unionRanges -> mergeRanges, which joins touching intervals anyway, and a
+                // source-reversion mutant of these four lines is the one mutant of this change that survives the
+                // suite. It is here for what the CACHE holds: `Parsed.ranged` is kept between plans, and on the
+                // 1,500-file density fixture this is 3,410,632 long[2] rather than 9,306,946 -- 2.73x. Do not
+                // "simplify" it away on the grounds that no test covers it.
+                out[at - 1][1] = end;
+            } else {
+                out[at++] = new long[] {start, end};
             }
-            if (i > 0 && start < previousEnd) {
-                throw new IllegalArgumentException("row ranges are unordered or overlapping");
-            }
-            out[i] = new long[] {start, end};
-            previousEnd = end;
         }
-        return out;
+        return at == array.size() ? out : java.util.Arrays.copyOf(out, at);
     }
 
-    private static long exactLong(JsonElement element) {
+    private static long exactOrdinal(JsonElement element) {
         if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isNumber()) {
-            throw new IllegalArgumentException("a row position is not a number");
+            throw new IllegalArgumentException("a granule ordinal is not a number");
         }
         // Gson narrows silently: 0.5 and 2^64 both become 0 through getAsLong(). Decide on the exact decimal, and
         // name the defect rather than letting BigDecimal's "Rounding necessary" stand as the recorded reason.
         try {
             return element.getAsJsonPrimitive().getAsBigDecimal().longValueExact();
         } catch (ArithmeticException | NumberFormatException e) {
-            throw new IllegalArgumentException("a row position is not an exact integer");
+            throw new IllegalArgumentException("a granule ordinal is not an exact integer");
         }
     }
 

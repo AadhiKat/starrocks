@@ -100,27 +100,45 @@ public class RapRowRangeHintsTest extends TableTestBase {
     private static final DataFile F3 = file("f3.parquet", 3000, 300); // uncovered
 
     /**
-     * A v3 manifest over F1 (100 rows) and F2 (200 rows), with the postings and the ranges that describe them:
-     * 'v' lives in F1 rows [0,20) and [40,60); 'w' lives in F1 rows [50,70) and in all of F2; F2 also holds NULLs
-     * in rows [100,200). F3 is not named at all, so it is uncovered and always scanned.
+     * The two covered files, each declaring the GRANULARITY its granule ordinals are read against. 10 rows per
+     * granule, so F1 has ceil(100/10) = 10 granules and F2 has 20.
+     */
+    private static final String FILES =
+            "\"files\": [{\"name\": \"gs/bucket/warehouse/db/t/data/f1.parquet\", \"size\": 1000, \"rows\": 100, "
+                    + "\"granularity\": 10}, "
+                    + "{\"name\": \"gs/bucket/warehouse/db/t/data/f2.parquet\", \"size\": 2000, \"rows\": 200, "
+                    + "\"granularity\": 10}], ";
+
+    /**
+     * A v3 manifest over F1 (100 rows) and F2 (200 rows), with the postings and the GRANULE ORDINALS that describe
+     * them: 'v' lives in F1 rows [0,20) and [40,60), which at granularity 10 is granules 0, 1, 4 and 5; 'w' lives
+     * in F1 rows [50,70) (granules 5 and 6) and in all of F2 (granules 0-9 of the 20 F2 has); F2 also holds NULLs
+     * in rows [100,200), granules 10-19. F3 is not named at all, so it is uncovered and always scanned.
+     *
+     * <p>Every derived range below is exactly the range the row-pair form of this manifest carried, because the
+     * frontend coalesces adjacent granules and clips the last one to the file's rows.
      */
     private static String rangedManifest() {
-        return rangedManifest("\"ranges\": {"
-                + "\"" + KEY_V + "\": {\"0\": [[0, 20], [40, 60]]}, "
-                + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                + "\"null_ranges\": {\"1\": [[100, 200]]}");
+        return rangedManifest("\"granules\": {"
+                + "\"" + KEY_V + "\": {\"0\": [0, 1, 4, 5]}, "
+                + "\"" + KEY_W + "\": {\"0\": [5, 6], \"1\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}}, "
+                + "\"null_granules\": {\"1\": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]}");
     }
 
-    /** The same manifest with the ranges section replaced, so a single defect can be injected at a time. */
-    private static String rangedManifest(String rangesSection) {
+    /** The same manifest with the granules section replaced, so a single defect can be injected at a time. */
+    private static String rangedManifest(String granulesSection) {
+        return rangedManifest(FILES, granulesSection);
+    }
+
+    /** ...and with the files section replaced too, for the defects that live in a file's own `granularity`. */
+    private static String rangedManifest(String filesSection, String granulesSection) {
         return "{\"version\": 3, \"key_type\": 1, \"key_encoding\": \"hex\", \"table_uuid\": \"" + UUID + "\", "
                 + "\"snapshot_id\": " + SNAP + ", \"column\": \"model\", \"field_id\": 15, "
                 + "\"granularity_rows\": 20000, "
-                + "\"files\": [{\"name\": \"gs/bucket/warehouse/db/t/data/f1.parquet\", \"size\": 1000, \"rows\": 100}, "
-                + "{\"name\": \"gs/bucket/warehouse/db/t/data/f2.parquet\", \"size\": 2000, \"rows\": 200}], "
+                + filesSection
                 + "\"postings\": {\"" + KEY_V + "\": [0], \"" + KEY_W + "\": [0, 1]}, "
                 + "\"null_postings\": [1]"
-                + (rangesSection == null ? "" : ", " + rangesSection) + "}";
+                + (granulesSection == null ? "" : ", " + granulesSection) + "}";
     }
 
     private static ScalarOperator eq(String col, String lit) {
@@ -246,7 +264,7 @@ public class RapRowRangeHintsTest extends TableTestBase {
         RapCoverage c = RapCoverage.fromJson(rangedManifest(null), UUID, SNAP, eq("model", "v"));
         Assertions.assertTrue(c.isActive());
         Assertions.assertFalse(c.hasRowRangeHints());
-        Assertions.assertEquals("v3 manifest without a ranges object", c.getHintReason());
+        Assertions.assertEquals("v3 manifest without a granules object", c.getHintReason());
         Assertions.assertEquals("none", hintOf(c, F1));
         Assertions.assertEquals(Arrays.asList("f1.parquet", "f3.parquet"), scheduled(c),
                 "a hint defect must not change which files are scheduled");
@@ -266,60 +284,118 @@ public class RapRowRangeHintsTest extends TableTestBase {
     public void testMalformedRangesHintNothingAndNameTheDefect() {
         record Case(String section, String reason) {
         }
+        String w = "\"" + KEY_W + "\": {\"0\": [5, 6], \"1\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}}, ";
+        String nulls = "\"null_granules\": {\"1\": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]}";
         List<Case> cases = List.of(
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 20]]}}, \"null_ranges\": {\"1\": [[100, 200]]}",
-                        "ranges and postings name different values"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 20]]}, \"" + KEY_W + "\": {\"0\": [[50, 70]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "ranges and postings name different files for a value"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 200]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "a row range runs past the file's row count"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[40, 60], [0, 20]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "row ranges are unordered or overlapping"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[20, 20]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "a row range is negative, empty or inverted"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[-1, 20]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "a row range is negative, empty or inverted"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 20.5]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "a row position is not an exact integer"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 20], [40, 60]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"0\": [[0, 10]]}",
-                        "ranges and postings name different files for a value"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 20], [40, 60]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}",
-                        "v3 manifest without a null_ranges object"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"7\": [[0, 20]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "range file ordinal outside the manifest files"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": []}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "a file's range list is absent or empty"),
-                new Case("\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 20, 30]]}, "
-                        + "\"" + KEY_W + "\": {\"0\": [[50, 70]], \"1\": [[0, 100]]}}, "
-                        + "\"null_ranges\": {\"1\": [[100, 200]]}",
-                        "a row range is not a [start, end) pair"));
+                // the twelve shapes the row-pair form pinned, each now expressed as ordinals
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [0, 1, 4, 5]}}, " + nulls,
+                        "granules and postings name different values"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [0, 1, 4, 5]}, "
+                        + "\"" + KEY_W + "\": {\"0\": [5, 6]}}, " + nulls,
+                        "granules and postings name different files for a value"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [10]}, " + w + nulls,
+                        "a granule ordinal is outside the file's granules"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [4, 0]}, " + w + nulls,
+                        "granule ordinals are unordered or repeated"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [0, 0]}, " + w + nulls,
+                        "granule ordinals are unordered or repeated"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [-1]}, " + w + nulls,
+                        "a granule ordinal is outside the file's granules"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [0.5]}, " + w + nulls,
+                        "a granule ordinal is not an exact integer"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [0, 1, 4, 5]}, " + w
+                        + "\"null_granules\": {\"0\": [0]}",
+                        "granules and postings name different files for a value"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [0, 1, 4, 5]}, " + w.substring(0, w.length() - 2),
+                        "v3 manifest without a null_granules object"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"7\": [0]}, " + w + nulls,
+                        "granule file ordinal outside the manifest files"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": []}, " + w + nulls,
+                        "a file's granule list is absent or empty"),
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"0\": [\"0\"]}, " + w + nulls,
+                        "a granule ordinal is not a number"),
+                // ...and the two structural shapes a section rename does not change
+                new Case("\"granules\": {\"" + KEY_V + "\": {\"f1\": [0]}, " + w + nulls,
+                        "granule file ordinal is not an integer"),
+                new Case("\"granules\": {\"" + KEY_V + "\": [], " + w + nulls,
+                        "a posting value has no granules object"));
         for (Case one : cases) {
             RapCoverage c = RapCoverage.fromJson(rangedManifest(one.section()), UUID, SNAP, eq("model", "v"));
             Assertions.assertTrue(c.isActive(), one.reason());
             Assertions.assertFalse(c.hasRowRangeHints(), "expected no hints for: " + one.reason());
             Assertions.assertEquals(one.reason(), c.getHintReason());
             Assertions.assertEquals("none", hintOf(c, F1));
-            // The whole point: a broken ranges section costs the narrowing, never the completeness rule.
+            // The whole point: a broken granules section costs the narrowing, never the completeness rule.
             Assertions.assertEquals(Arrays.asList("f1.parquet", "f3.parquet"), scheduled(c));
         }
+    }
+
+    /**
+     * The granularity is what turns an ordinal back into rows, so a file that does not declare a usable one
+     * cannot be hinted at all -- and, like every other hint defect, that costs the narrowing and nothing else.
+     */
+    @Test
+    public void testMalformedGranularityHintsNothingAndNamesTheDefect() {
+        String head = "\"files\": [{\"name\": \"gs/bucket/warehouse/db/t/data/f1.parquet\", \"size\": 1000, "
+                + "\"rows\": 100, ";
+        String tail = "{\"name\": \"gs/bucket/warehouse/db/t/data/f2.parquet\", \"size\": 2000, \"rows\": 200, "
+                + "\"granularity\": 10}], ";
+        List<String> files = List.of(
+                head + "\"granularity\": 10}, " + tail.replace("\"granularity\": 10}", "\"granularity\": 0}"),
+                head.substring(0, head.length() - 2) + "}, " + tail,           // no granularity at all
+                head + "\"granularity\": 10.5}, " + tail,
+                head + "\"granularity\": \"10\"}, " + tail,
+                head + "\"granularity\": -10}, " + tail);
+        for (String filesSection : files) {
+            RapCoverage c = RapCoverage.fromJson(rangedManifest(filesSection,
+                    "\"granules\": {\"" + KEY_V + "\": {\"0\": [0, 1, 4, 5]}, "
+                            + "\"" + KEY_W + "\": {\"0\": [5, 6], \"1\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}}, "
+                            + "\"null_granules\": {\"1\": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]}"),
+                    UUID, SNAP, eq("model", "v"));
+            Assertions.assertTrue(c.isActive(), filesSection);
+            Assertions.assertFalse(c.hasRowRangeHints(), filesSection);
+            Assertions.assertEquals("a file declares no usable granularity", c.getHintReason(), filesSection);
+            Assertions.assertEquals("none", hintOf(c, F1));
+            Assertions.assertEquals(Arrays.asList("f1.parquet", "f3.parquet"), scheduled(c));
+        }
+    }
+
+    /**
+     * The two properties the ordinal form rests on: the file's LAST granule is short -- clipped to its row count,
+     * never running past it -- and adjacent granules are one range, not two that touch. Both are what make the
+     * derived list identical to the one the sidecar holds.
+     */
+    @Test
+    public void testTheLastGranuleIsShortAndAdjacentGranulesAreOneRange() {
+        // granularity 30: F1 has ceil(100/30) = 4 granules, the last being [90,100); F2 has 7, the last [180,200).
+        String files = "\"files\": [{\"name\": \"gs/bucket/warehouse/db/t/data/f1.parquet\", \"size\": 1000, "
+                + "\"rows\": 100, \"granularity\": 30}, "
+                + "{\"name\": \"gs/bucket/warehouse/db/t/data/f2.parquet\", \"size\": 2000, \"rows\": 200, "
+                + "\"granularity\": 30}], ";
+        String rest = "\"" + KEY_W + "\": {\"0\": [0], \"1\": [0]}}, \"null_granules\": {\"1\": [6]}";
+
+        RapCoverage c = RapCoverage.fromJson(
+                rangedManifest(files, "\"granules\": {\"" + KEY_V + "\": {\"0\": [0, 2, 3]}, " + rest),
+                UUID, SNAP, eq("model", "v"));
+        Assertions.assertTrue(c.hasRowRangeHints(), c.getHintReason());
+        Assertions.assertEquals("[0,30),[60,100)", hintOf(c, F1),
+                "granules 2 and 3 are adjacent, so they are ONE range, and 3 ends at the file's 100th row");
+        Assertions.assertEquals(2, c.getHintedRanges());
+
+        // The NULL posting's granule 6 of F2 is the short one: [180,200), not [180,210).
+        RapCoverage nulls = RapCoverage.fromJson(
+                rangedManifest(files, "\"granules\": {\"" + KEY_V + "\": {\"0\": [0]}, " + rest),
+                UUID, SNAP, isNull("model", false));
+        Assertions.assertTrue(nulls.hasRowRangeHints(), nulls.getHintReason());
+        Assertions.assertEquals("[180,200)", hintOf(nulls, F2));
+
+        // One past the last granule is refused -- where the row-pair form said "past the file's row count".
+        RapCoverage over = RapCoverage.fromJson(
+                rangedManifest(files, "\"granules\": {\"" + KEY_V + "\": {\"0\": [4]}, " + rest),
+                UUID, SNAP, eq("model", "v"));
+        Assertions.assertFalse(over.hasRowRangeHints());
+        Assertions.assertEquals("a granule ordinal is outside the file's granules", over.getHintReason());
+        Assertions.assertEquals(Arrays.asList("f1.parquet", "f3.parquet"), scheduled(over));
     }
 
     @Test
@@ -407,11 +483,12 @@ public class RapRowRangeHintsTest extends TableTestBase {
                 + "\"snapshot_id\": " + snap + ", \"column\": \"data\", \"field_id\": " + fieldId + ", "
                 + "\"granularity_rows\": 20000, \"files\": ["
                 + "{\"name\": \"" + RapCoverage.keyOf(FILE_A.location()) + "\", \"size\": " + FILE_A.fileSizeInBytes()
-                + ", \"rows\": " + FILE_A.recordCount() + "}, "
+                + ", \"rows\": " + FILE_A.recordCount() + ", \"granularity\": 1}, "
                 + "{\"name\": \"" + RapCoverage.keyOf(FILE_A_1.location()) + "\", \"size\": "
-                + FILE_A_1.fileSizeInBytes() + ", \"rows\": " + FILE_A_1.recordCount() + "}], "
+                + FILE_A_1.fileSizeInBytes() + ", \"rows\": " + FILE_A_1.recordCount() + ", \"granularity\": 1}], "
                 + "\"postings\": {\"" + KEY_V + "\": [0]}, \"null_postings\": [], "
-                + "\"ranges\": {\"" + KEY_V + "\": {\"0\": [[0, 1]]}}, \"null_ranges\": {}}";
+                // granularity 1: granule 0 of a 2-row file is row [0,1), the same hint the row-pair form carried
+                + "\"granules\": {\"" + KEY_V + "\": {\"0\": [0]}}, \"null_granules\": {}}";
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -494,9 +571,10 @@ public class RapRowRangeHintsTest extends TableTestBase {
         String manifest = "{\"version\": 3, \"key_type\": 1, \"key_encoding\": \"hex\", \"table_uuid\": \"" + uuid
                 + "\", \"snapshot_id\": " + snap + ", \"column\": \"data\", \"field_id\": 2, "
                 + "\"granularity_rows\": 20000, \"files\": [{\"name\": \"" + RapCoverage.keyOf(big.location())
-                + "\", \"size\": 3000, \"rows\": 600}], "
+                + "\", \"size\": 3000, \"rows\": 600, \"granularity\": 20}], "
                 + "\"postings\": {\"" + KEY_V + "\": [0]}, \"null_postings\": [], "
-                + "\"ranges\": {\"" + KEY_V + "\": {\"0\": [[20, 40], [560, 600]]}}, \"null_ranges\": {}}";
+                // granularity 20 over 600 rows: granule 1 is [20,40), and 28 + 29 coalesce into [560,600)
+                + "\"granules\": {\"" + KEY_V + "\": {\"0\": [1, 28, 29]}}, \"null_granules\": {}}";
         RapCoverage cov = RapCoverage.fromJson(manifest, uuid, snap, eq("data", "v"));
         Assertions.assertTrue(cov.hasRowRangeHints(), cov.getHintReason());
 

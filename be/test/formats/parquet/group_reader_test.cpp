@@ -24,6 +24,7 @@
 #include "column/const_column.h"
 #include "column/variant_encoder.h"
 #include "common/config_exec_fwd.h"
+#include "common/config_scan_io_fwd.h"
 #include "compute_env/global_dict/parser.h"
 #include "exprs/chunk_predicate_evaluator.h"
 #include "exprs/expr_executor.h"
@@ -4651,6 +4652,326 @@ TEST_F(GroupReaderTest, ReadRangePlannerShouldCoalesceReadsCounter) {
 
     counter.store(0, std::memory_order_relaxed);
     EXPECT_TRUE(planner.should_coalesce_active_lazy());
+}
+
+// ── RAP sparse-range active/lazy I/O coalescing override ─────────────────────
+//
+// GroupReader::_decide_active_lazy_coalesce() takes the adaptive decision above and lets
+// config::rap_index_lazy_coalesce_sparse_threshold overrule it, but ONLY on a row group whose
+// ranges the RAP index supplied. The cases below pin every term of that decision, and each one
+// asserts WHICH counter moved rather than only the returned bool, because the counter and the
+// override can produce the same decision and a reverted override would otherwise survive.
+
+// Pins both knobs _decide_active_lazy_coalesce() reads, and restores them afterwards.
+// io_coalesce_adaptive_lazy_active is the production default (true); with it OFF,
+// set_io_ranges() coalesces whatever it is passed and the override is a no-op by design, so
+// every case below states that it runs with it on rather than inheriting it from the binary.
+class RapCoalesceKnobs {
+public:
+    explicit RapCoalesceKnobs(double threshold)
+            : _saved_threshold(config::rap_index_lazy_coalesce_sparse_threshold),
+              _saved_adaptive(config::io_coalesce_adaptive_lazy_active) {
+        config::rap_index_lazy_coalesce_sparse_threshold = threshold;
+        config::io_coalesce_adaptive_lazy_active = true;
+    }
+    ~RapCoalesceKnobs() {
+        config::rap_index_lazy_coalesce_sparse_threshold = _saved_threshold;
+        config::io_coalesce_adaptive_lazy_active = _saved_adaptive;
+    }
+    RapCoalesceKnobs(const RapCoalesceKnobs&) = delete;
+    RapCoalesceKnobs& operator=(const RapCoalesceKnobs&) = delete;
+
+private:
+    const double _saved_threshold;
+    const bool _saved_adaptive;
+};
+
+// The retained BE-narrow profiles are on files whose row groups hold ~167,000 rows, of which the
+// index selects ~20,000 (~0.12). The fixture's own row group carries 12 rows, so these tests widen
+// it and run the sparsity arithmetic on production-shaped numbers.
+static constexpr int64_t kRapOverrideGroupRows = 167000;
+static constexpr int64_t kRapSparseSelectedRows = 20000;
+static constexpr int64_t kRapDenseSelectedRows = 120000; // 0.72 of the group, above the 0.5 default
+
+struct CoalesceCounters {
+    int64_t together = 0;
+    int64_t seperately = 0;
+    int64_t sparse_override = 0;
+};
+
+// The fixture's FormatScannerStats is a file-static shared by every test in this binary, so these
+// assertions are on DELTAS. Taking absolute values here would make each case depend on which other
+// tests ran first.
+static CoalesceCounters read_coalesce_counters(const FormatScannerStats& stats) {
+    return CoalesceCounters{stats.active_lazy_coalesce_together, stats.active_lazy_coalesce_seperately,
+                            stats.active_lazy_coalesce_sparse_override};
+}
+
+static CoalesceCounters coalesce_delta(const FormatScannerStats& stats, const CoalesceCounters& base) {
+    return CoalesceCounters{stats.active_lazy_coalesce_together - base.together,
+                            stats.active_lazy_coalesce_seperately - base.seperately,
+                            stats.active_lazy_coalesce_sparse_override - base.sparse_override};
+}
+
+// Repoints the group reader at a copy of its row group carrying kRapOverrideGroupRows rows (column
+// chunks unchanged) and resets _range to the whole group -- the shape init() leaves behind when no
+// row-range hint is present.
+static void widen_row_group_to_production_size(GroupReader* group_reader, ObjectPool* pool) {
+    auto* wide = pool->add(new tparquet::RowGroup(*group_reader->_row_group_metadata));
+    wide->__set_num_rows(kRapOverrideGroupRows);
+    group_reader->_row_group_metadata = wide;
+    group_reader->_row_group_first_row = 0;
+    group_reader->_range = SparseRange<uint64_t>(0, kRapOverrideGroupRows);
+}
+
+// Covers: a RAP-provided sparse range overrules an adaptive counter saying "together".
+//         The override fires, the decision flips, and the override counter says so.
+TEST_F(GroupReaderTest, RapSparseRangeOverridesCounterSayingTogether) {
+    // The shipped default is what image 9 runs with, so pin it before overriding it.
+    EXPECT_DOUBLE_EQ(0.5, config::rap_index_lazy_coalesce_sparse_threshold);
+    RapCoalesceKnobs knobs(0.5);
+
+    auto* param = _create_group_reader_param();
+    FileMetaData* file_meta;
+    ASSERT_OK(_create_filemeta(&file_meta, param));
+    param->file_metadata = file_meta;
+
+    std::vector<RowRangeHint> hints{RowRangeHint{0, kRapSparseSelectedRows}};
+    param->selected_row_ranges = &hints;
+
+    SkipRowsContextPtr skip_rows_ctx = std::make_shared<SkipRowsContext>();
+    auto* group_reader = _pool.add(new GroupReader(*param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(group_reader, &_pool);
+
+    // Provenance comes from the production path, not from setting the flag by hand.
+    group_reader->_apply_selected_row_ranges();
+    ASSERT_EQ(kRapSparseSelectedRows, static_cast<int64_t>(group_reader->_range.span_size()));
+    ASSERT_TRUE(group_reader->range_from_row_range_hint());
+
+    const auto base = read_coalesce_counters(*param->stats);
+    // The adaptive counter says "coalesce together"; this is the BE-narrow cell the override exists for.
+    EXPECT_FALSE(group_reader->_decide_active_lazy_coalesce(true));
+    const auto d = coalesce_delta(*param->stats, base);
+    EXPECT_EQ(0, d.together);
+    EXPECT_EQ(1, d.seperately);
+    EXPECT_EQ(1, d.sparse_override);
+}
+
+// Covers: span_size() is the SUM of the selected sub-ranges, not end() - begin() of the outer span.
+//         Two 10,000-row runs 150,000 rows apart select 20,000 of 167,000 rows (sparse, override
+//         fires) while their outer span is 160,000 rows (dense, override would NOT fire). If the
+//         sparsity test ever reads the outer span, this case goes red and the one above does not.
+TEST_F(GroupReaderTest, RapSparseRangeUsesSelectedRowCountNotOuterSpan) {
+    RapCoalesceKnobs knobs(0.5);
+
+    auto* param = _create_group_reader_param();
+    FileMetaData* file_meta;
+    ASSERT_OK(_create_filemeta(&file_meta, param));
+    param->file_metadata = file_meta;
+
+    std::vector<RowRangeHint> hints{RowRangeHint{0, 10000}, RowRangeHint{150000, 160000}};
+    param->selected_row_ranges = &hints;
+
+    SkipRowsContextPtr skip_rows_ctx = std::make_shared<SkipRowsContext>();
+    auto* group_reader = _pool.add(new GroupReader(*param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(group_reader, &_pool);
+    group_reader->_apply_selected_row_ranges();
+
+    ASSERT_EQ(2u, group_reader->_range.size());
+    ASSERT_EQ(20000, static_cast<int64_t>(group_reader->_range.span_size()));
+    // Outer span, the value the override must NOT use.
+    ASSERT_EQ(160000, static_cast<int64_t>(group_reader->_range.end() - group_reader->_range.begin()));
+
+    const auto base = read_coalesce_counters(*param->stats);
+    EXPECT_FALSE(group_reader->_decide_active_lazy_coalesce(true));
+    const auto d = coalesce_delta(*param->stats, base);
+    EXPECT_EQ(0, d.together);
+    EXPECT_EQ(1, d.seperately);
+    EXPECT_EQ(1, d.sparse_override);
+}
+
+// Covers: the index-OFF shape -- no row-range hint at all, _range spans the whole row group.
+//         The decision is the adaptive counter's in BOTH directions and the override never counts.
+TEST_F(GroupReaderTest, NoRowRangeHintLeavesTheAdaptiveDecisionAlone) {
+    RapCoalesceKnobs knobs(0.5);
+
+    auto* param = _create_group_reader_param();
+    FileMetaData* file_meta;
+    ASSERT_OK(_create_filemeta(&file_meta, param));
+    param->file_metadata = file_meta;
+    ASSERT_EQ(nullptr, param->selected_row_ranges);
+
+    SkipRowsContextPtr skip_rows_ctx = std::make_shared<SkipRowsContext>();
+    auto* group_reader = _pool.add(new GroupReader(*param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(group_reader, &_pool);
+    group_reader->_apply_selected_row_ranges(); // no hint: returns without touching anything
+
+    ASSERT_EQ(kRapOverrideGroupRows, static_cast<int64_t>(group_reader->_range.span_size()));
+    ASSERT_FALSE(group_reader->range_from_row_range_hint());
+
+    {
+        const auto base = read_coalesce_counters(*param->stats);
+        EXPECT_TRUE(group_reader->_decide_active_lazy_coalesce(true));
+        const auto d = coalesce_delta(*param->stats, base);
+        EXPECT_EQ(1, d.together);
+        EXPECT_EQ(0, d.seperately);
+        EXPECT_EQ(0, d.sparse_override);
+    }
+    {
+        const auto base = read_coalesce_counters(*param->stats);
+        EXPECT_FALSE(group_reader->_decide_active_lazy_coalesce(false));
+        const auto d = coalesce_delta(*param->stats, base);
+        EXPECT_EQ(0, d.together);
+        EXPECT_EQ(1, d.seperately);
+        EXPECT_EQ(0, d.sparse_override); // the counter decided, not the override
+    }
+}
+
+// Covers: a range just as sparse, narrowed by the UPSTREAM page index instead of by RAP.
+//         FileReader::_filter_group() narrows exactly this way, through intersect_range(), and it
+//         runs with the index off. The override must not fire, or index-OFF reads change bytes.
+TEST_F(GroupReaderTest, PageIndexNarrowedRangeIsNotRapProvided) {
+    RapCoalesceKnobs knobs(0.5);
+
+    auto* param = _create_group_reader_param();
+    FileMetaData* file_meta;
+    ASSERT_OK(_create_filemeta(&file_meta, param));
+    param->file_metadata = file_meta;
+    ASSERT_EQ(nullptr, param->selected_row_ranges);
+
+    SkipRowsContextPtr skip_rows_ctx = std::make_shared<SkipRowsContext>();
+    auto* group_reader = _pool.add(new GroupReader(*param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(group_reader, &_pool);
+    group_reader->_apply_selected_row_ranges();
+
+    SparseRange<uint64_t> page_index_range;
+    page_index_range.add(Range<uint64_t>(0, kRapSparseSelectedRows));
+    group_reader->intersect_range(page_index_range);
+
+    // Same sparsity as the RAP case above -- and a different provenance.
+    ASSERT_EQ(kRapSparseSelectedRows, static_cast<int64_t>(group_reader->_range.span_size()));
+    ASSERT_FALSE(group_reader->range_from_row_range_hint());
+
+    const auto base = read_coalesce_counters(*param->stats);
+    EXPECT_TRUE(group_reader->_decide_active_lazy_coalesce(true));
+    const auto d = coalesce_delta(*param->stats, base);
+    EXPECT_EQ(1, d.together);
+    EXPECT_EQ(0, d.seperately);
+    EXPECT_EQ(0, d.sparse_override);
+}
+
+// Covers: a RAP-provided range that is DENSE relative to the threshold. Provenance is right, the
+//         sparsity term is not, so the adaptive decision stands.
+TEST_F(GroupReaderTest, DenseRapRangeAboveThresholdLeavesTheAdaptiveDecisionAlone) {
+    RapCoalesceKnobs knobs(0.5);
+
+    auto* param = _create_group_reader_param();
+    FileMetaData* file_meta;
+    ASSERT_OK(_create_filemeta(&file_meta, param));
+    param->file_metadata = file_meta;
+
+    std::vector<RowRangeHint> hints{RowRangeHint{0, kRapDenseSelectedRows}};
+    param->selected_row_ranges = &hints;
+
+    SkipRowsContextPtr skip_rows_ctx = std::make_shared<SkipRowsContext>();
+    auto* group_reader = _pool.add(new GroupReader(*param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(group_reader, &_pool);
+    group_reader->_apply_selected_row_ranges();
+
+    ASSERT_EQ(kRapDenseSelectedRows, static_cast<int64_t>(group_reader->_range.span_size()));
+    ASSERT_TRUE(group_reader->range_from_row_range_hint());
+    // 120,000 >= 0.5 * 167,000 = 83,500.
+    const auto base = read_coalesce_counters(*param->stats);
+    EXPECT_TRUE(group_reader->_decide_active_lazy_coalesce(true));
+    const auto d = coalesce_delta(*param->stats, base);
+    EXPECT_EQ(1, d.together);
+    EXPECT_EQ(0, d.seperately);
+    EXPECT_EQ(0, d.sparse_override);
+}
+
+// Covers: threshold 0.0 makes the override inert even on the sparse RAP range that fires at 0.5.
+//         This is the kill switch a cluster run flips to get the pre-override arm from one image.
+TEST_F(GroupReaderTest, ThresholdZeroDisablesTheRapSparseOverride) {
+    RapCoalesceKnobs knobs(0.0);
+
+    auto* param = _create_group_reader_param();
+    FileMetaData* file_meta;
+    ASSERT_OK(_create_filemeta(&file_meta, param));
+    param->file_metadata = file_meta;
+
+    std::vector<RowRangeHint> hints{RowRangeHint{0, kRapSparseSelectedRows}};
+    param->selected_row_ranges = &hints;
+
+    SkipRowsContextPtr skip_rows_ctx = std::make_shared<SkipRowsContext>();
+    auto* group_reader = _pool.add(new GroupReader(*param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(group_reader, &_pool);
+    group_reader->_apply_selected_row_ranges();
+
+    ASSERT_EQ(kRapSparseSelectedRows, static_cast<int64_t>(group_reader->_range.span_size()));
+    ASSERT_TRUE(group_reader->range_from_row_range_hint());
+
+    const auto base = read_coalesce_counters(*param->stats);
+    EXPECT_TRUE(group_reader->_decide_active_lazy_coalesce(true));
+    const auto d = coalesce_delta(*param->stats, base);
+    EXPECT_EQ(1, d.together);
+    EXPECT_EQ(0, d.seperately);
+    EXPECT_EQ(0, d.sparse_override);
+}
+
+// Covers: THE ISOLATING CASE. The adaptive counter already says "separately" and the override would
+//         fire too. Both arms return the same decision and both increment Seperately, so the
+//         returned bool and Seperately cannot tell them apart -- only SparseOverride can. Deleting
+//         the override would leave the first arm's Seperately delta at 1 and its SparseOverride
+//         delta at 0, which is exactly what the second arm legitimately produces.
+TEST_F(GroupReaderTest, RapSparseOverrideIsCountedEvenWhenTheCounterAlsoSaysSeparately) {
+    RapCoalesceKnobs knobs(0.5);
+
+    auto* param = _create_group_reader_param();
+    FileMetaData* file_meta;
+    ASSERT_OK(_create_filemeta(&file_meta, param));
+    param->file_metadata = file_meta;
+
+    std::vector<RowRangeHint> hints{RowRangeHint{0, kRapSparseSelectedRows}};
+    param->selected_row_ranges = &hints;
+
+    SkipRowsContextPtr skip_rows_ctx = std::make_shared<SkipRowsContext>();
+    auto* rap_reader = _pool.add(new GroupReader(*param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(rap_reader, &_pool);
+    rap_reader->_apply_selected_row_ranges();
+    ASSERT_TRUE(rap_reader->range_from_row_range_hint());
+
+    // Arm 1: RAP-provided sparse range, counter agrees on "separately".
+    const auto rap_base = read_coalesce_counters(*param->stats);
+    EXPECT_FALSE(rap_reader->_decide_active_lazy_coalesce(false));
+    const auto rap_delta = coalesce_delta(*param->stats, rap_base);
+    EXPECT_EQ(0, rap_delta.together);
+    EXPECT_EQ(1, rap_delta.seperately);
+    EXPECT_EQ(1, rap_delta.sparse_override);
+
+    // Arm 2: the SAME counter value and the SAME sparsity, without RAP provenance.
+    auto* plain_param = _create_group_reader_param();
+    FileMetaData* plain_meta;
+    ASSERT_OK(_create_filemeta(&plain_meta, plain_param));
+    plain_param->file_metadata = plain_meta;
+    ASSERT_EQ(nullptr, plain_param->selected_row_ranges);
+    auto* plain_reader = _pool.add(new GroupReader(*plain_param, 0, skip_rows_ctx, 0));
+    widen_row_group_to_production_size(plain_reader, &_pool);
+    SparseRange<uint64_t> page_index_range;
+    page_index_range.add(Range<uint64_t>(0, kRapSparseSelectedRows));
+    plain_reader->intersect_range(page_index_range);
+    ASSERT_EQ(kRapSparseSelectedRows, static_cast<int64_t>(plain_reader->_range.span_size()));
+    ASSERT_FALSE(plain_reader->range_from_row_range_hint());
+
+    const auto plain_base = read_coalesce_counters(*plain_param->stats);
+    EXPECT_FALSE(plain_reader->_decide_active_lazy_coalesce(false));
+    const auto plain_delta = coalesce_delta(*plain_param->stats, plain_base);
+    EXPECT_EQ(0, plain_delta.together);
+    EXPECT_EQ(1, plain_delta.seperately);
+    EXPECT_EQ(0, plain_delta.sparse_override);
+
+    // The two arms are distinguishable on SparseOverride and on nothing else.
+    EXPECT_EQ(rap_delta.seperately, plain_delta.seperately);
+    EXPECT_NE(rap_delta.sparse_override, plain_delta.sparse_override);
 }
 
 // ── Temp Column Lifecycle Tests ──────────────────────────────────────────────

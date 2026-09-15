@@ -55,6 +55,8 @@ import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.starrocks.type.IntegerType.INT;
 import static com.starrocks.type.VarcharType.VARCHAR;
@@ -573,6 +575,138 @@ public class RapRowRangeHintsTest extends TableTestBase {
                 RapManifestPredicate.intersectRanges(ranges(0, 20, 40, 60), ranges(50, 70)));
         Assertions.assertEquals(0, RapManifestPredicate.intersectRanges(ranges(0, 20), ranges(20, 40)).length,
                 "half-open intervals that only touch intersect to nothing");
+    }
+
+    // -------------------------------------------------------------------------------------------------------
+    // 5. K2 / R9: the fallback says WHY. The reason is decided at LOAD time, so unlike the four counters on the
+    //    same line it is real when EXPLAIN renders. The last case here is the one that protects the runners:
+    //    the fields they parse must still be where they were, because the new ones are appended.
+    // -------------------------------------------------------------------------------------------------------
+
+    @Test
+    public void testEveryFallbackNamesItsReason() throws Exception {
+        Assertions.assertEquals(RapCoverage.REASON_DISABLED,
+                RapCoverage.load("", mockedNativeTableA.io(), "u", Optional.of(SNAP), eq("model", "v")).getReason());
+        Assertions.assertEquals(RapCoverage.REASON_NO_SNAPSHOT,
+                RapCoverage.load("/tmp", mockedNativeTableA.io(), "u", Optional.empty(), eq("model", "v")).getReason());
+        Assertions.assertEquals(RapCoverage.REASON_NO_TABLE,
+                RapCoverage.load(null, Optional.of(SNAP), eq("model", "v")).getReason());
+        Assertions.assertEquals(RapCoverage.REASON_NO_TABLE_UUID,
+                RapCoverage.load("/tmp", mockedNativeTableA.io(), "", Optional.of(SNAP), eq("model", "v")).getReason());
+        Assertions.assertEquals(RapCoverage.REASON_UNREADABLE,
+                RapCoverage.load("/tmp", new ThrowingFileIO(), "u", Optional.of(SNAP), eq("model", "v")).getReason());
+
+        // absent: a real directory through the table's own FileIO, with no manifest in it
+        File dir = Files.createTempDirectory("rap_manifest_reason_").toFile();
+        Assertions.assertEquals(RapCoverage.REASON_ABSENT, RapCoverage
+                .load(dir.getAbsolutePath(), mockedNativeTableA.io(), UUID, Optional.of(SNAP), eq("model", "v"))
+                .getReason());
+
+        // oversize: the same manifest, read under a byte ceiling below its length -- never parsed in part
+        File tdir = new File(dir, UUID);
+        Assertions.assertTrue(tdir.mkdirs());
+        Files.write(new File(tdir, SNAP + RapCoverage.SUFFIX).toPath(),
+                rangedManifest().getBytes(StandardCharsets.UTF_8));
+        long savedMax = Config.rap_manifest_max_bytes;
+        try {
+            Config.rap_manifest_max_bytes = 8;
+            Assertions.assertEquals(RapCoverage.REASON_OVERSIZE, RapCoverage
+                    .load(dir.getAbsolutePath(), mockedNativeTableA.io(), UUID, Optional.of(SNAP), eq("model", "v"))
+                    .getReason());
+        } finally {
+            Config.rap_manifest_max_bytes = savedMax;
+        }
+        Assertions.assertEquals(RapCoverage.REASON_OK, RapCoverage
+                .load(dir.getAbsolutePath(), mockedNativeTableA.io(), UUID, Optional.of(SNAP), eq("model", "v"))
+                .getReason());
+
+        // parse-time refusals
+        Assertions.assertEquals(RapCoverage.REASON_UNSUPPORTED_VERSION, RapCoverage
+                .fromJson(rangedManifest().replace("\"version\": 3", "\"version\": 9"), UUID, SNAP, eq("model", "v"))
+                .getReason());
+        Assertions.assertEquals(RapCoverage.REASON_OTHER_SNAPSHOT,
+                RapCoverage.fromJson(rangedManifest(), UUID, SNAP + 1, eq("model", "v")).getReason());
+        Assertions.assertEquals(RapCoverage.REASON_OTHER_TABLE,
+                RapCoverage.fromJson(rangedManifest(), "another-uuid", SNAP, eq("model", "v")).getReason());
+        Assertions.assertEquals(RapCoverage.REASON_MALFORMED, RapCoverage
+                .fromJson(rangedManifest().replace("[0, 1]", "[0, 7]"), UUID, SNAP, eq("model", "v")).getReason());
+        Assertions.assertEquals(RapCoverage.REASON_MALFORMED,
+                RapCoverage.fromJson("{not json", UUID, SNAP, eq("model", "v")).getReason());
+
+        // active, but not useful -- and the two cases are told apart
+        Assertions.assertEquals(RapCoverage.REASON_PREDICATE_NOT_BOUND,
+                RapCoverage.fromJson(rangedManifest(), UUID, SNAP, eq("other", "v")).getReason());
+        // A v1 manifest that lists its files and carries no postings: M = C, nothing eliminated, backend narrows.
+        // (A TYPED manifest without postings is malformed, not "no postings", and is refused above.)
+        String noPostings = "{\"version\": 1, \"table_uuid\": \"" + UUID + "\", \"snapshot_id\": " + SNAP + ", "
+                + "\"column\": \"model\", \"field_id\": 15, \"granularity_rows\": 20000, "
+                + "\"files\": [{\"name\": \"gs/bucket/warehouse/db/t/data/f1.parquet\", \"size\": 1000, "
+                + "\"rows\": 100}]}";
+        RapCoverage noPost = RapCoverage.fromJson(noPostings, UUID, SNAP, eq("model", "v"));
+        Assertions.assertTrue(noPost.isActive());
+        Assertions.assertEquals(RapCoverage.REASON_NO_POSTINGS, noPost.getReason());
+        Assertions.assertEquals(RapCoverage.Decision.KEEP, noPost.decide(F1));
+    }
+
+    @Test
+    public void testStaleColumnIdentityNamesItsReason() throws Exception {
+        mockedNativeTableA.newFastAppend().appendFile(FILE_A).appendFile(FILE_A_1).commit();
+        long snap = mockedNativeTableA.currentSnapshot().snapshotId();
+        String uuid = ((BaseTable) mockedNativeTableA).operations().current().uuid();
+        File dir = Files.createTempDirectory("rap_manifest_stale_").toFile();
+        File tdir = new File(dir, uuid);
+        Assertions.assertTrue(tdir.mkdirs());
+        Files.write(new File(tdir, snap + RapCoverage.SUFFIX).toPath(),
+                tableRangedManifest(uuid, snap, 999).getBytes(StandardCharsets.UTF_8));
+        String saved = Config.rap_manifest_dir;
+        try {
+            Config.rap_manifest_dir = dir.getAbsolutePath();
+            RapCoverage c = RapCoverage.load(mockedNativeTableA, Optional.of(snap), eq("data", "v"));
+            Assertions.assertFalse(c.isActive());
+            Assertions.assertEquals(RapCoverage.REASON_STALE_COLUMN, c.getReason());
+            Assertions.assertTrue(c.explain().contains("reason=stale_column_identity"));
+        } finally {
+            Config.rap_manifest_dir = saved;
+        }
+    }
+
+    @Test
+    public void testExplainCarriesTheReasonAndStillParsesForTheRunners() {
+        RapCoverage on = RapCoverage.fromJson(rangedManifest(), UUID, SNAP, eq("model", "v"));
+        Assertions.assertEquals("RAP MANIFEST: active snapshot=" + SNAP + " column=model postings=yes consulted=0 "
+                + "covered=0 identity_mismatch=0 dropped=0 reason=ok hints=yes", on.explain());
+
+        RapCoverage off = RapCoverage.disabled(SNAP, RapCoverage.REASON_OVERSIZE);
+        Assertions.assertEquals("RAP MANIFEST: off snapshot=" + SNAP + " column= postings=no consulted=0 covered=0 "
+                + "identity_mismatch=0 dropped=0 reason=oversize hints=no", off.explain());
+
+        // The deployed runners parse this line with exactly this pattern (harness/deployed_check_fe.py). The new
+        // fields are appended, so it must still match -- including the empty `column=` of a disabled coverage.
+        Pattern runnerPattern = Pattern.compile("RAP MANIFEST: (\\w+) snapshot=(-?\\d+) column=(\\S*) postings=(\\w+) "
+                + "consulted=(\\d+) covered=(\\d+) identity_mismatch=(\\d+) dropped=(\\d+)");
+        for (RapCoverage c : List.of(on, off)) {
+            Matcher m = runnerPattern.matcher(c.explain());
+            Assertions.assertTrue(m.find(), "the runners' pattern no longer matches: " + c.explain());
+            Assertions.assertEquals(8, m.groupCount());
+        }
+    }
+
+    /** A FileIO that fails on every open, so the loader's unreadable path can be reached without a filesystem trick. */
+    private static final class ThrowingFileIO implements org.apache.iceberg.io.FileIO {
+        @Override
+        public org.apache.iceberg.io.InputFile newInputFile(String path) {
+            throw new RuntimeException("no");
+        }
+
+        @Override
+        public org.apache.iceberg.io.OutputFile newOutputFile(String path) {
+            throw new RuntimeException("no");
+        }
+
+        @Override
+        public void deleteFile(String path) {
+            throw new RuntimeException("no");
+        }
     }
 
     /** Flat [start, end) pairs as a range list, so the fixtures read as numbers rather than nested braces. */

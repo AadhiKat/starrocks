@@ -87,6 +87,26 @@ public class RapCoverage {
 
     public enum Decision { KEEP, DROP }
 
+    // Fallback reasons, as single tokens. `disabled` is the ordinary "no rap_manifest_dir configured" state and is
+    // not logged; every other value means a manifest was expected and something about it kept the ordinary scan.
+    public static final String REASON_OK = "ok";
+    public static final String REASON_DISABLED = "disabled";
+    public static final String REASON_NO_SNAPSHOT = "no_snapshot";
+    public static final String REASON_NO_TABLE = "no_table";
+    public static final String REASON_NO_TABLE_UUID = "no_table_uuid";
+    public static final String REASON_OTHER_TABLE = "other_table";
+    public static final String REASON_OTHER_SNAPSHOT = "other_snapshot";
+    public static final String REASON_ABSENT = "absent";
+    public static final String REASON_OVERSIZE = "oversize";
+    public static final String REASON_UNREADABLE = "unreadable";
+    public static final String REASON_UNSUPPORTED_VERSION = "unsupported_version";
+    public static final String REASON_MALFORMED = "malformed";
+    public static final String REASON_STALE_COLUMN = "stale_column_identity";
+    /** Active, but the query constrains no column this manifest indexes: nothing is eliminated and nothing is hinted. */
+    public static final String REASON_PREDICATE_NOT_BOUND = "predicate_not_on_indexed_column";
+    /** Active, but the manifest carries no postings: M = C, so no file is eliminated and the backend narrows. */
+    public static final String REASON_NO_POSTINGS = "no_postings";
+
     private static final class Covered {
         final long size;
         final long rows;
@@ -116,6 +136,11 @@ public class RapCoverage {
     private int hinted = 0;
     private int hintedRanges = 0;
 
+    // K2 / R9: WHY this plan fell back, decided at LOAD time and therefore real when EXPLAIN renders -- unlike the
+    // four counters below it, which are incremented later, during scheduling. A single token, no spaces, appended to
+    // the existing RAP MANIFEST line so the runners that parse the line's earlier fields are unaffected.
+    private String reason = REASON_OK;
+
     // counters, readable in EXPLAIN and logs
     private int consulted = 0;
     private int covered = 0;
@@ -130,9 +155,27 @@ public class RapCoverage {
         this.predicateUsable = predicateUsable;
     }
 
-    /** A coverage that keeps everything. */
+    /** A coverage that keeps everything, with no reason recorded. Prefer {@link #disabled(long, String)}. */
     public static RapCoverage disabled(long snapshotId) {
-        return new RapCoverage(false, snapshotId, "", false, false);
+        return disabled(snapshotId, REASON_DISABLED);
+    }
+
+    /**
+     * A coverage that keeps everything, and says why. K2 / R9: the fallback used to be silent -- an operator saw
+     * `RAP MANIFEST: off` and had no way to tell a missing manifest from an oversize or a stale one. The reason is
+     * decided here, at LOAD time, so {@link #explain()} can render it truthfully; the four counters on the same line
+     * cannot be, because they are incremented later, while files are enumerated
+     * (see fe-coverage-counters-are-always-zero.md). It is also logged, once per plan, for the same operator.
+     */
+    public static RapCoverage disabled(long snapshotId, String reason) {
+        RapCoverage c = new RapCoverage(false, snapshotId, "", false, false);
+        c.reason = reason;
+        c.hintsUsable = false;
+        c.hintReason = reason;
+        if (!REASON_DISABLED.equals(reason) && !REASON_NO_SNAPSHOT.equals(reason)) {
+            LOG.info("RAP coverage off for snapshot {}: {} -- ordinary scan", snapshotId, reason);
+        }
+        return c;
     }
 
     /**
@@ -141,7 +184,7 @@ public class RapCoverage {
      */
     public static RapCoverage load(Table nativeTable, Optional<Long> snapshotId, ScalarOperator predicate) {
         if (nativeTable == null) {
-            return disabled(snapshotId != null && snapshotId.isPresent() ? snapshotId.get() : -1L);
+            return disabled(snapshotId != null && snapshotId.isPresent() ? snapshotId.get() : -1L, REASON_NO_TABLE);
         }
         String uuid = nativeTable instanceof BaseTable ? ((BaseTable) nativeTable).operations().current().uuid() : null;
         RapCoverage coverage = load(Config.rap_manifest_dir, nativeTable.io(), uuid, snapshotId, predicate);
@@ -151,10 +194,10 @@ public class RapCoverage {
                 org.apache.iceberg.types.Types.NestedField field = nativeTable.schema().findField(coverage.column);
                 if (field == null || field.fieldId() != coverage.manifestFieldId
                         || icebergKeyType(field.type()) != coverage.manifestKeyType) {
-                    return disabled(coverage.snapshotId);
+                    return disabled(coverage.snapshotId, REASON_STALE_COLUMN);
                 }
             } catch (Exception e) {
-                return disabled(coverage.snapshotId);
+                return disabled(coverage.snapshotId, REASON_STALE_COLUMN);
             }
         }
         return coverage;
@@ -184,18 +227,20 @@ public class RapCoverage {
      */
     public static RapCoverage load(String dir, FileIO io, String uuid, Optional<Long> snapshotId, ScalarOperator predicate) {
         if (dir == null || dir.isEmpty() || io == null || snapshotId == null || !snapshotId.isPresent()) {
-            return disabled(snapshotId != null && snapshotId.isPresent() ? snapshotId.get() : -1L);
+            boolean off = dir == null || dir.isEmpty() || io == null;
+            return disabled(snapshotId != null && snapshotId.isPresent() ? snapshotId.get() : -1L,
+                    off ? REASON_DISABLED : REASON_NO_SNAPSHOT);
         }
         long snap = snapshotId.get();
         try {
             if (uuid == null || uuid.isEmpty()) {
-                return disabled(snap);
+                return disabled(snap, REASON_NO_TABLE_UUID);
             }
             String path = dir + (dir.endsWith("/") ? "" : "/") + uuid + "/" + snap + SUFFIX;
             InputFile in = io.newInputFile(path);
             if (!in.exists()) {
                 LOG.info("RAP manifest absent for {} snapshot {} ({}) -- ordinary scan", uuid, snap, path);
-                return disabled(snap);
+                return disabled(snap, REASON_ABSENT);
             }
             // slice 4 (PRD-02): the byte ceiling is applied BEFORE the read; an oversize manifest is "off", never a
             // partial parse
@@ -203,7 +248,7 @@ public class RapCoverage {
             if (length > Config.rap_manifest_max_bytes) {
                 LOG.warn("RAP manifest for {} snapshot {} is {} bytes, above rap_manifest_max_bytes {} -- ordinary scan",
                         uuid, snap, length, Config.rap_manifest_max_bytes);
-                return disabled(snap);
+                return disabled(snap, REASON_OVERSIZE);
             }
             String json;
             try (InputStream s = in.newStream()) {
@@ -212,7 +257,7 @@ public class RapCoverage {
             return fromJson(json, uuid, snap, predicate);
         } catch (Exception e) {
             LOG.warn("RAP manifest unusable for snapshot {}: {} -- ordinary scan", snap, e.toString());
-            return disabled(snap);
+            return disabled(snap, REASON_UNREADABLE);
         }
     }
 
@@ -233,7 +278,7 @@ public class RapCoverage {
             int version = m.has("version") ? m.get("version").getAsBigDecimal().intValueExact() : -1;
             if (version != VERSION && version != TYPED_VERSION && version != RANGED_VERSION) {
                 LOG.warn("RAP manifest version unsupported -- ordinary scan");
-                return disabled(expectSnapshot);
+                return disabled(expectSnapshot, REASON_UNSUPPORTED_VERSION);
             }
             // v3 is v2 plus row ranges: the same typed keys, key type, field id and NULL postings decide
             // elimination, and only the extra `ranges` section decides whether plan-time hints are emitted.
@@ -241,17 +286,17 @@ public class RapCoverage {
             if (!m.has("snapshot_id") || m.get("snapshot_id").getAsLong() != expectSnapshot) {
                 LOG.warn("RAP manifest is for snapshot {} not {} -- ordinary scan",
                         m.has("snapshot_id") ? m.get("snapshot_id").getAsString() : "?", expectSnapshot);
-                return disabled(expectSnapshot);
+                return disabled(expectSnapshot, REASON_OTHER_SNAPSHOT);
             }
             // astra CX-29: the table identity is REQUIRED, not optional -- a manifest that does not declare
             // its table, or declares another one, never activates
             if (!m.has("table_uuid") || m.get("table_uuid").isJsonNull() || m.get("table_uuid").getAsString().isEmpty()) {
                 LOG.warn("RAP manifest declares no table_uuid -- ordinary scan");
-                return disabled(expectSnapshot);
+                return disabled(expectSnapshot, REASON_NO_TABLE_UUID);
             }
             if (expectUuid == null || !expectUuid.equals(m.get("table_uuid").getAsString())) {
                 LOG.warn("RAP manifest is for table {} not {} -- ordinary scan", m.get("table_uuid").getAsString(), expectUuid);
-                return disabled(expectSnapshot);
+                return disabled(expectSnapshot, REASON_OTHER_TABLE);
             }
             String column = m.get("column").getAsString();
             Set<Integer> typedCandidates = typed ? typedCandidates(m, predicate, column) : null;
@@ -259,11 +304,13 @@ public class RapCoverage {
             boolean hasPostings = m.has("postings") && m.get("postings").isJsonObject();
             RapCoverage c = new RapCoverage(true, expectSnapshot, column, hasPostings,
                     typed ? typedCandidates != null : literals != null);
+            // Active is not the same as useful: say which of the two it is, at load time, so EXPLAIN can render it.
+            c.reason = !hasPostings ? REASON_NO_POSTINGS : (c.predicateUsable ? REASON_OK : REASON_PREDICATE_NOT_BOUND);
             if (typed) {
                 c.manifestKeyType = m.get("key_type").getAsBigDecimal().intValueExact();
                 c.manifestFieldId = m.get("field_id").getAsBigDecimal().intValueExact();
                 if (c.manifestFieldId <= 0) {
-                    return disabled(expectSnapshot);
+                    return disabled(expectSnapshot, REASON_MALFORMED);
                 }
             }
             JsonArray files = m.getAsJsonArray("files");
@@ -272,7 +319,7 @@ public class RapCoverage {
                 JsonObject f = e.getAsJsonObject();
                 String name = f.get("name").getAsString();
                 if (c.files.containsKey(name)) {
-                    return disabled(expectSnapshot);
+                    return disabled(expectSnapshot, REASON_MALFORMED);
                 }
                 names.add(name);
                 c.files.put(name, new Covered(f.get("size").getAsLong(), f.get("rows").getAsLong()));
@@ -285,7 +332,7 @@ public class RapCoverage {
                 for (Map.Entry<String, JsonElement> e : postings.entrySet()) {
                     if (!e.getValue().isJsonArray() || e.getValue().getAsJsonArray().size() == 0) {
                         LOG.warn("RAP manifest posting for a value is not a non-empty array -- ordinary scan");
-                        return disabled(expectSnapshot);
+                        return disabled(expectSnapshot, REASON_MALFORMED);
                     }
                     for (JsonElement idx : e.getValue().getAsJsonArray()) {
                         // astra CX-29 (second round): Gson's getAsInt() NARROWS -- 0.5, -0.5 and 4294967296 all
@@ -293,22 +340,22 @@ public class RapCoverage {
                         // on the exact decimal value BEFORE any narrowing.
                         if (!idx.isJsonPrimitive() || !idx.getAsJsonPrimitive().isNumber()) {
                             LOG.warn("RAP manifest posting index is not a number -- ordinary scan");
-                            return disabled(expectSnapshot);
+                            return disabled(expectSnapshot, REASON_MALFORMED);
                         }
                         java.math.BigDecimal exact;
                         try {
                             exact = idx.getAsJsonPrimitive().getAsBigDecimal();
                         } catch (NumberFormatException nfe) {
                             LOG.warn("RAP manifest posting index is not a decimal number -- ordinary scan");
-                            return disabled(expectSnapshot);
+                            return disabled(expectSnapshot, REASON_MALFORMED);
                         }
                         if (exact.stripTrailingZeros().scale() > 0) {
                             LOG.warn("RAP manifest posting index {} is not an integer -- ordinary scan", exact);
-                            return disabled(expectSnapshot);
+                            return disabled(expectSnapshot, REASON_MALFORMED);
                         }
                         if (exact.signum() < 0 || exact.compareTo(java.math.BigDecimal.valueOf(names.size() - 1)) > 0) {
                             LOG.warn("RAP manifest posting index {} outside its {} files -- ordinary scan", exact, names.size());
-                            return disabled(expectSnapshot);
+                            return disabled(expectSnapshot, REASON_MALFORMED);
                         }
                     }
                 }
@@ -337,7 +384,7 @@ public class RapCoverage {
             return c;
         } catch (Exception e) {
             LOG.warn("RAP manifest malformed ({}) -- ordinary scan", e.getClass().getSimpleName());
-            return disabled(expectSnapshot);
+            return disabled(expectSnapshot, REASON_MALFORMED);
         }
     }
 
@@ -707,11 +754,24 @@ public class RapCoverage {
         return active;
     }
 
+    /**
+     * The plan line. {@code state}, {@code snapshot}, {@code column}, {@code postings}, {@code reason} and
+     * {@code hints} describe the manifest that was LOADED and are real here. The four counters are incremented
+     * later, by {@code decide} during scheduling, so they are structurally zero at render time and always have
+     * been -- see fe-coverage-counters-are-always-zero.md; they are kept because runners parse them, and the
+     * fields that answer "did the manifest do anything" are {@code reason} and, in the query profile,
+     * {@code ScanRanges}. The two new fields are APPENDED so those runners' patterns still match.
+     */
     public String explain() {
         return String.format("RAP MANIFEST: %s snapshot=%d column=%s postings=%s consulted=%d covered=%d "
-                        + "identity_mismatch=%d dropped=%d",
+                        + "identity_mismatch=%d dropped=%d reason=%s hints=%s",
                 active ? "active" : "off", snapshotId, column, hasPostings ? "yes" : "no",
-                consulted, covered, identityMismatch, dropped);
+                consulted, covered, identityMismatch, dropped, reason, hintsUsable ? "yes" : "no");
+    }
+
+    /** Why this plan fell back, or {@link #REASON_OK}. Decided at load time, so it is real when EXPLAIN renders. */
+    public String getReason() {
+        return reason;
     }
 
     public int getConsulted() {

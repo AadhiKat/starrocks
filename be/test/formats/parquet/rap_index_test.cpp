@@ -3085,7 +3085,7 @@ TEST_F(RapIndexTest, V5BuilderChoosesShapeOnExactBytes) {
     formats::RapSidecarBuilder uniq("event_time", 2, TYPE_BIGINT, 20000);
     {
         auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_BIGINT), false);
-        for (int64_t r = 0; r < 100000; ++r) col->append_datum(Datum(1785058200000LL + r));
+        for (int64_t r = 0; r < 100000; ++r) col->append_datum(Datum(static_cast<int64_t>(1785058200000LL + r)));
         uniq.observe(*col, 0);
     }
     EXPECT_EQ(uniq.num_values(), 100000u);
@@ -3178,7 +3178,7 @@ TEST_F(RapIndexTest, V5BytesMatchTheReferenceEncoder) {
         auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_BIGINT), true);
         for (int64_t r = 0; r < 100000; ++r) {
             if (r == 99999) col->append_nulls(1);
-            else col->append_datum(Datum(1785058200000LL + (r / 20000) * 10 + (r % 10)));
+            else col->append_datum(Datum(static_cast<int64_t>(1785058200000LL + (r / 20000) * 10 + (r % 10))));
         }
         uniq.observe(*col, 0);
     }

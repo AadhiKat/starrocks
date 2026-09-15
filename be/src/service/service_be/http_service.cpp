@@ -42,9 +42,12 @@
 #include "common/config_http_fwd.h"
 #include "common/config_ingest_fwd.h"
 #include "common/config_path_fwd.h"
+#include "common/config_scan_io_fwd.h"
 #include "common/config_update_registry.h"
 #include "common/utils.h"
 #include "fs/fs_util.h"
+#include "fs/fs_factory.h"
+#include "formats/parquet/rap_index_cache.h"
 #include "gen_cpp/HeartbeatService_types.h"
 #include "gutil/stl_util.h"
 #include "http/action/checksum_action.h"
@@ -77,6 +80,7 @@
 #include "http/action/transaction_stream_load.h"
 #include "http/action/update_config_action.h"
 #include "http/action/rap_build_action.h"
+#include "http/action/rap_index_preload_action.h"
 #include "http/default_path_handlers.h"
 #include "http/download_action.h"
 #include "http/utils.h"
@@ -110,6 +114,7 @@ HttpServiceBE::HttpServiceBE(DataCache* cache_env, ExecEnv* env, orchestration::
           _http_concurrent_limiter(new ConcurrentLimiter(config::be_http_num_workers - 1)) {}
 
 HttpServiceBE::~HttpServiceBE() {
+    if (_rap_index_preloader) _rap_index_preloader->shutdown();
     _ev_http_server.reset();
     _web_page_handler.reset();
     STLDeleteElements(&_http_handlers);
@@ -121,6 +126,7 @@ void HttpServiceBE::stop() {
 
 void HttpServiceBE::join() {
     _ev_http_server->join();
+    if (_rap_index_preloader) _rap_index_preloader->shutdown();
 }
 
 Status HttpServiceBE::start() {
@@ -301,6 +307,26 @@ Status HttpServiceBE::start() {
     _ev_http_server->register_handler(HttpMethod::GET, "/api/rap/build", rap_build_action);
     _ev_http_server->register_handler(HttpMethod::POST, "/api/rap/build", rap_build_action);
     _http_handlers.emplace_back(rap_build_action);
+
+    // Operator-directed, BE-local warming, using server filesystem credentials.
+    // No borrowed query lifetime and no background threads until first admission.
+    auto eligible = [](const RapIndexPreloader::Request& r) {
+        return config::rap_index_preload_enable && !r.generation.empty() &&
+               r.directory == config::rap_index_dir.value() && r.generation == config::rap_index_generation.value();
+    };
+    _rap_index_preloader = std::make_unique<RapIndexPreloader>(
+            [this](const RapIndexPreloader::Request& r) -> RapIndexPreloader::Prepared {
+                auto fs = FileSystemFactory::CreateSharedFromString(r.directory);
+                if (!fs.ok()) return {RapIndexPreloader::Result{"FILESYSTEM_ERROR"}, {}};
+                return parquet::RapIndexCache::prepare(_cache_env->page_cache(), fs->get(), r);
+            }, eligible);
+    auto* preload_action = new RapIndexPreloadAction(_rap_index_preloader.get(),
+            [this, eligible](const RapIndexPreloader::Request& r) {
+                return eligible(r) && parquet::RapIndexCache::resident(_cache_env->page_cache(), r);
+            });
+    _ev_http_server->register_handler(HttpMethod::GET, "/api/rap/index_preload", preload_action);
+    _ev_http_server->register_handler(HttpMethod::POST, "/api/rap/index_preload", preload_action);
+    _http_handlers.emplace_back(preload_action);
 
     auto* runtime_filter_cache_action = new RuntimeFilterCacheAction(_env);
     _ev_http_server->register_handler(HttpMethod::GET, "/api/runtime_filter_cache/{action}",

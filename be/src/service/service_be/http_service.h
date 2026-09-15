@@ -49,6 +49,7 @@ class RuntimeEnv;
 class HttpHandler;
 class LoadChannelMgr;
 class ProcessMetricsRegistry;
+class RapIndexPreloader;
 class StreamLoadExecutor;
 class TransactionMgr;
 class WebPageHandler;
@@ -87,6 +88,7 @@ private:
     std::vector<HttpHandler*> _http_handlers;
 
     std::unique_ptr<ConcurrentLimiter> _http_concurrent_limiter;
+    std::unique_ptr<RapIndexPreloader> _rap_index_preloader;
 };
 
 } // namespace starrocks

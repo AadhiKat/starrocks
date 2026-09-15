@@ -1349,6 +1349,8 @@ CONF_mBool(enable_adjustment_page_cache_skip, "true");
 CONF_mString(rap_index_dir, "");
 // slice 2f: joins every RAP cache key (READY and negative entries); bump it to invalidate after a sidecar rebuild
 CONF_mString(rap_index_generation, "");
+// Experimental operator-directed BE-local parsed-index preloading. Disabled by default.
+CONF_mBool(rap_index_preload_enable, "false");
 // RAP / lake-index slice 3a: index at export. A non-empty dir plus a comma-separated column list makes the
 // Parquet writer emit <dir>/<basename>.<column>.rapx next to every data file it closes. Empty = off.
 CONF_mString(rap_export_index_dir, "");

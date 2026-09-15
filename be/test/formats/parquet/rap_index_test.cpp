@@ -36,6 +36,7 @@
 #include "formats/parquet/parquet_test_util/util.h"
 #include "formats/parquet/parquet_ut_base.h"
 #include "formats/parquet/rap_index.h"
+#include "formats/parquet/rap_index_cache.h"
 #include "formats/parquet/utils.h"
 #include "formats/deletion_bitmap.h"
 #include "types/date_value.h"
@@ -1372,6 +1373,34 @@ struct CacheGuard {
 } // namespace
 
 // a. the second consult on a directory without the sidecar makes no filesystem call and repeats the outcome + reason
+TEST_F(RapIndexTest, ProactivePreloadIsConsumedByOrdinaryReader) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    CacheGuard guard;
+    const std::string file = _fixture_dir + "/" + kFile0;
+    const auto baseline = run(file, {"2203129G"}, "");
+    // This per-test mirror is owned by the fixture; provide its canonical name.
+    std::filesystem::copy_file(sidecar_of(kFile0), sidecar_of(kFile0, "model"),
+                               std::filesystem::copy_options::overwrite_existing);
+    config::rap_index_dir = _index_dir;
+    config::rap_index_generation = "preload-test";
+    RapIndexPreloader::Request r{"preload", file, _index_dir, "preload-test", "model",
+                                 std::filesystem::file_size(file), 2576384, 0, 15, 8 * 1024 * 1024};
+    auto prepared = RapIndexCache::prepare(guard.cache.get(), FileSystem::Default(), r);
+    ASSERT_TRUE(prepared.admit);
+    ASSERT_EQ("LOADED", prepared.admit().state);
+    const auto consult = init_once(file, "2203129G", true);
+    EXPECT_TRUE(consult.ok);
+    EXPECT_EQ(1, consult.hit);
+    EXPECT_EQ(0, consult.miss);
+    _metacache = true;
+    const int64_t loads_before = g_rap_stats.rap_index_load_ns;
+    const auto actual = run(file, {"2203129G"}, _index_dir);
+    std::string diagnostic;
+    EXPECT_TRUE(same_multiset(baseline.rows, actual.rows, &diagnostic)) << diagnostic;
+    EXPECT_EQ(loads_before, g_rap_stats.rap_index_load_ns);
+    EXPECT_GT(actual.stats_delta.rap_index_ready, 0);
+}
+
 TEST_F(RapIndexTest, NegativeHitSkipsFilesystem) {
     if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
     CacheGuard guard;

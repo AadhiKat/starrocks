@@ -36,6 +36,7 @@
 #include "formats/parquet/predicate_filter_evaluator.h"
 #include "common/config.h"
 #include "formats/parquet/rap_index.h"
+#include "formats/parquet/rap_index_cache.h"
 #include "formats/parquet/rap_sidecar_builder.h"
 #include <algorithm>
 #include <sstream>
@@ -230,15 +231,14 @@ void FileReader::_maybe_consult_rap_index_impl() {
             const std::string file_key = ParquetUtils::get_file_cache_key(CacheType::INDEX, _file->filename(),
                                                                           _datacache_options.modification_time, _file_size);
             const std::string generation = std::string(config::rap_index_generation);
-            rap_cache_key = RapIndex::cache_key(false, file_key, col, generation, "");
+            rap_cache_key = RapIndexCache::key(_file->filename(), _file_size,
+                                               _datacache_options.modification_time, col, generation);
             if (_cache->lookup(rap_cache_key, &rap_cache_handle)) {
                 auto cached = *(reinterpret_cast<const std::shared_ptr<RapIndex>*>(rap_cache_handle.data()));
                 // CX-27: a cached object is applicable only if its identity matches what the loader
                 // would have validated -- same column, compatible field id, same file identity
-                const auto& id = cached->identity();
-                const bool compatible = id.column == col && id.file_name == base && id.file_size == _file_size &&
-                                        id.file_rows == static_cast<uint64_t>(_file_metadata->num_rows()) &&
-                                        (field_id < 0 || id.field_id < 0 || id.field_id == field_id);
+                const bool compatible = RapIndexCache::compatible(*cached,
+                        {base, _file_size, static_cast<uint64_t>(_file_metadata->num_rows()), col, field_id});
                 if (compatible) {
                     index = cached;
                     if (stats != nullptr) stats->rap_index_cache_hit++;
@@ -324,14 +324,9 @@ void FileReader::_maybe_consult_rap_index_impl() {
             index = std::shared_ptr<RapIndex>(std::move(res.index));
             if (cache_on) {
                 if (stats != nullptr) stats->rap_index_cache_miss++;
-                auto deleter = [](const starrocks::CacheKey& key, void* value) { delete (std::shared_ptr<RapIndex>*)value; };
                 MemCacheWriteOptions options;
                 options.evict_probability = _datacache_options.datacache_evict_probability;
-                auto capture = std::make_unique<std::shared_ptr<RapIndex>>(index);
-                // size estimate: values plus 16 bytes per range plus a small per-value overhead
-                const int64_t approx = static_cast<int64_t>(index->approx_bytes());
-                Status st = _cache->insert(rap_cache_key, (void*)(capture.get()), approx, deleter, options, &rap_cache_handle);
-                if (st.ok()) capture.release();
+                (void)RapIndexCache::insert(_cache, rap_cache_key, index, options);
             }
         }
         // slice 4: answer the question against the sidecar's key type. Anything the sidecar cannot answer EXACTLY refuses

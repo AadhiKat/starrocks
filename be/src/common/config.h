@@ -1363,6 +1363,12 @@ CONF_mString(rap_build_index_columns, "");
 // refused before any allocation; a builder stops at the distinct-value ceiling and writes nothing.
 CONF_mInt64(rap_index_max_sidecar_bytes, "67108864");
 CONF_mInt64(rap_index_max_values, "4194304");
+// RAP R7 (plan-time row ranges): when the frontend ships THdfsScanRange.selected_row_ranges for a file, the backend
+// uses them and does NOT open that file's sidecar -- the manifest the frontend read was built from the same sidecars,
+// so the consult would re-answer an answered question at 113-348 ms of remote first consult per file (S3). Setting
+// this true restores the older behaviour: consult anyway and INTERSECT the two answers. Both are correct; the
+// default is the one that costs nothing.
+CONF_mBool(rap_plan_hint_consult_sidecar, "false");
 
 CONF_Int32(io_coalesce_read_max_buffer_size, "8388608");
 CONF_Int32(io_coalesce_read_max_distance_size, "1048576");

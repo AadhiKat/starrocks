@@ -109,6 +109,11 @@ public class Config extends ConfigBase {
     // RAP slice 4 (PRD-02): a manifest above this many bytes is treated as absent (ordinary scan), never read in part
     @ConfField(mutable = true)
     public static long rap_manifest_max_bytes = 64L * 1024 * 1024;
+    // RAP R7 (plan-time row ranges): ship the row ranges a v3 manifest carries on each covered file's scan range,
+    // so the backend uses them and never opens that file's sidecar. Turning this off keeps file elimination and
+    // returns the scheduled files to the backend sidecar consult. Inert without a v3 manifest under rap_manifest_dir.
+    @ConfField(mutable = true)
+    public static boolean rap_plan_row_range_hints = true;
     @ConfField
     public static String sys_log_level = "INFO";
     @ConfField

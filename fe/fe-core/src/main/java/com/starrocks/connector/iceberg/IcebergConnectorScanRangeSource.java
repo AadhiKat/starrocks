@@ -51,6 +51,7 @@ import com.starrocks.thrift.THdfsScanRange;
 import com.starrocks.thrift.TIcebergDeleteFile;
 import com.starrocks.thrift.TIcebergFileContent;
 import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TRowRange;
 import com.starrocks.thrift.TScanRange;
 import com.starrocks.thrift.TScanRangeLocation;
 import com.starrocks.thrift.TScanRangeLocations;
@@ -312,6 +313,7 @@ public class IcebergConnectorScanRangeSource extends ConnectorScanRangeSource {
 
     private List<TScanRangeLocations> buildScanRanges(FileScanTask task, Long partitionId) throws AnalysisException {
         THdfsScanRange hdfsScanRange = buildScanRange(task, task.file(), partitionId);
+        attachRapRowRanges(hdfsScanRange, task.file());
 
         List<TIcebergDeleteFile> posDeleteFiles = new ArrayList<>();
         for (DeleteFile deleteFile : task.deletes()) {
@@ -338,6 +340,35 @@ public class IcebergConnectorScanRangeSource extends ConnectorScanRangeSource {
         }
 
         return Lists.newArrayList(buildTScanRangeLocations(hdfsScanRange));
+    }
+
+    /**
+     * RAP R7 (plan-time row ranges): ship the row ranges the manifest already answered for this data file, so the
+     * backend narrows the read without opening the file's sidecar.
+     *
+     * <p>The positions are absolute within the FILE, so a file split into several scan ranges carries the same list
+     * on each one and the backend intersects it with whatever row groups that split actually reads -- there is
+     * nothing split-relative to compute here, and computing something split-relative would be wrong.
+     *
+     * <p>Only the DATA-file path calls this. Delete files are scanned through buildDeleteFileScanRanges and are
+     * never hinted: a hint narrows what is read, and deletes must be read in full to be applied.
+     */
+    private void attachRapRowRanges(THdfsScanRange hdfsScanRange, DataFile file) {
+        if (rapCoverage == null) {
+            return;
+        }
+        long[][] ranges = rapCoverage.rowRangesFor(file);
+        if (ranges == null || ranges.length == 0) {
+            return; // uncovered file, unusable manifest, or a shape with no ranges: the scan is unchanged
+        }
+        List<TRowRange> hints = new ArrayList<>(ranges.length);
+        for (long[] range : ranges) {
+            TRowRange hint = new TRowRange();
+            hint.setStart_row(range[0]);
+            hint.setEnd_row(range[1]);
+            hints.add(hint);
+        }
+        hdfsScanRange.setSelected_row_ranges(hints);
     }
 
     private List<TScanRangeLocations> buildDeleteFileScanRanges(FileScanTask task, Long partitionId) throws AnalysisException {

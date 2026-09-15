@@ -116,6 +116,29 @@ Status FileReader::init(FormatScanContext* ctx) {
 // this file's selected ranges; an empty result means no row of this file matches. ABSENT ->
 // nothing. UNUSABLE -> counted, logged, and the scan proceeds unindexed and complete.
 void FileReader::_maybe_consult_rap_index() {
+    // R7 (plan-time row ranges). The frontend already answered this file at PLANNING, from the per-snapshot
+    // manifest it reads anyway, and shipped the row ranges on the scan range. The manifest is built from the same
+    // sidecars, so opening this file's sidecar would re-answer an answered question -- and that is the expensive
+    // half: S3 measured the first remote consult at 113-348 ms per file, every one of 256 files above the 100 ms
+    // the row asks for. So when a hint is present, use it and DO NOT open the sidecar.
+    //
+    // Nothing else is needed here: _init_group_readers() already routes a non-empty transport hint into every
+    // GroupReader, which intersects it into that group's row span. Leaving _rap_ready false also leaves the
+    // whole-file filter below alone, which is right -- a file with no matching row was never scheduled.
+    //
+    // The profile keeps the two apart: this file adds 1 to RapIndexPlanHinted and 0 to RapIndexConsulted.
+    // config::rap_plan_hint_consult_sidecar restores the older behaviour (consult anyway, then INTERSECT at the
+    // bottom of _maybe_consult_rap_index_impl) for an operator who wants the sidecar's opinion as well.
+    if (_scanner_ctx != nullptr && !_scanner_ctx->selected_row_ranges.empty() &&
+        !config::rap_plan_hint_consult_sidecar) {
+        _rap_ready = false;
+        _rap_ranges.clear();
+        if (_scanner_ctx->stats != nullptr) {
+            _scanner_ctx->stats->rap_plan_hinted++;
+            _scanner_ctx->stats->rap_plan_hint_ranges += static_cast<int>(_scanner_ctx->selected_row_ranges.size());
+        }
+        return;
+    }
     // CX-28: the WHOLE consult is timed -- cache lookup, any load, the postings lookup -- so a
     // warm-cache consult has a measured cost rather than an inferred zero.
     int64_t consult_ns = 0;

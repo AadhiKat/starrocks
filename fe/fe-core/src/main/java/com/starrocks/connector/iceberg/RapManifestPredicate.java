@@ -27,8 +27,14 @@ import com.starrocks.type.Type;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Set;
@@ -117,6 +123,171 @@ final class RapManifestPredicate {
         Set<Integer> out = new HashSet<>();
         postings.values().forEach(out::addAll);
         return out;
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // R7 (plan-time row ranges). matchingRanges() answers the same question as matching() -- which files can
+    // hold a matching row -- and additionally WHICH ROWS of each, so the frontend can ship them to the backend
+    // as THdfsScanRange.selected_row_ranges and the backend never opens that file's sidecar.
+    //
+    // It is deliberately a line-for-line mirror of matching(): same shapes supported, same null-means-
+    // unsupported contract, same treatment of an unsupported AND child (ignored, which widens the answer).
+    // RapCoverage asserts that the two agree on the file set before it emits a single hint, so a divergence
+    // turns the hints off instead of narrowing a read the elimination rule did not sanction.
+    //
+    // Every answer is a SUPERSET of the true matching rows -- a union over candidate keys, intersected across
+    // AND children -- which is the whole safety argument: over-selecting costs IO, under-selecting drops rows.
+    // Ranges are half-open [start, end) absolute row positions within the data FILE, ascending and disjoint.
+    // ---------------------------------------------------------------------------------------------------------
+
+    /** Merge a file's ranges into an ascending, disjoint list. Touching intervals are joined. */
+    static long[][] mergeRanges(List<long[]> ranges) {
+        if (ranges.isEmpty()) {
+            return new long[0][];
+        }
+        List<long[]> sorted = new ArrayList<>(ranges);
+        sorted.sort(Comparator.comparingLong((long[] r) -> r[0]).thenComparingLong(r -> r[1]));
+        List<long[]> out = new ArrayList<>();
+        long[] cur = new long[] {sorted.get(0)[0], sorted.get(0)[1]};
+        for (int i = 1; i < sorted.size(); i++) {
+            long[] next = sorted.get(i);
+            if (next[0] <= cur[1]) {
+                cur[1] = Math.max(cur[1], next[1]);
+            } else {
+                out.add(cur);
+                cur = new long[] {next[0], next[1]};
+            }
+        }
+        out.add(cur);
+        return out.toArray(new long[0][]);
+    }
+
+    /** Intersection of two ascending, disjoint lists. Empty is a legitimate answer (no row of the file matches). */
+    static long[][] intersectRanges(long[][] a, long[][] b) {
+        List<long[]> out = new ArrayList<>();
+        int i = 0;
+        int j = 0;
+        while (i < a.length && j < b.length) {
+            long start = Math.max(a[i][0], b[j][0]);
+            long end = Math.min(a[i][1], b[j][1]);
+            if (start < end) {
+                out.add(new long[] {start, end});
+            }
+            if (a[i][1] <= b[j][1]) {
+                i++;
+            } else {
+                j++;
+            }
+        }
+        return out.toArray(new long[0][]);
+    }
+
+    private static Map<Integer, long[][]> unionRanges(Collection<Map<Integer, long[][]>> selected) {
+        Map<Integer, List<long[]>> gathered = new HashMap<>();
+        for (Map<Integer, long[][]> perFile : selected) {
+            for (Map.Entry<Integer, long[][]> e : perFile.entrySet()) {
+                List<long[]> acc = gathered.computeIfAbsent(e.getKey(), k -> new ArrayList<>());
+                acc.addAll(Arrays.asList(e.getValue()));
+            }
+        }
+        Map<Integer, long[][]> out = new HashMap<>();
+        gathered.forEach((file, ranges) -> out.put(file, mergeRanges(ranges)));
+        return out;
+    }
+
+    /**
+     * Per-file candidate row ranges for {@code op}, or null when the shape is unsupported (never an empty map,
+     * which means "supported, and no file can match"). A file present with a zero-length array is a file the
+     * conjunction cannot match; the caller keeps the key so the answer's file set stays comparable to
+     * {@link #matching}, and emits no hint for it.
+     */
+    static Map<Integer, long[][]> matchingRanges(ScalarOperator op, String column, int type,
+                                                 NavigableMap<String, Map<Integer, long[][]>> postings,
+                                                 Map<Integer, long[][]> nullFiles) {
+        if (op == null) {
+            return null;
+        }
+        if (op instanceof CompoundPredicateOperator) {
+            if (!((CompoundPredicateOperator) op).isAnd()) {
+                return null; // Never narrow using just one branch of OR/NOT.
+            }
+            Map<Integer, long[][]> out = null;
+            for (ScalarOperator child : op.getChildren()) {
+                Map<Integer, long[][]> next = matchingRanges(child, column, type, postings, nullFiles);
+                if (next != null) {
+                    if (out == null) {
+                        out = new HashMap<>(next);
+                    } else {
+                        Map<Integer, long[][]> both = new HashMap<>();
+                        for (Map.Entry<Integer, long[][]> e : out.entrySet()) {
+                            long[][] other = next.get(e.getKey());
+                            if (other != null) {
+                                both.put(e.getKey(), intersectRanges(e.getValue(), other));
+                            }
+                        }
+                        out = both;
+                    }
+                }
+            }
+            return out;
+        }
+        if (op instanceof IsNullPredicateOperator && column(op.getChild(0), column, type)) {
+            return ((IsNullPredicateOperator) op).isNotNull() ? unionRanges(postings.values())
+                    : unionRanges(List.of(nullFiles));
+        }
+        if (op instanceof InPredicateOperator) {
+            InPredicateOperator in = (InPredicateOperator) op;
+            if (in.isNotIn() || !column(in.getChild(0), column, type)) {
+                return null;
+            }
+            List<Map<Integer, long[][]>> selected = new ArrayList<>();
+            for (int i = 1; i < in.getChildren().size(); i++) {
+                if (!(in.getChild(i) instanceof ConstantOperator)) {
+                    return null; // Discard partial results if ANY member is unsupported.
+                }
+                String key = literal((ConstantOperator) in.getChild(i), type);
+                if (key == null) {
+                    return null;
+                }
+                selected.add(postings.getOrDefault(key, Map.of()));
+            }
+            return unionRanges(selected);
+        }
+        if (!(op instanceof BinaryPredicateOperator)) {
+            return null;
+        }
+        BinaryPredicateOperator binary = (BinaryPredicateOperator) op;
+        ScalarOperator left = op.getChild(0);
+        ScalarOperator right = op.getChild(1);
+        boolean reverse = false;
+        if (!column(left, column, type)) {
+            ScalarOperator swap = left;
+            left = right;
+            right = swap;
+            reverse = true;
+        }
+        if (!column(left, column, type) || !(right instanceof ConstantOperator)) {
+            return null;
+        }
+        String key = literal((ConstantOperator) right, type);
+        if (key == null) {
+            return null;
+        }
+        BinaryType kind = binary.getBinaryType();
+        switch (kind) {
+            case EQ:
+                return unionRanges(List.of(postings.getOrDefault(key, Map.of())));
+            case GT:
+            case GE:
+                return unionRanges((reverse ? postings.headMap(key, kind == BinaryType.GE)
+                        : postings.tailMap(key, kind == BinaryType.GE)).values());
+            case LT:
+            case LE:
+                return unionRanges((reverse ? postings.tailMap(key, kind == BinaryType.LE)
+                        : postings.headMap(key, kind == BinaryType.LE)).values());
+            default:
+                return null;
+        }
     }
 
     static Set<Integer> matching(ScalarOperator op, String column, int type,

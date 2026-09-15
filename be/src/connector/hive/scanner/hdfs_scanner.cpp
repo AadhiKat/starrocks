@@ -40,17 +40,32 @@ Status HdfsScanner::init(RuntimeState* runtime_state, HdfsScannerContext* scanne
     return Status::OK();
 }
 
-void build_row_range_hints(const std::vector<TRowRange>& src, std::vector<RowRangeHint>* dst) {
+bool build_row_range_hints(const std::vector<TRowRange>& src, std::vector<RowRangeHint>* dst, std::string* why) {
     dst->clear();
+    auto refuse = [&](const char* reason) {
+        dst->clear();
+        if (why != nullptr) *why = reason;
+        return false;
+    };
     dst->reserve(src.size());
+    int64_t prev_end = 0;
+    bool first = true;
     for (const auto& r : src) {
-        // Clamp a negative start to 0 rather than rejecting: over-selecting is safe,
-        // under-selecting is not. Drop anything empty or inverted.
-        const int64_t start = std::max<int64_t>(0, r.start_row);
-        if (start < r.end_row) {
-            dst->push_back(RowRangeHint{start, r.end_row});
-        }
+        // A1: the fields are `optional` on the wire. An absent bound is not a zero -- refuse the
+        // whole list rather than invent one. (Thrift's C++ codegen leaves the member default-
+        // constructed when the field is not on the wire, so __isset is the only way to tell.)
+        if (!r.__isset.start_row) return refuse("missing start_row");
+        if (!r.__isset.end_row) return refuse("missing end_row");
+        if (r.start_row < 0 || r.end_row < 0) return refuse("negative row position");
+        if (r.end_row <= r.start_row) return refuse("empty or inverted range");
+        // Strictly ascending and disjoint: RapIndex::intersect() two-pointer-merges this list with a
+        // sidecar's answer and would UNDER-select on an unordered one.
+        if (!first && r.start_row < prev_end) return refuse("overlapping or unordered ranges");
+        dst->push_back(RowRangeHint{r.start_row, r.end_row});
+        prev_end = r.end_row;
+        first = false;
     }
+    return true;
 }
 
 Status HdfsScanner::_build_scanner_context() {
@@ -75,6 +90,7 @@ Status HdfsScanner::_build_scanner_context() {
     ctx.format_scan_context.extended_column_exprs.clear();
     ctx.format_scan_context.predicate_tree = nullptr;
     ctx.format_scan_context.runtime_filter_scan_range_pruner = nullptr;
+    ctx.format_scan_context.selected_row_ranges.clear(); // RAP transport; refilled below when the FE set one
 
     ctx.format_scan_context.scan_range_offset = ctx.scan_range->offset;
     ctx.format_scan_context.scan_range_length = ctx.scan_range->length;
@@ -84,13 +100,6 @@ Status HdfsScanner::_build_scanner_context() {
     }
     if (ctx.scan_range->__isset.first_row_id) {
         ctx.format_scan_context.first_row_id = ctx.scan_range->first_row_id;
-    }
-    // RAP / lake-index row-range transport. Convert TRowRange -> RowRangeHint here so
-    // format readers never depend on THdfsScanRange. Ranges are dropped if malformed;
-    // an empty result means "no hint" and the scan is unchanged.
-    ctx.format_scan_context.selected_row_ranges.clear();
-    if (ctx.scan_range->__isset.selected_row_ranges) {
-        build_row_range_hints(ctx.scan_range->selected_row_ranges, &ctx.format_scan_context.selected_row_ranges);
     }
 
     Columns& partition_values = ctx.format_scan_context.partition_values;
@@ -154,6 +163,22 @@ Status HdfsScanner::_build_scanner_context() {
     ctx.format_scan_context.timezone = _runtime_state->timezone();
     ctx.format_scan_context.stats = &_app_stats;
     ctx.format_scan_context.fs = _scanner_ctx->fs; // RAP / lake-index slice 2c: sidecars read through the scan's filesystem
+
+    // RAP / lake-index row-range transport. Convert TRowRange -> RowRangeHint here so format readers
+    // never depend on THdfsScanRange. A1: the conversion is all-or-nothing per file -- a defective list
+    // leaves NO hint and names itself in the profile (RapPlanHintRefused / RapPlanHintReason), so the
+    // file falls back to the sidecar consult / ordinary scan instead of being narrowed by half a hint.
+    // Placed after `stats` is bound so the refusal has somewhere to be recorded.
+    if (ctx.scan_range->__isset.selected_row_ranges) {
+        std::string why;
+        if (!build_row_range_hints(ctx.scan_range->selected_row_ranges, &ctx.format_scan_context.selected_row_ranges,
+                                   &why)) {
+            _app_stats.rap_plan_hint_refused++;
+            if (_app_stats.rap_plan_hint_reason.empty()) _app_stats.rap_plan_hint_reason = why;
+            LOG(WARNING) << "RAP plan-time row ranges refused (" << why << ") for "
+                         << ctx.scan_range->relative_path << ctx.scan_range->full_path << "; scanning without the hint";
+        }
+    }
 
     ScanConjunctsManagerOptions opts;
     opts.conjunct_ctxs_ptr = &_scanner_ctx->format_scan_context.conjuncts.all_ctxs;

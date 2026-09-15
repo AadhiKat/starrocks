@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "base/hash/crc32c.h"
+#include "base/utility/defer_op.h"
 #include "cache/datacache.h"
 #include "cache/mem_cache/local_mem_cache_engine.h"
 #include "cache/mem_cache/lrucache_engine.h"
@@ -430,6 +431,7 @@ protected:
         struct {
             int rap_index_consulted = 0, rap_index_ready = 0, rap_index_unusable = 0, rap_index_ranges = 0;
             int rap_build_written = 0, rap_build_skipped = 0; // slice 4 (P3b)
+            int rap_plan_hinted = 0, rap_plan_hint_ranges = 0; // R7 (plan-time row ranges)
         } stats_delta;
     };
 
@@ -506,6 +508,7 @@ protected:
         const int b_consulted = g_rap_stats.rap_index_consulted, b_ready = g_rap_stats.rap_index_ready,
                   b_unusable = g_rap_stats.rap_index_unusable, b_ranges = g_rap_stats.rap_index_ranges;
         const int b_bw = g_rap_stats.rap_build_written, b_bs = g_rap_stats.rap_build_skipped;
+        const int b_ph = g_rap_stats.rap_plan_hinted, b_phr = g_rap_stats.rap_plan_hint_ranges;
         // pass 1: accounting (never consumed)
         {
             auto* ctx = _ctx(path, literals);
@@ -579,6 +582,8 @@ protected:
         out.stats_delta.rap_index_ranges = g_rap_stats.rap_index_ranges - b_ranges;
         out.stats_delta.rap_build_written = g_rap_stats.rap_build_written - b_bw;
         out.stats_delta.rap_build_skipped = g_rap_stats.rap_build_skipped - b_bs;
+        out.stats_delta.rap_plan_hinted = g_rap_stats.rap_plan_hinted - b_ph;
+        out.stats_delta.rap_plan_hint_ranges = g_rap_stats.rap_plan_hint_ranges - b_phr;
         config::rap_index_dir = "";
         return out;
     }
@@ -818,20 +823,115 @@ TEST_F(RapIndexTest, ParityAndNarrowingEQ) {
     }
 }
 
-// 4. Composition: a transport hint disjoint from the index ranges yields zero rows; a hint that
-//    covers them yields the indexed result -- intersect, never replace.
+// 4. Composition. R7 changed the DEFAULT here: a plan-time hint now means the sidecar is not opened at all
+//    (see PlanTimeHintServesTheFileWithoutOpeningTheSidecar below). The intersect-with-the-sidecar behaviour is
+//    still available and still correct, under config::rap_plan_hint_consult_sidecar, and this case keeps it under
+//    test: a hint disjoint from the index ranges yields zero rows; a hint that covers them yields the indexed
+//    result -- intersect, never replace.
 TEST_F(RapIndexTest, ComposesWithTransportHint) {
     if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
     const std::string path = _fixture_dir + "/" + kFile0;
+    const bool saved = config::rap_plan_hint_consult_sidecar;
+    config::rap_plan_hint_consult_sidecar = true;
+    DeferOp restore([&]() { config::rap_plan_hint_consult_sidecar = saved; });
     const Result idx = run(path, {"2203129G"}, _index_dir);
     if (idx.rows.empty()) GTEST_SKIP() << "literal absent from this file";
     const Result covering = run(path, {"2203129G"}, _index_dir, {RowRangeHint{0, 3000000}});
     std::string diag;
     EXPECT_TRUE(same_multiset(covering.rows, idx.rows, &diag)) << diag;
+    EXPECT_EQ(covering.stats_delta.rap_index_consulted, 2) << "opted in: the sidecar IS consulted alongside the hint";
+    EXPECT_EQ(covering.stats_delta.rap_plan_hinted, 0) << "a consulted file is not a plan-hinted file";
     // a hint on rows none of the index ranges touch: pick beyond the file
     const Result disjoint = run(path, {"2203129G"}, _index_dir, {RowRangeHint{2576384, 2576384 + 10}});
     EXPECT_TRUE(disjoint.rows.empty());
     EXPECT_TRUE(disjoint.file_filtered);
+}
+
+// 4b. R7: a file the frontend hinted is served from the hint and its sidecar is never opened.
+//
+// The hint used here is not invented: it is the sidecar's OWN answer for this literal, captured from a reader that
+// did consult it. That is what the frontend ships -- the manifest it reads at planning is built from these same
+// sidecars -- so this compares the two routes to the same answer, one of which pays a remote consult and one of
+// which does not. The three things that must hold together:
+//   rows      -- identical to an UNINDEXED, unhinted scan, which is the whole correctness claim;
+//   IO        -- the same planned bytes as the consulting run, so the narrowing really did happen;
+//   counters  -- RapIndexConsulted 0 and RapIndexPlanHinted 1 per reader, which is how the profile shows it.
+// Reverting the short-circuit leaves rows and bytes green and turns the counters red, so the counter assertions
+// are the ones carrying the claim.
+TEST_F(RapIndexTest, PlanTimeHintServesTheFileWithoutOpeningTheSidecar) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    const std::string path = _fixture_dir + "/" + kFile0;
+    const std::vector<std::string> literals = {"2203129G"};
+
+    // Baseline: no index, no hint. The complete and correct answer for this predicate.
+    const Result plain = run(path, literals, "");
+    if (plain.rows.empty()) GTEST_SKIP() << "literal absent from this file";
+    ASSERT_EQ(plain.stats_delta.rap_index_consulted, 0);
+    ASSERT_EQ(plain.stats_delta.rap_plan_hinted, 0);
+
+    // The sidecar's answer, taken from a reader that consulted it -- the ranges the frontend would ship.
+    std::vector<RowRangeHint> sidecar_ranges;
+    {
+        config::rap_index_dir = _index_dir;
+        DeferOp clear_dir([]() { config::rap_index_dir = ""; });
+        auto* ctx = _ctx(path, literals);
+        auto file = *FileSystem::Default()->new_random_access_file(path);
+        auto reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                   std::filesystem::file_size(path), DataCacheOptions(), nullptr,
+                                                   _skip_rows);
+        ASSERT_TRUE(reader->init(&ctx->format_scan_context).ok());
+        ASSERT_TRUE(reader->_rap_ready) << "this case needs a READY sidecar to copy an answer from";
+        sidecar_ranges = reader->_rap_ranges;
+    }
+    ASSERT_FALSE(sidecar_ranges.empty());
+
+    // The consulting route, for the IO comparison.
+    const Result consulted = run(path, literals, _index_dir);
+    EXPECT_EQ(consulted.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(consulted.stats_delta.rap_plan_hinted, 0);
+
+    // The plan-hinted route: the index directory is configured, so a consult WOULD happen if the short-circuit
+    // were not there, and the counters are what prove it did not.
+    const Result hinted = run(path, literals, _index_dir, sidecar_ranges);
+    EXPECT_EQ(hinted.stats_delta.rap_index_consulted, 0) << "a hinted file must not open its sidecar";
+    EXPECT_EQ(hinted.stats_delta.rap_index_ready, 0);
+    EXPECT_EQ(hinted.stats_delta.rap_plan_hinted, 2) << "one per reader init; run() builds two";
+    EXPECT_EQ(hinted.stats_delta.rap_plan_hint_ranges, 2 * static_cast<int>(sidecar_ranges.size()));
+
+    std::string diag;
+    EXPECT_TRUE(same_multiset(hinted.rows, plain.rows, &diag)) << "hinted rows differ from an unhinted scan: " << diag;
+    EXPECT_TRUE(same_multiset(hinted.rows, consulted.rows, &diag)) << diag;
+    EXPECT_EQ(hinted.planned_bytes, consulted.planned_bytes) << "the same narrowing, without the sidecar fetch";
+    EXPECT_LT(hinted.planned_bytes, plain.planned_bytes) << "the hint must actually narrow the read";
+}
+
+// 4c. R7: a hint that is a strict SUPERSET of the matching rows still returns exactly the unhinted rows -- the
+//     predicate is still evaluated on what is read, which is why an over-selecting hint can only cost IO.
+TEST_F(RapIndexTest, PlanTimeHintThatOverSelectsStillReturnsExactlyTheSameRows) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    const std::string path = _fixture_dir + "/" + kFile0;
+    const std::vector<std::string> literals = {"2203129G"};
+    const Result plain = run(path, literals, "");
+    if (plain.rows.empty()) GTEST_SKIP() << "literal absent from this file";
+
+    const Result whole = run(path, literals, _index_dir, {RowRangeHint{0, 1 << 30}});
+    EXPECT_EQ(whole.stats_delta.rap_index_consulted, 0);
+    EXPECT_EQ(whole.stats_delta.rap_plan_hinted, 2);
+    std::string diag;
+    EXPECT_TRUE(same_multiset(whole.rows, plain.rows, &diag)) << diag;
+    EXPECT_EQ(whole.planned_bytes, plain.planned_bytes) << "a whole-file hint narrows nothing and costs nothing";
+}
+
+// 4d. R7: with no hint, nothing about the old path moves -- the sidecar is consulted exactly as before.
+TEST_F(RapIndexTest, NoPlanTimeHintLeavesTheConsultPathUntouched) {
+    if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    const std::string path = _fixture_dir + "/" + kFile0;
+    const Result consulted = run(path, {"2203129G"}, _index_dir);
+    if (consulted.rows.empty()) GTEST_SKIP() << "literal absent from this file";
+    EXPECT_EQ(consulted.stats_delta.rap_index_consulted, 2);
+    EXPECT_EQ(consulted.stats_delta.rap_index_ready, 2);
+    EXPECT_EQ(consulted.stats_delta.rap_plan_hinted, 0) << "no hint, nothing hinted";
+    EXPECT_EQ(consulted.stats_delta.rap_plan_hint_ranges, 0);
 }
 
 // 5. astra CX-26: the row encoding is exact -- exercised on the actual helper.

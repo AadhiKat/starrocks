@@ -1368,6 +1368,19 @@ CONF_mString(rap_export_index_columns, "");
 // the files it reads completely; an existing object is never overwritten. Empty = off.
 CONF_mString(rap_build_index_dir, "");
 CONF_mString(rap_build_index_columns, "");
+// RAP / lake-index: active/lazy I/O-coalescing override for index-narrowed row groups.
+// When a row group's selected row ranges came from the RAP index and cover less than this fraction of the
+// row group's rows, read active and lazy columns in separate I/O buffers instead of coalescing them.
+// 0.0 disables the override (decision falls back to the adaptive counter).
+//
+// Why it exists: ReadRangePlanner::should_coalesce_active_lazy() reads exactly one input, a cross-file
+// adaptive feedback counter that ~GroupReader() DECREMENTS for a prepared row group whose lazy columns
+// turned out not to be needed. Whole-file index pruning deletes precisely those row groups from the
+// population -- a pruned file never constructs a GroupReader and never reaches that destructor -- so the
+// counter only ever increments, parks on "coalesce together", and every surviving row group fetches active
+// AND lazy column bytes in one buffer spanning the gap between them. The override does not second-guess
+// the counter anywhere the index did not narrow the read.
+CONF_mDouble(rap_index_lazy_coalesce_sparse_threshold, "0.5");
 // slice 4 (fork production-readiness review, PRD-02): admission limits for sidecars -- a sidecar above the byte ceiling is
 // refused before it is read; a header declaring more values / ranges than this, or more than the body can hold, is
 // refused before any allocation; a builder stops at the distinct-value ceiling and writes nothing.

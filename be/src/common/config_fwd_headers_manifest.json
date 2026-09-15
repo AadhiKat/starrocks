@@ -514,6 +514,7 @@
         "io_coalesce_read_max_buffer_size",
         "io_coalesce_read_max_distance_size",
         "io_coalesce_adaptive_lazy_active",
+        "rap_index_lazy_coalesce_sparse_threshold",
         "io_tasks_per_scan_operator",
         "connector_io_tasks_per_scan_operator",
         "connector_io_tasks_min_size",

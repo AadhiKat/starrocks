@@ -143,6 +143,20 @@ CONF_mDouble(parquet_page_select_min_coverage, "0.8");
 
 CONF_mBool(enable_adjustment_page_cache_skip, "true");
 
+// RAP / lake-index: active/lazy I/O-coalescing override for index-narrowed row groups.
+// When a row group's selected row ranges came from the RAP index and cover less than this fraction of the
+// row group's rows, read active and lazy columns in separate I/O buffers instead of coalescing them.
+// 0.0 disables the override (decision falls back to the adaptive counter).
+//
+// Why it exists: ReadRangePlanner::should_coalesce_active_lazy() reads exactly one input, a cross-file
+// adaptive feedback counter that ~GroupReader() DECREMENTS for a prepared row group whose lazy columns
+// turned out not to be needed. Whole-file index pruning deletes precisely those row groups from the
+// population -- a pruned file never constructs a GroupReader and never reaches that destructor -- so the
+// counter only ever increments, parks on "coalesce together", and every surviving row group fetches active
+// AND lazy column bytes in one buffer spanning the gap between them. The override does not second-guess
+// the counter anywhere the index did not narrow the read.
+CONF_mDouble(rap_index_lazy_coalesce_sparse_threshold, "0.5");
+
 CONF_Int32(io_coalesce_read_max_buffer_size, "8388608");
 
 CONF_Int32(io_coalesce_read_max_distance_size, "1048576");

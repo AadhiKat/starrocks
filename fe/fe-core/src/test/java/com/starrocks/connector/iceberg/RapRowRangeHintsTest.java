@@ -674,11 +674,11 @@ public class RapRowRangeHintsTest extends TableTestBase {
     public void testExplainCarriesTheReasonAndStillParsesForTheRunners() {
         RapCoverage on = RapCoverage.fromJson(rangedManifest(), UUID, SNAP, eq("model", "v"));
         Assertions.assertEquals("RAP MANIFEST: active snapshot=" + SNAP + " column=model postings=yes consulted=0 "
-                + "covered=0 identity_mismatch=0 dropped=0 reason=ok hints=yes", on.explain());
+                + "covered=0 identity_mismatch=0 dropped=0 reason=ok hints=yes cache=none", on.explain());
 
         RapCoverage off = RapCoverage.disabled(SNAP, RapCoverage.REASON_OVERSIZE);
         Assertions.assertEquals("RAP MANIFEST: off snapshot=" + SNAP + " column= postings=no consulted=0 covered=0 "
-                + "identity_mismatch=0 dropped=0 reason=oversize hints=no", off.explain());
+                + "identity_mismatch=0 dropped=0 reason=oversize hints=no cache=none", off.explain());
 
         // The deployed runners parse this line with exactly this pattern (harness/deployed_check_fe.py). The new
         // fields are appended, so it must still match -- including the empty `column=` of a disabled coverage.

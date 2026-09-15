@@ -668,7 +668,7 @@ public class IcebergCachingFileIO implements FileIO, HadoopConfigurable {
         }
     }
 
-    private static class CachingInputFile implements InputFile {
+    public static class CachingInputFile implements InputFile {
         private final ContentCache contentCache;
         private final InputFile wrappedInputFile;
 
@@ -713,6 +713,19 @@ public class IcebergCachingFileIO implements FileIO, HadoopConfigurable {
         @Override
         public boolean exists() {
             return contentCache.exists(location()) || wrappedInputFile.exists();
+        }
+
+        /**
+         * The file this one caches. Iceberg's {@link InputFile} declares only location / exists / getLength /
+         * newStream -- no generation, ETag or modification time -- so a caller that needs a stronger freshness
+         * signal than the byte count has to reach the wrapped file. RAP slice 5's manifest cache does: with this
+         * accessor its stamp is (length, modification time) on the deployed frontend, which reads through this
+         * FileIO, instead of falling back to length alone and missing an equal-length same-snapshot republish.
+         * Read-only, and no extra round trip: the modification time comes from the FileStatus the length probe
+         * has already fetched.
+         */
+        public InputFile wrapped() {
+            return wrappedInputFile;
         }
 
         private CacheEntry newCacheEntry() {

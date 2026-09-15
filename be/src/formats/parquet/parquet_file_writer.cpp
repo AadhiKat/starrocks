@@ -138,6 +138,8 @@ void ParquetFileWriter::_write_rap_sidecars(FileCommitResult* result) {
     const uint64_t size = static_cast<uint64_t>(result->file_statistics.file_size);
     std::vector<std::string> written_paths;
     for (auto& [idx, builder] : _rap_builders) {
+        // counted at the point the builder reaches its write decision, so attempted == written + skipped always
+        _rap_stats.attempted++;
         if (builder->over_cap()) {
             // slice 4 (PRD-02): the distinct-value ceiling was hit -- advisory failure, the file scans unindexed
             _rap_stats.failures++;
@@ -166,6 +168,8 @@ void ParquetFileWriter::_write_rap_sidecars(FileCommitResult* result) {
         written_paths.push_back(path);
     }
     _rap_stats.build_ns += MonotonicNanos() - t0;
+    // the sink reads these off the commit result and puts them in the INSERT's profile under its own node
+    result->rap_index = _rap_stats;
     if (!written_paths.empty()) {
         auto orig = result->rollback_action;
         auto fs = _rap_fs;

@@ -73,6 +73,16 @@ void PartitionedConnectorChunkSink::init_profile() {
 
     // Memory usage peak metrics
     _sink_profile->spilling_bytes_usage_peak = ADD_PEAK_COUNTER(_profile, "SpillingBytesUsagePeak", TUnit::BYTES);
+
+    // RAP / lake-index: the export builder's own counters, registered unconditionally so that "the index was off" and
+    // "the profile does not report it" are distinguishable -- with rap_export_index_dir empty every one reads 0, and
+    // RapSinkIndexAttempted == 0 is then a fact rather than an absence. They are updated in
+    // PartitionChunkWriter::commit_file(), the single place every sink closes a data file.
+    _sink_profile->rap_sink_index_attempted = ADD_COUNTER(_profile, "RapSinkIndexAttempted", TUnit::UNIT);
+    _sink_profile->rap_sink_index_written = ADD_COUNTER(_profile, "RapSinkIndexWritten", TUnit::UNIT);
+    _sink_profile->rap_sink_index_skipped = ADD_COUNTER(_profile, "RapSinkIndexSkipped", TUnit::UNIT);
+    _sink_profile->rap_sink_index_bytes = ADD_COUNTER(_profile, "RapSinkIndexBytes", TUnit::BYTES);
+    _sink_profile->rap_sink_index_timer = ADD_TIMER(_profile, "RapSinkIndexTime");
 }
 
 Status PartitionedConnectorChunkSink::write_partition_chunk(const std::string& partition,

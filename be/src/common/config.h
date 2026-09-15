@@ -1363,6 +1363,21 @@ CONF_mString(rap_build_index_columns, "");
 // refused before any allocation; a builder stops at the distinct-value ceiling and writes nothing.
 CONF_mInt64(rap_index_max_sidecar_bytes, "67108864");
 CONF_mInt64(rap_index_max_values, "4194304");
+// RAPX v5 (S8): the builder writes value->granule POSTINGS while their exact encoded body is within
+// max(rap_index_postings_budget_pct % of the DATA file's bytes, rap_index_postings_min_bytes), and a per-granule
+// min/max ZONE MAP otherwise. It is acceptance row S8 (sidecar <= 2 % of the Parquet file) enforced per file at build
+// time rather than a proxy for it: a near-unique column, whose postings approach one entry per row, takes the zone map
+// and costs ~0.014 % instead of 200 %, and a dimension keeps the postings that narrow. Measured at density: `model`
+// 0.3325 %, worst single file 0.4512 %, largest postings body 10,039 B; `event_time` 19.6 % under postings.
+//
+// The absolute floor is there because the relative term alone is wrong for a SMALL file -- the per-value cost does not
+// shrink with the file, so a few-kilobyte dimension sidecar crosses 1 % of a half-megabyte file -- and what it would be
+// traded for is a zone map over a dimension, which narrows almost nothing (min/max over a string vocabulary spans most
+// of it in every granule; that is D10's `event_time` range finding). It is bounded: it can only apply to files under
+// 1.6 MB and adds at most 16 KiB to one sidecar, and at density every file is inside BOTH terms, so it moves no
+// measured result. harness/rap_index_build.py::POSTINGS_BUDGET_PCT / POSTINGS_MIN_BYTES carry the same numbers.
+CONF_mDouble(rap_index_postings_budget_pct, "1.0");
+CONF_mInt64(rap_index_postings_min_bytes, "16384");
 // RAP R7 (plan-time row ranges): when the frontend ships THdfsScanRange.selected_row_ranges for a file, the backend
 // uses them and does NOT open that file's sidecar -- the manifest the frontend read was built from the same sidecars,
 // so the consult would re-answer an answered question at 113-348 ms of remote first consult per file (S3). Setting

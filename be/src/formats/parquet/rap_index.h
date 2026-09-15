@@ -17,6 +17,33 @@
 // so ranges can be answered) and a NULL posting; v1 (string keys, no null posting) stays readable.
 // Every answer is a CANDIDATE set of row ranges: the predicate is still evaluated on the rows read.
 //
+// RAPX v5 (2026-09-15, acceptance row S8 -- sidecar <= 2 % of the Parquet file at 20,000-row granularity) makes the
+// sidecar CARDINALITY-AWARE and granule-native. Measured on the 1,500 real `model` sidecars of
+// ice_poc.poc_lake.pg_dense250b, v2 cost 88,303,606 B = 2.2238 % of 3,970,764,424 Parquet bytes, and on pg_typed6 the
+// near-unique `event_time` cost 112 % of its own data file. v5 changes three things:
+//
+//   * a posting is a set of GRANULE ORDINALS, written as a bitmap of n_granules bits or as delta-varint runs --
+//     whichever is smaller for that file. Row ranges are DERIVED on read: granule g covers
+//     [g * granularity_rows, min((g + 1) * granularity_rows, file_rows)), adjacent granules merged, which is exactly
+//     the range list v2 stored. v2 spent 16 bytes per (start, end) pair to say the same thing.
+//   * keys are FRONT-CODED against the previous key. They are sorted, so a shared prefix costs nothing.
+//   * a NEAR-UNIQUE column gets a per-granule min/max ZONE MAP instead of postings. Postings are the wrong structure
+//     there: they approach one entry per row and overtake the delta-encoded column they index.
+//
+// The builder chooses between the two shapes at encode time, on exact byte counts, and records the choice in the
+// header: POSTINGS while their encoded body is within `rap_index_postings_budget_pct` % of the DATA file's bytes,
+// otherwise the ZONE MAP. That is S8 itself enforced per file rather than a proxy for it. Measured: `model` at density
+// 0.3325 % (postings kept, 3.0x inside a 1 % budget, worst single file 0.4512 %), `event_time` 19.6 % under v5
+// postings (zone map taken instead, 0.0042 %).
+//
+// A zone map answers the same questions as postings, as candidates: equality and IN select the granules whose
+// [min, max] contains a literal, a range selects the granules its interval overlaps, and a per-granule flag byte
+// carries has-null / all-null so IS NULL and IS NOT NULL stay exact. READY / UNUSABLE / ABSENT, the reasons and the
+// fallback are identical for both shapes.
+//
+// v1 and v2 sidecars still decode -- the version is the first field, so an older sidecar is DISPATCHED, never read as
+// v5. Any other version is refused with `format v<N>, rebuild`, and a refusal is a fallback to an ordinary scan.
+//
 // The format is defined once, in harness/rap_index_build.py (builder + reference decoder); this
 // file implements the same contract. Little-endian throughout, except the typed keys (big-endian by
 // construction so that bytewise order is numeric order).
@@ -46,6 +73,14 @@ public:
     // 0 / 1; DATE = the julian day as INT64; DATETIME = the internal timestamp (monotonic in time) as INT64.
     enum class KeyType : uint8_t { STRING = 1, INT64 = 2, BOOLEAN = 3, DATE = 4, DATETIME = 5 };
 
+    // v5: which structure the sidecar's body carries, chosen by the builder and recorded in the header
+    enum class Shape : uint8_t { POSTINGS = 1, ZONEMAP = 2 };
+    // v5: how a POSTINGS body writes one value's granule set (0 on a zone map)
+    enum class PostingEncoding : uint8_t { NONE = 0, BITMAP = 1, RUNS = 2 };
+    // v5 zone-map per-granule flags
+    static constexpr uint8_t kZoneHasNull = 1;
+    static constexpr uint8_t kZoneAllNull = 2;
+
     struct Identity {
         std::string file_name; // KEY of the data file (key_of): its full path minus the scheme (slice 2g v3)
         uint64_t file_size = 0;
@@ -74,6 +109,7 @@ public:
                                  const std::string& generation, const std::string& directory);
     static constexpr uint32_t kVersion = 1;   // the version the v1 tests and the reference encoder emit
     static constexpr uint32_t kVersionV2 = 2; // slice 4: typed keys + NULL posting
+    static constexpr uint32_t kVersionV5 = 5; // 2026-09-15 (S8): granule-native postings, or a per-granule zone map
     // slice 2g v3 (fork production-readiness review, PRD-01): the KEY of a data file is its FULL path minus its scheme
     // and leading slashes -- bucket, table location, partition directories and file name, nothing shortened. v2's "path
     // after the last /data/" dropped the table, so two tables with the same suffix, size and row count under one sidecar
@@ -114,7 +150,13 @@ public:
 
     uint32_t version() const { return _version; }
     KeyType key_type() const { return _key_type; }
+    Shape shape() const { return _shape; }
+    PostingEncoding posting_encoding() const { return _posting_encoding; }
     uint32_t granularity_rows() const { return _granularity_rows; }
+    uint32_t num_granules() const { return _n_granules; }
+    // v5: the distinct non-NULL values the builder measured in this file -- the selection rule's numerator, kept so an
+    // operator can see WHY a sidecar is a zone map without re-reading the data
+    uint64_t distinct_values() const { return _distinct_values; }
     size_t num_values() const { return _values.size(); }
     // slice 3b: the number of ranges as ENCODED (before lookup's merge) -- what the sidecar's bytes carry
     size_t num_ranges() const {
@@ -127,17 +169,31 @@ public:
     size_t approx_bytes() const {
         size_t n = 0;
         for (size_t i = 0; i < _values.size(); ++i) n += _values[i].size() + 32 + _ranges[i].size() * sizeof(RowRangeHint);
+        for (size_t i = 0; i < _zone_min.size(); ++i) n += _zone_min[i].size() + _zone_max[i].size() + 33;
         return n + _null_ranges.size() * sizeof(RowRangeHint);
     }
 
 private:
+    // v5: granule ordinals -> ascending, merged, half-open row ranges. The ONE place the mapping is applied.
+    std::vector<RowRangeHint> granule_ranges(const std::vector<uint32_t>& granules) const;
+    static Result parse_v5(const std::string& b, size_t body_end, uint64_t file_size, uint64_t file_rows,
+                           const Identity& expect, size_t offset);
+
     Identity _identity;
     uint32_t _version = kVersion;
     KeyType _key_type = KeyType::STRING;
+    Shape _shape = Shape::POSTINGS;
+    PostingEncoding _posting_encoding = PostingEncoding::NONE;
     uint32_t _granularity_rows = 0;
+    uint32_t _n_granules = 0;
+    uint64_t _distinct_values = 0;
     std::vector<std::string> _values;                 // sorted bytewise ascending (= the key type's order, slice 4)
     std::vector<std::vector<RowRangeHint>> _ranges;   // parallel to _values
     std::vector<RowRangeHint> _null_ranges;           // v2: rows whose value is NULL (candidate buckets)
+    // v5 ZONEMAP: one entry per granule. _zone_min/_zone_max are meaningless where kZoneAllNull is set.
+    std::vector<uint8_t> _zone_flags;
+    std::vector<std::string> _zone_min;
+    std::vector<std::string> _zone_max;
 };
 
 } // namespace starrocks::parquet

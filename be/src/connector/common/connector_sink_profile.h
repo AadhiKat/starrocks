@@ -40,6 +40,14 @@ struct ConnectorSinkProfile {
 
     // Memory usage peak metrics
     RuntimeProfile::Counter* spilling_bytes_usage_peak = nullptr;
+
+    // RAP / lake-index: what the sidecar builders did in THIS sink. Kept distinct from the scan-side RapBuild*
+    // counters, which live in CONNECTOR_SCAN and describe the INSERT's source read, not its write.
+    RuntimeProfile::Counter* rap_sink_index_attempted = nullptr;
+    RuntimeProfile::Counter* rap_sink_index_written = nullptr;
+    RuntimeProfile::Counter* rap_sink_index_skipped = nullptr;
+    RuntimeProfile::Counter* rap_sink_index_bytes = nullptr;
+    RuntimeProfile::Counter* rap_sink_index_timer = nullptr;
 };
 
 } // namespace starrocks::connector

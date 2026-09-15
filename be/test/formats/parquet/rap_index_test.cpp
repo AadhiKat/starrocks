@@ -13,9 +13,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <unistd.h>
@@ -311,6 +313,128 @@ std::string enc_i64(int64_t v) {
     std::string k;
     RapIndex::encode_int64(v, &k);
     return k;
+}
+
+// RAPX v5 -- the layout RapSidecarBuilder writes and harness/rap_index_build.py defines. Written here by hand, from
+// GRANULE ORDINALS rather than row ranges, because that is what v5 carries: a posting is the set of granules a value
+// occupies and the reader derives [g*gran, min((g+1)*gran, rows)) from it.
+void put_uvarint_t(std::string* b, uint64_t n) {
+    while (true) {
+        const uint8_t x = static_cast<uint8_t>(n & 0x7f);
+        n >>= 7;
+        b->push_back(static_cast<char>(n != 0 ? (x | 0x80) : x));
+        if (n == 0) return;
+    }
+}
+
+std::string encode_v5(const std::string& name, uint64_t size, uint64_t rows, const std::string& col, int32_t field_id,
+                      uint8_t key_type, uint32_t gran, uint8_t shape, uint8_t encoding,
+                      const std::vector<std::pair<std::string, std::vector<uint32_t>>>& postings,
+                      const std::vector<std::pair<int64_t, int64_t>>& null_ranges,
+                      const std::vector<std::tuple<uint8_t, std::string, std::string>>& zone,
+                      uint64_t distinct_values, int64_t n_granules_override = -1) {
+    const bool zonemap = shape == static_cast<uint8_t>(RapIndex::Shape::ZONEMAP);
+    const uint32_t n_granules = n_granules_override >= 0 ? static_cast<uint32_t>(n_granules_override)
+                                                         : static_cast<uint32_t>(gran == 0 ? 0 : (rows + gran - 1) / gran);
+    Enc e;
+    e.b.append("RAPX", 4);
+    e.put<uint32_t>(RapIndex::kVersionV5);
+    e.put<uint64_t>(size);
+    e.put<uint64_t>(rows);
+    e.bytes(name);
+    e.bytes(col);
+    e.put<int32_t>(field_id);
+    e.put<uint8_t>(key_type);
+    e.put<uint8_t>(shape);
+    e.put<uint8_t>(zonemap ? 0 : encoding);
+    e.put<uint32_t>(gran);
+    e.put<uint32_t>(n_granules);
+    e.put<uint64_t>(distinct_values);
+    e.put<uint32_t>(zonemap ? 0 : postings.size());
+    e.put<uint32_t>(zonemap ? 0 : null_ranges.size());
+    e.put<uint64_t>(e.b.size() + 8);
+    if (!zonemap) {
+        const size_t width = (static_cast<size_t>(n_granules) + 7) / 8;
+        std::string prev;
+        for (const auto& [v, gs] : postings) {
+            size_t sh = 0;
+            while (sh < std::min(prev.size(), v.size()) && prev[sh] == v[sh]) ++sh;
+            put_uvarint_t(&e.b, sh);
+            put_uvarint_t(&e.b, v.size() - sh);
+            e.b.append(v, sh, v.size() - sh);
+            prev = v;
+            if (encoding == static_cast<uint8_t>(RapIndex::PostingEncoding::BITMAP)) {
+                const size_t at = e.b.size();
+                e.b.append(width, '\0');
+                for (uint32_t g : gs) e.b[at + (g >> 3)] = static_cast<char>(e.b[at + (g >> 3)] | (1u << (g & 7u)));
+            } else {
+                std::vector<std::pair<uint32_t, uint32_t>> runs;
+                for (uint32_t g : gs) {
+                    if (!runs.empty() && runs.back().second == g) runs.back().second = g + 1;
+                    else runs.emplace_back(g, g + 1);
+                }
+                put_uvarint_t(&e.b, runs.size());
+                uint32_t p = 0;
+                for (const auto& [a, b2] : runs) {
+                    put_uvarint_t(&e.b, a - p);
+                    put_uvarint_t(&e.b, b2 - a - 1);
+                    p = b2;
+                }
+            }
+        }
+        for (const auto& [a, b2] : null_ranges) {
+            e.put<int64_t>(a);
+            e.put<int64_t>(b2);
+        }
+    } else {
+        const bool var = key_type == static_cast<uint8_t>(RapIndex::KeyType::STRING);
+        for (const auto& [flags, lo, hi] : zone) {
+            e.put<uint8_t>(flags);
+            if (var) {
+                put_uvarint_t(&e.b, lo.size());
+                e.b += lo;
+                put_uvarint_t(&e.b, hi.size());
+                e.b += hi;
+            } else {
+                e.b += lo;
+                e.b += hi;
+            }
+        }
+    }
+    const uint32_t crc = starrocks::crc32c::Value(e.b.data(), e.b.size());
+    e.put<uint32_t>(crc);
+    e.b.append("RAPX", 4);
+    return e.b;
+}
+
+// the same three values as `postings` above, as GRANULE sets and as the ROW RANGES a v2 sidecar would carry
+const std::vector<std::pair<std::string, std::vector<uint32_t>>> kV5Postings = {
+        {"aaa", {0, 1, 3}}, {"aab", {2}}, {"zzz", {0, 4}}};
+const std::vector<std::pair<std::string, std::vector<std::pair<int64_t, int64_t>>>> kV2Postings = {
+        {"aaa", {{0, 20000}, {20000, 40000}, {60000, 80000}}},
+        {"aab", {{40000, 60000}}},
+        {"zzz", {{0, 20000}, {80000, 100000}}}};
+
+std::vector<std::tuple<uint8_t, std::string, std::string>> zone_int64(
+        const std::vector<std::tuple<uint8_t, int64_t, int64_t>>& in) {
+    std::vector<std::tuple<uint8_t, std::string, std::string>> out;
+    for (const auto& [f, lo, hi] : in) {
+        out.emplace_back(f, (f & RapIndex::kZoneAllNull) != 0 ? std::string(8, '\0') : enc_i64(lo),
+                         (f & RapIndex::kZoneAllNull) != 0 ? std::string(8, '\0') : enc_i64(hi));
+    }
+    return out;
+}
+
+std::string from_hex(const std::string& h) {
+    std::string out;
+    for (size_t i = 0; i + 1 < h.size(); i += 2) out.push_back(static_cast<char>(std::stoi(h.substr(i, 2), nullptr, 16)));
+    return out;
+}
+
+std::string show(const std::vector<RowRangeHint>& rs) {
+    std::string s;
+    for (const auto& r : rs) s += "[" + std::to_string(r.start_row) + "," + std::to_string(r.end_row) + ")";
+    return s.empty() ? "<empty>" : s;
 }
 
 // the row encoding's fields ("V<len>:<bytes>;" / "N;"), decoded; a null field is std::nullopt
@@ -739,8 +863,10 @@ TEST_F(RapIndexTest, GateRefusals) {
     b[b.size() / 2] ^= 0x01;
     expect_unusable(b, id, "crc32c");
     b = good;
-    b[4] = 3; // version (2 is RAPX v2 since slice 4; a v1 body read as v2 fails on postings_offset, not on the version)
-    expect_unusable(with_crc(b), id, "version");
+    // v5: an unknown version is refused BY NAME ("format v3, rebuild"), never read as another format. 2 is RAPX v2
+    // and 5 is RAPX v5, so 3 is the unwritten one here; v4 has its own case in V5RefusesAnyOtherFormatByName.
+    b[4] = 3;
+    expect_unusable(with_crc(b), id, "format v3, rebuild");
     expect_unusable(good, RapIndex::Identity{"other.parquet", 1000, 50000, "model", 15}, "file_name");
     expect_unusable(good, RapIndex::Identity{"f.parquet", 1001, 50000, "model", 15}, "file_size");
     expect_unusable(good, RapIndex::Identity{"f.parquet", 1000, 49999, "model", 15}, "file_rows");
@@ -2636,6 +2762,430 @@ TEST_F(RapIndexTest, TwoNamespacesSameBytesNotAliased) {
     }
     _file_name_override.clear();
     fs::remove_all(tmp);
+}
+
+// =====================================================================================================================
+// RAPX v5 (2026-09-15, acceptance row S8). NOTE: written on a laptop that cannot build the BE. These cases have NOT
+// been compiled or run; they are for the integrator's `rap_index_test` run on the build host. What HAS been checked
+// here is narrower and is recorded in the report: the v5 encoder and parser text was lifted verbatim out of the
+// sources into a standalone program (clang++ -std=c++17 -Wall, clean) and compared against
+// harness/rap_index_build.py -- byte-identical sidecars on six synthetic cases and 12 real density sidecars, identical
+// equality / IN / range / NULL answers for both shapes, and five refusal reasons word-for-word.
+// =====================================================================================================================
+
+// v5-1. Both posting encodings round-trip, and both answer exactly what the v2 sidecar for the SAME data answers.
+// This is the case that protects every deployed number: D1's literals, D10's narrowing and the FE manifest all rest on
+// the ranges a sidecar returns, and v5 changes how they are STORED, not what they are.
+TEST_F(RapIndexTest, V5PostingsAnswerIdenticallyToV2) {
+    const RapIndex::Identity id{"f.parquet", 4000000, 100000, "model", 15};
+    const std::string v2 = encode_v2("f.parquet", 4000000, 100000, "model", 15,
+                                     static_cast<uint8_t>(RapIndex::KeyType::STRING), 20000, kV2Postings,
+                                     {{80000, 100000}});
+    auto rv2 = RapIndex::parse(v2, id);
+    ASSERT_EQ(rv2.state, RapIndex::State::READY) << rv2.reason;
+
+    for (uint8_t enc : {static_cast<uint8_t>(RapIndex::PostingEncoding::BITMAP),
+                        static_cast<uint8_t>(RapIndex::PostingEncoding::RUNS)}) {
+        const std::string v5 = encode_v5("f.parquet", 4000000, 100000, "model", 15,
+                                         static_cast<uint8_t>(RapIndex::KeyType::STRING), 20000,
+                                         static_cast<uint8_t>(RapIndex::Shape::POSTINGS), enc, kV5Postings,
+                                         {{80000, 100000}}, {}, 3);
+        auto r = RapIndex::parse(v5, id);
+        ASSERT_EQ(r.state, RapIndex::State::READY) << "encoding " << int(enc) << ": " << r.reason;
+        EXPECT_EQ(r.index->version(), RapIndex::kVersionV5);
+        EXPECT_EQ(r.index->shape(), RapIndex::Shape::POSTINGS);
+        EXPECT_EQ(r.index->posting_encoding(), static_cast<RapIndex::PostingEncoding>(enc));
+        EXPECT_EQ(r.index->num_granules(), 5u);
+        EXPECT_EQ(r.index->num_values(), 3u);
+        EXPECT_EQ(r.index->distinct_values(), 3u);
+        EXPECT_EQ(r.index->granularity_rows(), 20000u);
+        // equality, IN, range (both bounds, both inclusivities), IS NULL, IS NOT NULL, and an absent literal
+        const std::string lo = "aab", hi = "zzz";
+        const std::vector<std::vector<RowRangeHint>> got = {
+                r.index->lookup({"aaa"}),        r.index->lookup({"aaa", "aab"}),
+                r.index->lookup({"nosuchvalue"}), r.index->lookup_range(&lo, true, &hi, false),
+                r.index->lookup_range(&lo, false, nullptr, true), r.index->lookup_range(nullptr, true, &hi, true),
+                r.index->null_ranges(),          r.index->not_null_ranges()};
+        const std::vector<std::vector<RowRangeHint>> want = {
+                rv2.index->lookup({"aaa"}),        rv2.index->lookup({"aaa", "aab"}),
+                rv2.index->lookup({"nosuchvalue"}), rv2.index->lookup_range(&lo, true, &hi, false),
+                rv2.index->lookup_range(&lo, false, nullptr, true), rv2.index->lookup_range(nullptr, true, &hi, true),
+                rv2.index->null_ranges(),          rv2.index->not_null_ranges()};
+        for (size_t i = 0; i < got.size(); ++i) {
+            EXPECT_EQ(show(got[i]), show(want[i])) << "encoding " << int(enc) << ", answer " << i;
+        }
+        // and the ranges themselves are the merged, file_rows-bounded ones v2 stored, not granule multiples
+        auto aaa = r.index->lookup({"aaa"});
+        ASSERT_EQ(aaa.size(), 2u);
+        EXPECT_EQ(aaa[0].start_row, 0);
+        EXPECT_EQ(aaa[0].end_row, 40000) << "granules 0 and 1 are adjacent and must merge";
+        EXPECT_EQ(aaa[1].start_row, 60000);
+        EXPECT_EQ(aaa[1].end_row, 80000);
+        auto zzz = r.index->lookup({"zzz"});
+        ASSERT_EQ(zzz.size(), 2u);
+        EXPECT_EQ(zzz[1].end_row, 100000) << "the last granule is bounded by file_rows, not by (g+1)*gran";
+    }
+}
+
+// v5-2. The zone map answers equality, IN and range for a near-unique column, including a range that STRADDLES
+// granules, and an equality inside the file's span but inside no granule's [min, max] reads nothing -- which is the
+// narrowing no Parquet page min/max on this layout can do.
+TEST_F(RapIndexTest, V5ZoneMapEqualityAndStraddlingRange) {
+    const RapIndex::Identity id{"f.parquet", 4000000, 100000, "event_time", 2};
+    // five granules of 20,000 rows; granule g holds the ten timestamps 10g .. 10g+9 (a miniature of a near-unique
+    // column: distinct values well inside each granule, gaps between granules)
+    const int64_t t0 = 1785058200000;
+    std::vector<std::tuple<uint8_t, int64_t, int64_t>> z;
+    for (int g = 0; g < 5; ++g) z.emplace_back(g == 4 ? RapIndex::kZoneHasNull : 0, t0 + 10 * g, t0 + 10 * g + 9);
+    const std::string blob = encode_v5("f.parquet", 4000000, 100000, "event_time", 2,
+                                       static_cast<uint8_t>(RapIndex::KeyType::INT64), 20000,
+                                       static_cast<uint8_t>(RapIndex::Shape::ZONEMAP), 0, {}, {}, zone_int64(z), 50);
+    auto r = RapIndex::parse(blob, id);
+    ASSERT_EQ(r.state, RapIndex::State::READY) << r.reason;
+    EXPECT_EQ(r.index->shape(), RapIndex::Shape::ZONEMAP);
+    EXPECT_EQ(r.index->posting_encoding(), RapIndex::PostingEncoding::NONE);
+    EXPECT_EQ(r.index->num_values(), 0u) << "a zone map carries no value list";
+    EXPECT_EQ(r.index->num_granules(), 5u);
+    EXPECT_EQ(r.index->distinct_values(), 50u) << "the rule's numerator is kept so the choice can be audited";
+
+    // equality inside granule 2's interval selects granule 2 and nothing else
+    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 25)})), "[40000,60000)");
+    // IN of two literals in different granules
+    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 5), enc_i64(t0 + 25)})), "[0,20000)[40000,60000)");
+    // a value inside the file's overall span but inside NO granule's interval: nothing is read
+    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 15)})), "<empty>") << "the gap between granule 0 and granule 2";
+    // a range STRADDLING granules 1 and 2 selects exactly those two
+    const std::string lo = enc_i64(t0 + 12), hi = enc_i64(t0 + 23);
+    EXPECT_EQ(show(r.index->lookup_range(&lo, true, &hi, true)), "[20000,60000)");
+    // the SQL bounds, exactly: an interval that lies strictly between two granules selects neither
+    const std::string glo = enc_i64(t0 + 19), ghi = enc_i64(t0 + 20);
+    EXPECT_EQ(show(r.index->lookup_range(&glo, false, &ghi, false)), "<empty>");
+    // and inclusive on the same two bounds picks up the granules that touch them
+    EXPECT_EQ(show(r.index->lookup_range(&glo, true, &ghi, true)), "[20000,60000)");
+    // half-open ranges
+    const std::string mid = enc_i64(t0 + 15);
+    EXPECT_EQ(show(r.index->lookup_range(nullptr, true, &mid, true)), "[0,40000)");
+    EXPECT_EQ(show(r.index->lookup_range(&mid, true, nullptr, true)), "[40000,100000)");
+    // NULL semantics stay exact: the flag byte, not the bounds
+    EXPECT_EQ(show(r.index->null_ranges()), "[80000,100000)");
+    EXPECT_EQ(show(r.index->not_null_ranges()), "[0,100000)");
+}
+
+// v5-3. An all-NULL granule holds no value, so it answers no equality and no range -- and its placeholder bounds are
+// the smallest INT64 key there is, which is exactly the literal that would select it if the flag were ignored.
+TEST_F(RapIndexTest, V5ZoneMapAllNullGranuleAnswersNoValueQuestion) {
+    const RapIndex::Identity id{"f.parquet", 4000000, 100000, "event_time", 2};
+    const int64_t t0 = 1785058200000;
+    std::vector<std::tuple<uint8_t, int64_t, int64_t>> z;
+    for (int g = 0; g < 5; ++g) {
+        if (g == 2) {
+            z.emplace_back(RapIndex::kZoneHasNull | RapIndex::kZoneAllNull, 0, 0);
+        } else {
+            z.emplace_back(0, t0 + 10 * g, t0 + 10 * g + 9);
+        }
+    }
+    const std::string blob = encode_v5("f.parquet", 4000000, 100000, "event_time", 2,
+                                       static_cast<uint8_t>(RapIndex::KeyType::INT64), 20000,
+                                       static_cast<uint8_t>(RapIndex::Shape::ZONEMAP), 0, {}, {}, zone_int64(z), 40);
+    auto r = RapIndex::parse(blob, id);
+    ASSERT_EQ(r.state, RapIndex::State::READY) << r.reason;
+    EXPECT_EQ(show(r.index->lookup({std::string(8, '\0')})), "<empty>")
+            << "equality on the placeholder bound must not reach an all-NULL granule";
+    EXPECT_EQ(show(r.index->lookup_range(nullptr, true, nullptr, true)), "[0,40000)[60000,100000)")
+            << "an unbounded range must skip it too";
+    EXPECT_EQ(show(r.index->null_ranges()), "[40000,60000)");
+    EXPECT_EQ(show(r.index->not_null_ranges()), "[0,40000)[60000,100000)");
+}
+
+// v5-4. Any other format is refused BY NAME -- v4 in particular, which is the version the roll-out plan names -- and
+// the refusal is a fallback to an ordinary scan, not an error. v1 and v2 still load, so no deployed sidecar is
+// misread while the fixtures are rebuilt.
+TEST_F(RapIndexTest, V5RefusesAnyOtherFormatByName) {
+    const RapIndex::Identity id{"f.parquet", 1000, 50000, "model", 15};
+    const std::string v1 = encode("f.parquet", 1000, 50000, "model", 15, 20000, {{"A", {{0, 20000}}}});
+    const std::string v2 = encode_v2("f.parquet", 1000, 50000, "model", 15,
+                                     static_cast<uint8_t>(RapIndex::KeyType::STRING), 20000, {{"A", {{0, 20000}}}}, {});
+    EXPECT_EQ(RapIndex::parse(v1, id).state, RapIndex::State::READY) << "v1 must still decode";
+    EXPECT_EQ(RapIndex::parse(v2, id).state, RapIndex::State::READY) << "v2 must still decode";
+    for (uint32_t bogus : {0u, 3u, 4u, 6u, 99u}) {
+        std::string b = v2;
+        std::memcpy(b.data() + 4, &bogus, 4);
+        auto r = RapIndex::parse(with_crc(b), id);
+        EXPECT_EQ(r.state, RapIndex::State::UNUSABLE) << "version " << bogus;
+        EXPECT_EQ(r.reason, "format v" + std::to_string(bogus) + ", rebuild") << "version " << bogus;
+        EXPECT_EQ(r.index, nullptr) << "a refused sidecar must not be half-built";
+    }
+}
+
+// v5-5. Every bound the two new shapes need, each one named by its own reason. Without these a corrupt or hostile
+// sidecar could name rows the file does not have, and the reader would hand them to the transport.
+TEST_F(RapIndexTest, V5BoundsAreCheckedBeforeUse) {
+    const RapIndex::Identity id{"f.parquet", 4000000, 100000, "model", 15};
+    const uint8_t kStr = static_cast<uint8_t>(RapIndex::KeyType::STRING);
+    const uint8_t kPost = static_cast<uint8_t>(RapIndex::Shape::POSTINGS);
+    const uint8_t kBm = static_cast<uint8_t>(RapIndex::PostingEncoding::BITMAP);
+    const std::string good = encode_v5("f.parquet", 4000000, 100000, "model", 15, kStr, 20000, kPost, kBm,
+                                       kV5Postings, {{80000, 100000}}, {}, 3);
+    ASSERT_EQ(RapIndex::parse(good, id).state, RapIndex::State::READY);
+    // header field offsets, derived from the two variable-length fields rather than hard-coded
+    const size_t base = 4 + 4 + 8 + 8 + (4 + std::string("f.parquet").size()) + (4 + std::string("model").size()) + 4;
+    const size_t off_shape = base + 1, off_enc = base + 2, off_gran = base + 3, off_ngran = base + 7;
+    auto refuse = [&](const std::string& what, std::string b, const std::string& why) {
+        auto r = RapIndex::parse(with_crc(b), id);
+        EXPECT_EQ(r.state, RapIndex::State::UNUSABLE) << what;
+        EXPECT_NE(r.reason.find(why), std::string::npos) << what << ": got reason '" << r.reason << "'";
+    };
+    std::string b = good;
+    b[off_shape] = 9;
+    refuse("an unknown shape byte", b, "shape 9");
+    b = good;
+    b[off_enc] = 7;
+    refuse("an unknown posting encoding", b, "posting_encoding 7");
+    b = good;
+    b[off_enc] = 0;
+    refuse("a postings body with the zone map's encoding byte", b, "posting_encoding 0");
+    b = good;
+    { const uint32_t nine = 9; std::memcpy(b.data() + off_ngran, &nine, 4); }
+    refuse("n_granules that does not follow from rows and granularity", b, "n_granules");
+    b = good;
+    { const uint32_t zero = 0; std::memcpy(b.data() + off_gran, &zero, 4); }
+    refuse("granularity 0", b, "granularity");
+    // the last bitmap byte carries 5 valid bits; bit 7 names granule 7, which a 100,000-row file does not have.
+    // The last value's bitmap sits just before the 16-byte null posting.
+    b = good;
+    b[b.size() - 8 - 16 - 1] = static_cast<char>(b[b.size() - 8 - 16 - 1] | 0x80);
+    refuse("a bitmap bit past the last granule", b, "granule beyond file_rows");
+    // a run that reaches past the last granule
+    {
+        std::string runs = encode_v5("f.parquet", 4000000, 100000, "model", 15, kStr, 20000, kPost,
+                                     static_cast<uint8_t>(RapIndex::PostingEncoding::RUNS), {{"a", {0}}}, {}, {}, 1);
+        runs[runs.size() - 9] = 8; // length-1 of the only run: 9 granules where the file has 5
+        refuse("a run reaching past the last granule", runs, "granule beyond file_rows");
+    }
+    // front-coded keys that stop ascending, and a key claiming more shared prefix than the previous key carries
+    {
+        std::string two = encode_v5("f.parquet", 4000000, 100000, "model", 15, kStr, 20000, kPost, kBm,
+                                    {{"aa", {0}}, {"ab", {1}}}, {}, {}, 2);
+        std::string unsorted = two;
+        // the second key is front-coded as shared=1, suffix "b"; search the BODY only -- the trailing crc32c can
+        // hold a 0x62 byte, and with_crc would then recompute it and undo the mutation
+        unsorted[unsorted.rfind('b', unsorted.size() - 9)] = 'a';
+        refuse("front-coded keys that stop ascending", unsorted, "sorted");
+        std::string prefix = two;
+        prefix[two.find("aa", base) + 2 + 1] = 9; // the second key's shared-prefix length
+        refuse("a key claiming more shared prefix than the previous key has", prefix, "key prefix");
+    }
+    // zone-map bounds
+    {
+        const uint8_t kI64 = static_cast<uint8_t>(RapIndex::KeyType::INT64);
+        const uint8_t kZone = static_cast<uint8_t>(RapIndex::Shape::ZONEMAP);
+        const RapIndex::Identity zid{"f.parquet", 4000000, 100000, "event_time", 2};
+        std::vector<std::tuple<uint8_t, int64_t, int64_t>> z;
+        for (int g = 0; g < 5; ++g) z.emplace_back(0, 10 * g, 10 * g + 9);
+        const std::string zgood = encode_v5("f.parquet", 4000000, 100000, "event_time", 2, kI64, 20000, kZone, 0, {},
+                                            {}, zone_int64(z), 50);
+        ASSERT_EQ(RapIndex::parse(zgood, zid).state, RapIndex::State::READY);
+        auto zrefuse = [&](const std::string& what, std::string bb, const std::string& why) {
+            auto r = RapIndex::parse(with_crc(bb), zid);
+            EXPECT_EQ(r.state, RapIndex::State::UNUSABLE) << what;
+            EXPECT_NE(r.reason.find(why), std::string::npos) << what << ": got reason '" << r.reason << "'";
+        };
+        std::string zb = zgood;
+        zb[zb.size() - 8 - 9] = static_cast<char>(0xFF); // the last granule's min, above its max
+        zrefuse("a granule whose min is above its max", zb, "malformed zone");
+        zb = zgood;
+        zb[zb.size() - 8 - 17] = 0x40; // an undefined flag bit
+        zrefuse("an undefined zone flag bit", zb, "zone flags");
+        zb = zgood;
+        {
+            const size_t zbase = 4 + 4 + 8 + 8 + (4 + std::string("f.parquet").size()) +
+                                 (4 + std::string("event_time").size()) + 4;
+            const uint32_t one = 1;
+            std::memcpy(zb.data() + zbase + 19, &one, 4);
+        }
+        zrefuse("a zone-map sidecar that declares postings", zb, "zonemap carries postings");
+    }
+}
+
+// v5-6. Size, at the 20,000-row granularity the S8 baseline pins, on a synthetic column shaped like one density file
+// (167,014 rows, 2.65 MB of Parquet, ~1,361 distinct values of the `model` vocabulary). The v2 sidecar for the same
+// data is measured alongside, because the claim is a RATIO between the two and not an absolute number.
+TEST_F(RapIndexTest, V5SizeAtTwentyThousandRowGranularity) {
+    constexpr uint64_t kRows = 167014, kFileBytes = 2648000;
+    constexpr uint32_t kGran = 20000;
+    const uint32_t n_gran = static_cast<uint32_t>((kRows + kGran - 1) / kGran);
+    const uint8_t kStr = static_cast<uint8_t>(RapIndex::KeyType::STRING);
+
+    // a dimension: 1,361 values, each in two granules, keys shaped like the fixture's ("SM-A155F", "2203129G", ...)
+    std::vector<std::pair<std::string, std::vector<uint32_t>>> v5p;
+    std::vector<std::pair<std::string, std::vector<std::pair<int64_t, int64_t>>>> v2p;
+    for (int i = 0; i < 1361; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "M%07d", i);
+        const std::vector<uint32_t> gs = {static_cast<uint32_t>(i % n_gran),
+                                          static_cast<uint32_t>((i + 3) % n_gran)};
+        std::vector<uint32_t> sorted = gs;
+        std::sort(sorted.begin(), sorted.end());
+        sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+        v5p.emplace_back(buf, sorted);
+        std::vector<std::pair<int64_t, int64_t>> rs;
+        for (uint32_t g : sorted) {
+            const int64_t s = static_cast<int64_t>(g) * kGran;
+            const int64_t e = std::min<int64_t>(static_cast<int64_t>(g + 1) * kGran, static_cast<int64_t>(kRows));
+            if (!rs.empty() && rs.back().second == s) rs.back().second = e;
+            else rs.emplace_back(s, e);
+        }
+        v2p.emplace_back(buf, rs);
+    }
+    const std::string v2 = encode_v2("f.parquet", kFileBytes, kRows, "model", 15, kStr, kGran, v2p, {});
+    const std::string v5 = encode_v5("f.parquet", kFileBytes, kRows, "model", 15, kStr, kGran,
+                                     static_cast<uint8_t>(RapIndex::Shape::POSTINGS),
+                                     static_cast<uint8_t>(RapIndex::PostingEncoding::BITMAP), v5p, {}, {}, 1361);
+    const RapIndex::Identity id{"f.parquet", kFileBytes, kRows, "model", 15};
+    ASSERT_EQ(RapIndex::parse(v2, id).state, RapIndex::State::READY);
+    ASSERT_EQ(RapIndex::parse(v5, id).state, RapIndex::State::READY);
+    const double v2_share = 100.0 * v2.size() / kFileBytes, v5_share = 100.0 * v5.size() / kFileBytes;
+    EXPECT_LT(v5_share, 1.0) << "a dimension's v5 postings are " << v5_share << " % of the Parquet file (" << v5.size()
+                             << " B); the density fixture measures 0.3325 %";
+    EXPECT_LT(v5.size() * 3, v2.size()) << "v5 " << v5.size() << " B vs v2 " << v2.size()
+                                        << " B: the measured factor at density is 6.69x";
+    EXPECT_GT(v2_share, v5_share);
+
+    // and the near-unique column at the same geometry: the zone map is two values per granule, whatever the data
+    std::vector<std::tuple<uint8_t, int64_t, int64_t>> z;
+    for (uint32_t g = 0; g < n_gran; ++g) z.emplace_back(0, 1785058200000LL + g, 1785058200000LL + g + 1);
+    const std::string zone = encode_v5("f.parquet", kFileBytes, kRows, "event_time", 2,
+                                       static_cast<uint8_t>(RapIndex::KeyType::INT64), kGran,
+                                       static_cast<uint8_t>(RapIndex::Shape::ZONEMAP), 0, {}, {}, zone_int64(z), kRows);
+    ASSERT_EQ(RapIndex::parse(zone, RapIndex::Identity{"f.parquet", kFileBytes, kRows, "event_time", 2}).state,
+              RapIndex::State::READY);
+    const double zone_share = 100.0 * zone.size() / kFileBytes;
+    EXPECT_LT(zone_share, 0.1) << "a near-unique column's zone map is " << zone_share << " % (" << zone.size()
+                               << " B); at density event_time measures 0.01439 % against 200.68 % under v2";
+    EXPECT_EQ(zone.size(), static_cast<size_t>(90 + n_gran * 17 + 8)) // 90 B of header, 17 B per granule, 8 B trailer
+            << "a zone entry is one flag byte plus two 8-byte INT64 bounds, and nothing else scales";
+}
+
+// v5-7. The builder's selection rule, asserted as a RULE and not as an outcome: the same builder, the same granule
+// sets, two different data-file sizes, and the byte counts it decided on.
+TEST_F(RapIndexTest, V5BuilderChoosesShapeOnExactBytes) {
+    // a dimension: 1,000 distinct values over 5 granules of a 100,000-row file
+    formats::RapSidecarBuilder dim("model", 15, TYPE_VARCHAR, 20000);
+    {
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_VARCHAR), false);
+        for (int64_t r = 0; r < 100000; ++r) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "M%07d", static_cast<int>(r % 1000));
+            col->append_datum(Datum(Slice(buf, std::strlen(buf))));
+        }
+        dim.observe(*col, 0);
+    }
+    EXPECT_EQ(dim.num_values(), 1000u);
+    // a near-unique column: one distinct value per row
+    formats::RapSidecarBuilder uniq("event_time", 2, TYPE_BIGINT, 20000);
+    {
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_BIGINT), false);
+        for (int64_t r = 0; r < 100000; ++r) col->append_datum(Datum(1785058200000LL + r));
+        uniq.observe(*col, 0);
+    }
+    EXPECT_EQ(uniq.num_values(), 100000u);
+
+    constexpr uint64_t kBig = 4000000; // 4 MB of Parquet, so the relative term governs
+    const auto cd = dim.shape_of(kBig, 100000);
+    const auto cu = uniq.shape_of(kBig, 100000);
+    EXPECT_EQ(cd.n_granules, 5u);
+    EXPECT_EQ(cd.shape, RapIndex::Shape::POSTINGS)
+            << "the dimension's postings are " << cd.postings_bytes << " B of a " << kBig << " B file";
+    EXPECT_EQ(cu.shape, RapIndex::Shape::ZONEMAP)
+            << "the near-unique column's postings are " << cu.postings_bytes << " B of a " << kBig << " B file";
+    EXPECT_LT(cd.postings_bytes, static_cast<size_t>(kBig / 100)) << "and the rule's own arithmetic says so";
+    EXPECT_GT(cu.postings_bytes, static_cast<size_t>(kBig / 100));
+    EXPECT_LT(cu.zonemap_bytes, cu.postings_bytes / 100) << "the shape it takes instead is two bounds per granule";
+
+    // what it writes matches what it decided, and both shapes load
+    const std::string dim_bytes = dim.encode("f.parquet", kBig, 100000);
+    auto rd = RapIndex::parse(dim_bytes, RapIndex::Identity{"f.parquet", kBig, 100000, "model", 15});
+    ASSERT_EQ(rd.state, RapIndex::State::READY) << rd.reason;
+    EXPECT_EQ(rd.index->shape(), RapIndex::Shape::POSTINGS);
+    EXPECT_EQ(rd.index->num_values(), 1000u);
+    EXPECT_EQ(rd.index->distinct_values(), 1000u);
+    const std::string uniq_bytes = uniq.encode("f.parquet", kBig, 100000);
+    auto ru = RapIndex::parse(uniq_bytes, RapIndex::Identity{"f.parquet", kBig, 100000, "event_time", 2});
+    ASSERT_EQ(ru.state, RapIndex::State::READY) << ru.reason;
+    EXPECT_EQ(ru.index->shape(), RapIndex::Shape::ZONEMAP);
+    EXPECT_EQ(ru.index->num_values(), 0u);
+    EXPECT_EQ(ru.index->distinct_values(), 100000u) << "the numerator survives into the sidecar";
+    EXPECT_LT(uniq_bytes.size(), dim_bytes.size())
+            << "the near-unique sidecar is now the SMALL one: " << uniq_bytes.size() << " vs " << dim_bytes.size();
+    // and it still answers: every row's own timestamp is inside its granule's bounds
+    EXPECT_EQ(show(ru.index->lookup({enc_i64(1785058200000LL + 25000)})), "[20000,40000)");
+    EXPECT_EQ(show(ru.index->lookup({enc_i64(1785058200000LL - 1)})), "<empty>");
+
+    // the absolute floor: the SAME dimension in a small file keeps its postings, because a zone map over a dimension
+    // narrows almost nothing and two kilobytes cannot be what breaks a size budget
+    const auto cs = dim.shape_of(300000, 100000); // 1 % = 3,000 B, under the 16 KiB floor
+    EXPECT_EQ(cs.shape, RapIndex::Shape::POSTINGS) << "postings " << cs.postings_bytes << " B";
+    // and a file size the builder does not know falls back to the structural form
+    EXPECT_EQ(dim.shape_of(0, 100000).shape, RapIndex::Shape::POSTINGS) << "1,000 distinct in 100,000 rows";
+    EXPECT_EQ(uniq.shape_of(0, 100000).shape, RapIndex::Shape::ZONEMAP) << "100,000 distinct in 100,000 rows";
+}
+
+// v5-8. Golden bytes. The BE builder and harness/rap_index_build.py are two implementations of one format, and the
+// only thing that keeps them together is that they agree byte for byte. These three constants were produced by the
+// reference encoder; if either side drifts, this fails here rather than on a cluster.
+TEST_F(RapIndexTest, V5BytesMatchTheReferenceEncoder) {
+    const char* kGoldenPostingsBitmap =
+            "524150580500000000093d0000000000a08601000000000009000000662e70617271756574050000006d6f64656c0f00"
+            "0000010101204e00000500000003000000000000000300000001000000550000000000000000036161610b0201620400"
+            "037a7a7a118038010000000000a086010000000000bc78aab752415058";
+    const char* kGoldenPostingsRuns =
+            "524150580500000000093d0000000000a08601000000000009000000662e70617271756574050000006d6f64656c0f00"
+            "0000010102204e0000050000000300000000000000030000000100000055000000000000000003616161020001010002"
+            "016201020000037a7a7a02000003008038010000000000a086010000000000fc9a766652415058";
+    const char* kGoldenZoneMap =
+            "524150580500000000093d0000000000a08601000000000009000000662e706172717565740a0000006576656e745f74"
+            "696d6502000000020200204e000005000000320000000000000000000000000000005a00000000000000008000019f9d"
+            "c289c08000019f9dc289c9008000019f9dc289ca8000019f9dc289d3008000019f9dc289d48000019f9dc289dd008000"
+            "019f9dc289de8000019f9dc289e7018000019f9dc289e88000019f9dc289f122a7466452415058";
+
+    formats::RapSidecarBuilder dim("model", 15, TYPE_VARCHAR, 20000);
+    {
+        // "aaa" in granules 0, 1, 3; "aab" in 2; "zzz" in 0 and 4; a NULL in granule 4
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_VARCHAR), true);
+        auto put = [&](const char* v, int n) {
+            for (int i = 0; i < n; ++i) {
+                if (v == nullptr) col->append_nulls(1);
+                else col->append_datum(Datum(Slice(v, std::strlen(v))));
+            }
+        };
+        put("zzz", 1); put("aaa", 19999);            // granule 0
+        put("aaa", 20000);                            // granule 1
+        put("aab", 20000);                            // granule 2
+        put("aaa", 20000);                            // granule 3
+        put("zzz", 19999); put(nullptr, 1);           // granule 4
+        dim.observe(*col, 0);
+    }
+    formats::RapSidecarBuilder::Choice ch = dim.shape_of(4000000, 100000);
+    ch.shape = RapIndex::Shape::POSTINGS;
+    ch.encoding = RapIndex::PostingEncoding::BITMAP;
+    EXPECT_EQ(dim.encode("f.parquet", 4000000, 100000, &ch), from_hex(kGoldenPostingsBitmap));
+    ch.encoding = RapIndex::PostingEncoding::RUNS;
+    EXPECT_EQ(dim.encode("f.parquet", 4000000, 100000, &ch), from_hex(kGoldenPostingsRuns));
+
+    formats::RapSidecarBuilder uniq("event_time", 2, TYPE_BIGINT, 20000);
+    {
+        // ten timestamps per granule over five granules, plus a NULL in granule 4
+        auto col = ColumnHelper::create_column(TypeDescriptor::from_logical_type(TYPE_BIGINT), true);
+        for (int64_t r = 0; r < 100000; ++r) {
+            if (r == 99999) col->append_nulls(1);
+            else col->append_datum(Datum(1785058200000LL + (r / 20000) * 10 + (r % 10)));
+        }
+        uniq.observe(*col, 0);
+    }
+    formats::RapSidecarBuilder::Choice cz = uniq.shape_of(4000000, 100000);
+    cz.shape = RapIndex::Shape::ZONEMAP;
+    cz.encoding = RapIndex::PostingEncoding::NONE;
+    EXPECT_EQ(uniq.encode("f.parquet", 4000000, 100000, &cz), from_hex(kGoldenZoneMap));
 }
 
 } // namespace starrocks::parquet

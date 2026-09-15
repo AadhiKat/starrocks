@@ -61,6 +61,18 @@ Status PartitionChunkWriter::commit_file() {
     auto file_result = _file_writer->close();
     const auto io_status = file_result.io_status;
     const auto file_size = file_result.file_statistics.file_size;
+    // RAP / lake-index: the sidecar builders ran inside that close(), in the SINK. This is the one place every sink
+    // and every partition writer closes a data file, so the counters are registered once here rather than in each
+    // connector's commit callback. A file the writer could not close reports attempted 0, which is correct: the
+    // sidecar pass never ran.
+    if (_sink_profile != nullptr) {
+        const auto& rap = file_result.rap_index;
+        COUNTER_UPDATE(_sink_profile->rap_sink_index_attempted, rap.attempted);
+        COUNTER_UPDATE(_sink_profile->rap_sink_index_written, rap.sidecars_written);
+        COUNTER_UPDATE(_sink_profile->rap_sink_index_skipped, rap.failures);
+        COUNTER_UPDATE(_sink_profile->rap_sink_index_bytes, rap.sidecar_bytes);
+        COUNTER_UPDATE(_sink_profile->rap_sink_index_timer, rap.build_ns);
+    }
     CommitResult result{.file_result = std::move(file_result)};
     result.set_partition_null_fingerprint(_commit_extra_data);
     _commit_callback(result);

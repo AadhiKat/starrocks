@@ -85,13 +85,6 @@ using FileColumnId = ::starrocks::parquet::FileColumnId;
 class RapSidecarBuilder;
 
 // RAP slice 3a: what the writer did for sidecars (reported through the sink profile later)
-struct RapExportStats {
-    int64_t sidecars_written = 0;
-    int64_t sidecar_bytes = 0;
-    int64_t failures = 0;
-    int64_t build_ns = 0;
-};
-
 struct ParquetWriterOptions : FileWriterOptions {
     int64_t dictionary_pagesize = 1024 * 1024; // 1MB
     int64_t page_size = 1024 * 1024;           // 1MB

@@ -40,6 +40,22 @@ public:
         _o += n;
         return true;
     }
+    // v5: LEB128. Refuses a value wider than 64 bits rather than wrapping it into a small one.
+    bool read_uvarint(uint64_t* out) {
+        uint64_t n = 0;
+        int shift = 0;
+        while (true) {
+            if (_o >= _b.size() || shift > 63) return false;
+            const uint8_t c = static_cast<uint8_t>(_b[_o++]);
+            n |= static_cast<uint64_t>(c & 0x7f) << shift;
+            if ((c & 0x80) == 0) {
+                *out = n;
+                return true;
+            }
+            shift += 7;
+        }
+    }
+    void seek(size_t o) { _o = o; }
 
 private:
     const std::string& _b;
@@ -208,7 +224,12 @@ RapIndex::Result RapIndex::parse(const std::string& b, const Identity& expect) {
     uint32_t version = 0;
     uint64_t file_size = 0, file_rows = 0;
     if (!c.read(&version) || !c.read(&file_size) || !c.read(&file_rows)) return unusable("truncated header");
-    if (version != kVersion && version != kVersionV2) return unusable("version " + std::to_string(version));
+    if (version != kVersion && version != kVersionV2 && version != kVersionV5) {
+        // v5: an unknown format is refused BY NAME, so it can never be read as another one. The scan proceeds
+        // unindexed and complete; the reason names the version and the remedy.
+        return unusable("format v" + std::to_string(version) + ", rebuild");
+    }
+    if (version == kVersionV5) return parse_v5(b, body_end, file_size, file_rows, expect, c.offset());
     const bool v2 = version == kVersionV2;
     uint32_t n = 0;
     std::string name, column;
@@ -278,6 +299,205 @@ RapIndex::Result RapIndex::parse(const std::string& b, const Identity& expect) {
     return r;
 }
 
+// v5 (S8). The body is either granule-native postings -- front-coded keys, then a granule bitmap or delta-varint
+// granule runs -- or a per-granule min/max zone map. Every bound the v2 parser applies is applied here, plus the ones
+// the new shapes need: the granule count is DERIVED from rows and granularity rather than trusted, no granule ordinal
+// may name a granule the file does not have, a front-coded key may not claim more shared prefix than the previous key
+// carries, and a zone entry's min may not exceed its max. harness/rap_index_build.py::_decode_v5 is the same code.
+RapIndex::Result RapIndex::parse_v5(const std::string& b, size_t body_end, uint64_t file_size, uint64_t file_rows,
+                                    const Identity& expect, size_t offset) {
+    Cursor c(b);
+    c.seek(offset);
+    uint32_t n = 0;
+    std::string name, column;
+    if (!c.read(&n) || c.offset() > body_end || n > body_end - c.offset() || !c.read_bytes(n, &name)) {
+        return unusable("truncated name");
+    }
+    if (!c.read(&n) || c.offset() > body_end || n > body_end - c.offset() || !c.read_bytes(n, &column)) {
+        return unusable("truncated column");
+    }
+    int32_t field_id = -1;
+    uint8_t key_type = 0, shape = 0, encoding = 0;
+    uint32_t granularity = 0, n_granules = 0, n_values = 0, n_null_ranges = 0;
+    uint64_t distinct_values = 0, body_offset = 0;
+    if (!c.read(&field_id) || !c.read(&key_type) || !c.read(&shape) || !c.read(&encoding)) {
+        return unusable("truncated header");
+    }
+    if (!c.read(&granularity) || !c.read(&n_granules) || !c.read(&distinct_values) || !c.read(&n_values) ||
+        !c.read(&n_null_ranges) || !c.read(&body_offset)) {
+        return unusable("truncated header");
+    }
+    if (body_offset != c.offset()) return unusable("postings_offset");
+    if (!valid_key_type(key_type)) return unusable("key_type " + std::to_string(key_type));
+    const bool zonemap = shape == static_cast<uint8_t>(Shape::ZONEMAP);
+    if (shape != static_cast<uint8_t>(Shape::POSTINGS) && !zonemap) return unusable("shape " + std::to_string(shape));
+    if (!zonemap && encoding != static_cast<uint8_t>(PostingEncoding::BITMAP) &&
+        encoding != static_cast<uint8_t>(PostingEncoding::RUNS)) {
+        return unusable("posting_encoding " + std::to_string(encoding));
+    }
+    if (zonemap && encoding != 0) return unusable("posting_encoding " + std::to_string(encoding));
+    if (granularity == 0) return unusable("granularity");
+    // derived, never trusted: it fixes the bitmap width and every row range this sidecar can name
+    const uint64_t derived = (file_rows + granularity - 1) / granularity;
+    if (static_cast<uint64_t>(n_granules) != derived) {
+        return unusable("n_granules " + std::to_string(n_granules) + " for " + std::to_string(file_rows) + " rows at " +
+                        std::to_string(granularity));
+    }
+    if (zonemap && (n_values != 0 || n_null_ranges != 0)) return unusable("zonemap carries postings");
+    // PRD-02: declared counts against the ceiling and against the bytes that are left, before any reserve
+    if (static_cast<int64_t>(n_values) > config::rap_index_max_values) {
+        return unusable("declared values " + std::to_string(n_values) + " above rap_index_max_values " +
+                        std::to_string(config::rap_index_max_values));
+    }
+    const size_t remaining = body_end - c.offset();
+    // a v5 value costs at least two bytes (the two key varints); a null range still costs 16
+    if (n_values > remaining / 2 || static_cast<size_t>(n_null_ranges) > remaining / kRangeBytes) {
+        return unusable("declared count exceeds body");
+    }
+
+    // identity gate -- the whole point, and identical to v2's
+    if (name != expect.file_name) return unusable("file_name mismatch: index '" + name + "' vs file '" + expect.file_name + "'");
+    if (file_size != expect.file_size) {
+        return unusable("file_size mismatch: index " + std::to_string(file_size) + " vs file " + std::to_string(expect.file_size));
+    }
+    if (file_rows != expect.file_rows) {
+        return unusable("file_rows mismatch: index " + std::to_string(file_rows) + " vs file " + std::to_string(expect.file_rows));
+    }
+    if (column != expect.column) return unusable("column mismatch: index '" + column + "' vs predicate '" + expect.column + "'");
+    if (expect.field_id >= 0 && field_id >= 0 && field_id != expect.field_id) {
+        return unusable("field_id mismatch: index " + std::to_string(field_id) + " vs schema " + std::to_string(expect.field_id));
+    }
+
+    auto idx = std::make_unique<RapIndex>();
+    idx->_identity = Identity{name, file_size, file_rows, column, field_id};
+    idx->_version = kVersionV5;
+    idx->_key_type = static_cast<KeyType>(key_type);
+    idx->_shape = static_cast<Shape>(shape);
+    idx->_posting_encoding = static_cast<PostingEncoding>(encoding);
+    idx->_granularity_rows = granularity;
+    idx->_n_granules = n_granules;
+    idx->_distinct_values = distinct_values;
+
+    if (!zonemap) {
+        const size_t width = (static_cast<size_t>(n_granules) + 7) / 8;
+        const bool bitmap = encoding == static_cast<uint8_t>(PostingEncoding::BITMAP);
+        idx->_values.reserve(n_values);
+        idx->_ranges.reserve(n_values);
+        std::string prev;
+        std::vector<uint32_t> granules;
+        for (uint32_t i = 0; i < n_values; ++i) {
+            uint64_t shared = 0, suffix_len = 0;
+            if (!c.read_uvarint(&shared) || !c.read_uvarint(&suffix_len)) return unusable("truncated value");
+            if (shared > prev.size()) return unusable("key prefix");
+            std::string suffix;
+            if (c.offset() > body_end || suffix_len > body_end - c.offset() ||
+                !c.read_bytes(static_cast<size_t>(suffix_len), &suffix)) {
+                return unusable("truncated value");
+            }
+            std::string v = prev.substr(0, static_cast<size_t>(shared)) + suffix;
+            if (i > 0 && !(prev < v)) return unusable("values not sorted");
+            prev = v;
+            granules.clear();
+            if (bitmap) {
+                std::string bm;
+                if (c.offset() > body_end || width > body_end - c.offset() || !c.read_bytes(width, &bm)) {
+                    return unusable("truncated bitmap");
+                }
+                const uint32_t tail = n_granules & 7u;
+                if (tail != 0 && width > 0 && (static_cast<uint8_t>(bm[width - 1]) >> tail) != 0) {
+                    return unusable("granule beyond file_rows");
+                }
+                for (uint32_t g = 0; g < n_granules; ++g) {
+                    if (static_cast<uint8_t>(bm[g >> 3]) & (1u << (g & 7u))) granules.push_back(g);
+                }
+            } else {
+                uint64_t n_runs = 0;
+                if (!c.read_uvarint(&n_runs)) return unusable("truncated ranges");
+                if (c.offset() > body_end || n_runs > (body_end - c.offset()) / 2) {
+                    return unusable("declared count exceeds body");
+                }
+                uint64_t p = 0;
+                for (uint64_t k = 0; k < n_runs; ++k) {
+                    uint64_t gap = 0, length_1 = 0;
+                    if (!c.read_uvarint(&gap) || !c.read_uvarint(&length_1)) return unusable("truncated ranges");
+                    // every term is bounded by n_granules before it is added, so nothing here can overflow
+                    if (gap > n_granules || p + gap > n_granules) return unusable("granule beyond file_rows");
+                    const uint64_t start = p + gap;
+                    if (length_1 >= n_granules || start + length_1 + 1 > n_granules) {
+                        return unusable("granule beyond file_rows");
+                    }
+                    for (uint64_t g = start; g < start + length_1 + 1; ++g) granules.push_back(static_cast<uint32_t>(g));
+                    p = start + length_1 + 1;
+                }
+            }
+            idx->_values.push_back(std::move(v));
+            idx->_ranges.push_back(idx->granule_ranges(granules));
+        }
+        std::string why;
+        if (!read_ranges(&c, n_null_ranges, file_rows, body_end, &idx->_null_ranges, &why)) {
+            return unusable("null posting: " + why);
+        }
+    } else {
+        const size_t fixed = key_type == static_cast<uint8_t>(KeyType::BOOLEAN)
+                                     ? 1
+                                     : (key_type == static_cast<uint8_t>(KeyType::STRING) ? 0 : 8);
+        if (fixed != 0 && static_cast<size_t>(n_granules) > remaining / (1 + 2 * fixed)) {
+            return unusable("declared count exceeds body");
+        }
+        idx->_zone_flags.reserve(n_granules);
+        idx->_zone_min.reserve(n_granules);
+        idx->_zone_max.reserve(n_granules);
+        for (uint32_t g = 0; g < n_granules; ++g) {
+            uint8_t flags = 0;
+            if (c.offset() >= body_end || !c.read(&flags)) return unusable("truncated zone");
+            if ((flags & ~(kZoneHasNull | kZoneAllNull)) != 0) return unusable("zone flags");
+            std::string lo, hi;
+            if (fixed != 0) {
+                if (c.offset() > body_end || 2 * fixed > body_end - c.offset() || !c.read_bytes(fixed, &lo) ||
+                    !c.read_bytes(fixed, &hi)) {
+                    return unusable("truncated zone");
+                }
+            } else {
+                uint64_t ln = 0;
+                if (!c.read_uvarint(&ln) || c.offset() > body_end || ln > body_end - c.offset() ||
+                    !c.read_bytes(static_cast<size_t>(ln), &lo)) {
+                    return unusable("truncated zone");
+                }
+                if (!c.read_uvarint(&ln) || c.offset() > body_end || ln > body_end - c.offset() ||
+                    !c.read_bytes(static_cast<size_t>(ln), &hi)) {
+                    return unusable("truncated zone");
+                }
+            }
+            if ((flags & kZoneAllNull) == 0 && lo > hi) return unusable("malformed zone");
+            idx->_zone_flags.push_back(flags);
+            idx->_zone_min.push_back(std::move(lo));
+            idx->_zone_max.push_back(std::move(hi));
+        }
+    }
+    if (c.offset() != body_end) return unusable("trailing bytes");
+    Result r;
+    r.state = State::READY;
+    r.index = std::move(idx);
+    return r;
+}
+
+// Granule ordinals (ascending, de-duplicated by construction) -> merged, half-open row ranges. The last granule is
+// bounded by file_rows, so the ranges are byte-for-byte what v2 wrote for the same granules.
+std::vector<RowRangeHint> RapIndex::granule_ranges(const std::vector<uint32_t>& granules) const {
+    std::vector<RowRangeHint> out;
+    for (uint32_t g : granules) {
+        const int64_t start = static_cast<int64_t>(g) * _granularity_rows;
+        const int64_t end = std::min<int64_t>(static_cast<int64_t>(g + 1) * _granularity_rows,
+                                              static_cast<int64_t>(_identity.file_rows));
+        if (!out.empty() && out.back().end_row == start) {
+            out.back().end_row = end;
+        } else {
+            out.push_back(RowRangeHint{start, end});
+        }
+    }
+    return out;
+}
+
 void RapIndex::encode_int64(int64_t v, std::string* out) {
     // sign bit flipped, big-endian: bytewise order == signed numeric order
     const uint64_t u = static_cast<uint64_t>(v) ^ (1ULL << 63);
@@ -345,6 +565,22 @@ std::vector<RowRangeHint> RapIndex::merge(std::vector<RowRangeHint> all) {
 }
 
 std::vector<RowRangeHint> RapIndex::lookup(const std::vector<std::string>& values) const {
+    if (_shape == Shape::ZONEMAP) {
+        // v5: a granule is a CANDIDATE when one of the literals lies inside its [min, max]. An all-NULL granule holds
+        // no value and is never a candidate -- its stored bounds are placeholders. Over-selecting is safe (the
+        // predicate still runs on the rows); under-selecting would lose rows, so the test is inclusive on both sides.
+        std::vector<uint32_t> granules;
+        for (uint32_t g = 0; g < _n_granules; ++g) {
+            if ((_zone_flags[g] & kZoneAllNull) != 0) continue;
+            for (const auto& v : values) {
+                if (_zone_min[g] <= v && v <= _zone_max[g]) {
+                    granules.push_back(g);
+                    break;
+                }
+            }
+        }
+        return granule_ranges(granules);
+    }
     std::vector<RowRangeHint> all;
     for (const auto& v : values) {
         auto it = std::lower_bound(_values.begin(), _values.end(), v);
@@ -357,6 +593,23 @@ std::vector<RowRangeHint> RapIndex::lookup(const std::vector<std::string>& value
 
 std::vector<RowRangeHint> RapIndex::lookup_range(const std::string* lower, bool lower_inclusive, const std::string* upper,
                                                  bool upper_inclusive) const {
+    if (_shape == Shape::ZONEMAP) {
+        // v5: a granule overlaps the interval when its max is at (or past) the lower bound and its min is at (or
+        // before) the upper bound -- the SQL bounds exactly, so an exclusive bound excludes a granule only when the
+        // whole granule sits on that bound. All-NULL granules hold no value and cannot overlap any interval.
+        std::vector<uint32_t> granules;
+        for (uint32_t g = 0; g < _n_granules; ++g) {
+            if ((_zone_flags[g] & kZoneAllNull) != 0) continue;
+            if (lower != nullptr) {
+                if (lower_inclusive ? _zone_max[g] < *lower : !(_zone_max[g] > *lower)) continue;
+            }
+            if (upper != nullptr) {
+                if (upper_inclusive ? _zone_min[g] > *upper : !(_zone_min[g] < *upper)) continue;
+            }
+            granules.push_back(g);
+        }
+        return granule_ranges(granules);
+    }
     // the keys are sorted bytewise and, for a typed sidecar, bytewise order is the type's order (canonical encodings);
     // every key inside the interval contributes its ranges -- an under-selection here would lose rows, so the bounds
     // follow SQL exactly: [lower, upper] when both inclusive, (lower, upper) when neither
@@ -375,10 +628,24 @@ std::vector<RowRangeHint> RapIndex::lookup_range(const std::string* lower, bool 
 }
 
 std::vector<RowRangeHint> RapIndex::null_ranges() const {
+    if (_shape == Shape::ZONEMAP) {
+        std::vector<uint32_t> granules;
+        for (uint32_t g = 0; g < _n_granules; ++g) {
+            if ((_zone_flags[g] & kZoneHasNull) != 0) granules.push_back(g);
+        }
+        return granule_ranges(granules);
+    }
     return merge(_null_ranges);
 }
 
 std::vector<RowRangeHint> RapIndex::not_null_ranges() const {
+    if (_shape == Shape::ZONEMAP) {
+        std::vector<uint32_t> granules;
+        for (uint32_t g = 0; g < _n_granules; ++g) {
+            if ((_zone_flags[g] & kZoneAllNull) == 0) granules.push_back(g);
+        }
+        return granule_ranges(granules);
+    }
     std::vector<RowRangeHint> all;
     for (const auto& rs : _ranges) all.insert(all.end(), rs.begin(), rs.end());
     return merge(std::move(all));

@@ -3866,7 +3866,8 @@ TEST_F(HdfsScannerTest, TestRapRowRangeHintsRefusedAtTheScannerContextAreCounted
     auto* tuple_desc = _create_tuple_desc(parquet_descs);
     auto* ctx = _create_ctx(parquet_file, range, tuple_desc);
 
-    ASSERT_OK(scanner->init(_runtime_state, ctx));
+    Status status = scanner->init(_runtime_state, ctx);
+    ASSERT_OK(status);
     ASSERT_OK(scanner->open(_runtime_state));
     EXPECT_TRUE(ctx->format_scan_context.selected_row_ranges.empty())
             << "a refused list must leave the scan unhinted, not half hinted";

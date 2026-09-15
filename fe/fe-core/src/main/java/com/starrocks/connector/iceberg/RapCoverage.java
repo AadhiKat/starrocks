@@ -41,6 +41,7 @@ import java.io.InputStream;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -69,6 +70,12 @@ import java.util.TreeMap;
  *
  * <p>Disabled unless {@code Config.rap_manifest_dir} is set. A disabled or failed coverage keeps
  * every file and counts nothing but {@code consulted}.
+ *
+ * <p><b>Slice 5 (workstream D):</b> everything a manifest establishes before the query's literals are looked at
+ * is done once, in {@link #parseManifest}, and kept between plans by {@link RapManifestCache}; a plan pays only
+ * {@link #bind}. That split is what the row-range work of workstream A sits inside: the {@code ranges} section is
+ * VALIDATED at parse time, with the rest of the document, and only the selection of which ranges this query's
+ * literals choose happens per plan.
  */
 public class RapCoverage {
     private static final Logger LOG = LogManager.getLogger(RapCoverage.class);
@@ -107,6 +114,9 @@ public class RapCoverage {
     /** Active, but the manifest carries no postings: M = C, so no file is eliminated and the backend narrows. */
     public static final String REASON_NO_POSTINGS = "no_postings";
 
+    /** The hint reason a manifest with no usable postings for THIS plan carries. Decided in {@link #bind}. */
+    private static final String HINTS_NO_POSTINGS = "no usable postings for this predicate";
+
     private static final class Covered {
         final long size;
         final long rows;
@@ -119,17 +129,22 @@ public class RapCoverage {
     private final boolean active;                 // a manifest for THIS snapshot was loaded and parsed
     private final long snapshotId;
     private final String column;
-    private final Map<String, Covered> files = new HashMap<>();   // key (path under data/) -> identity; slice 2g
+    // key (path under data/) -> identity; slice 2g. Slice 5: this is the SHARED, immutable map of the cached parse
+    // -- read only, never copied per plan and never written after construction.
+    private Map<String, Covered> files = Collections.emptyMap();
     private final Set<String> matching = new HashSet<>();         // basenames in M (null postings -> M = C)
     private final boolean hasPostings;
     private final boolean predicateUsable;        // EQ / IN literal(s) on `column` were found
     private int manifestKeyType = 0;              // zero denotes a retained v1 manifest
     private int manifestFieldId = -1;
+    // slice 5: which path served this plan's manifest -- RapManifestCache.Outcome, rendered as `cache=` in EXPLAIN
+    private String cache = RapManifestCache.Outcome.NONE.label();
 
-    // R7: per-file candidate row ranges, keyed the same way as `files`. Non-empty only for a v3 manifest whose
-    // `ranges` section validated AND whose file set agrees with the elimination candidates. Half-open [start, end)
-    // absolute row positions within the data FILE -- not within a split -- because that is what the backend's
-    // GroupReader intersects into each row group (be/src/formats/parquet/group_reader.cpp).
+    // R7: per-file candidate row ranges for THIS plan's predicate, keyed the same way as `files`. Non-empty only for
+    // a v3 manifest whose `ranges` section validated at parse time AND whose file set agrees with this plan's
+    // elimination candidates. Half-open [start, end) absolute row positions within the data FILE -- not within a
+    // split -- because that is what the backend's GroupReader intersects into each row group
+    // (be/src/formats/parquet/group_reader.cpp). The arrays are the cached parse's own: read, never written.
     private final Map<String, long[][]> hintRanges = new HashMap<>();
     private boolean hintsUsable = false;
     private String hintReason = "no ranged manifest";
@@ -194,13 +209,18 @@ public class RapCoverage {
                 org.apache.iceberg.types.Types.NestedField field = nativeTable.schema().findField(coverage.column);
                 if (field == null || field.fieldId() != coverage.manifestFieldId
                         || icebergKeyType(field.type()) != coverage.manifestKeyType) {
-                    return disabled(coverage.snapshotId, REASON_STALE_COLUMN);
+                    return disabled(coverage.snapshotId, REASON_STALE_COLUMN).withCache(coverage.cache);
                 }
             } catch (Exception e) {
-                return disabled(coverage.snapshotId, REASON_STALE_COLUMN);
+                return disabled(coverage.snapshotId, REASON_STALE_COLUMN).withCache(coverage.cache);
             }
         }
         return coverage;
+    }
+
+    private RapCoverage withCache(String outcome) {
+        this.cache = outcome;
+        return this;
     }
 
     private static int icebergKeyType(org.apache.iceberg.types.Type type) {
@@ -224,6 +244,13 @@ public class RapCoverage {
     /**
      * The loader proper (astra CX-32: testable with any FileIO). An empty directory is "off": nothing is
      * read and every file is kept. Otherwise the manifest for (uuid, snapshot) is read through `io`.
+     *
+     * <p>Slice 5: the PARSE is kept between plans by {@link RapManifestCache} and only the predicate binding is
+     * per plan. The object is still probed on every plan by default ({@code rap_manifest_cache_ttl_ms = 0}) --
+     * {@code newInputFile} + {@code exists()} + {@code getLength()}, the same calls this loader already made --
+     * and the parse is reused only while that probe's stamp is unchanged, so a same-snapshot republish is seen
+     * by the next plan exactly as it was before the cache existed. Absent, oversize and unparsable manifests
+     * are never stored and invalidate whatever was held for the same path.
      */
     public static RapCoverage load(String dir, FileIO io, String uuid, Optional<Long> snapshotId, ScalarOperator predicate) {
         if (dir == null || dir.isEmpty() || io == null || snapshotId == null || !snapshotId.isPresent()) {
@@ -232,33 +259,69 @@ public class RapCoverage {
                     off ? REASON_DISABLED : REASON_NO_SNAPSHOT);
         }
         long snap = snapshotId.get();
+        String path = null;
         try {
             if (uuid == null || uuid.isEmpty()) {
                 return disabled(snap, REASON_NO_TABLE_UUID);
             }
-            String path = dir + (dir.endsWith("/") ? "" : "/") + uuid + "/" + snap + SUFFIX;
+            path = dir + (dir.endsWith("/") ? "" : "/") + uuid + "/" + snap + SUFFIX;
+            RapManifestCache.Lookup look = RapManifestCache.lookup(path);
+            if (look.freshWithoutProbe()) {
+                // inside the TTL: the object is not touched at all, which is the only setting that costs no
+                // remote call. Off by default, because nothing signals this frontend when a manifest is replaced.
+                return served(look.parsed(), predicate, RapManifestCache.Outcome.HIT, uuid, snap, null, 0L);
+            }
             InputFile in = io.newInputFile(path);
             if (!in.exists()) {
+                RapManifestCache.invalidate(path);
                 LOG.info("RAP manifest absent for {} snapshot {} ({}) -- ordinary scan", uuid, snap, path);
                 return disabled(snap, REASON_ABSENT);
             }
             // slice 4 (PRD-02): the byte ceiling is applied BEFORE the read; an oversize manifest is "off", never a
             // partial parse
-            long length = in.getLength();
+            RapManifestCache.Stamp stamp = RapManifestCache.stampOf(in);
+            long length = stamp.length();
             if (length > Config.rap_manifest_max_bytes) {
+                RapManifestCache.invalidate(path);
                 LOG.warn("RAP manifest for {} snapshot {} is {} bytes, above rap_manifest_max_bytes {} -- ordinary scan",
                         uuid, snap, length, Config.rap_manifest_max_bytes);
                 return disabled(snap, REASON_OVERSIZE);
+            }
+            if (look.matches(stamp)) {
+                // the object has not moved since it was parsed: no body read, no parse
+                RapManifestCache.confirm(path);
+                return served(look.parsed(), predicate, RapManifestCache.Outcome.HIT, uuid, snap, stamp, length);
             }
             String json;
             try (InputStream s = in.newStream()) {
                 json = new String(s.readAllBytes(), StandardCharsets.UTF_8);
             }
-            return fromJson(json, uuid, snap, predicate);
+            RapManifestCache.Outcome outcome = !RapManifestCache.enabled() ? RapManifestCache.Outcome.DISABLED
+                    : look.present() ? RapManifestCache.Outcome.REFRESH : RapManifestCache.Outcome.MISS;
+            ParseResult result = parseManifest(json, uuid, snap);
+            if (result.parsed() == null) {
+                // a manifest that does not parse is never cached as valid, and never leaves the previous one serving
+                RapManifestCache.invalidate(path);
+                RapManifestCache.count(outcome);
+                return disabled(snap, result.reason()).withCache(outcome.label());
+            }
+            RapManifestCache.store(path, result.parsed(), stamp, length);
+            return served(result.parsed(), predicate, outcome, uuid, snap, stamp, length);
         } catch (Exception e) {
+            if (path != null) {
+                RapManifestCache.invalidate(path);
+            }
             LOG.warn("RAP manifest unusable for snapshot {}: {} -- ordinary scan", snap, e.toString());
             return disabled(snap, REASON_UNREADABLE);
         }
+    }
+
+    /** Bind a parsed manifest to this plan's predicate, and record which path served it. */
+    private static RapCoverage served(Parsed parsed, ScalarOperator predicate, RapManifestCache.Outcome outcome,
+                                      String uuid, long snap, RapManifestCache.Stamp stamp, long bytes) {
+        RapManifestCache.count(outcome);
+        RapManifestCache.log(outcome, uuid, snap, stamp, bytes);
+        return bind(parsed, predicate).withCache(outcome.label());
     }
 
     /**
@@ -266,6 +329,115 @@ public class RapCoverage {
      * for another table or snapshot, or an unknown version, yields a disabled coverage.
      */
     public static RapCoverage fromJson(String json, String expectUuid, long expectSnapshot, ScalarOperator predicate) {
+        ParseResult result = parseManifest(json, expectUuid, expectSnapshot);
+        return result.parsed() == null ? disabled(expectSnapshot, result.reason()) : bind(result.parsed(), predicate);
+    }
+
+    /**
+     * Slice 5: everything a manifest establishes BEFORE the query's literals are looked at -- the whole JSON
+     * tokenisation, the table and snapshot identity, the file identities, the validation of every posting index
+     * and (v3) the validation of every row range. None of it depends on the predicate, so it is done once and kept
+     * by {@link RapManifestCache}; {@link #bind} is what each plan pays. Immutable: `files`, `names`, `postings`,
+     * `typed`, `ranged` and `nullRanges` are never written after construction and are SHARED with every coverage
+     * bound from this manifest.
+     */
+    static final class Parsed {
+        private final int version;
+        private final long snapshotId;
+        private final String column;
+        private final int keyType;
+        private final int fieldId;
+        private final boolean hasPostings;
+        private final String[] names;                   // file index -> key, the order the manifest declares
+        private final Map<String, Covered> files;       // key -> identity
+        private final Map<String, int[]> postings;      // v1: value -> file indices; null for a typed manifest
+        private final Typed typed;                      // v2 / v3: validated typed postings; null for a v1 manifest
+        // R7, slice 5: the validated `ranges` / `null_ranges` sections of a v3 manifest, value -> file ordinal ->
+        // [[start, end), ...]. Null when this manifest carries none, or when its ranges were REFUSED -- a refusal
+        // is a property of the manifest, not of the query, so it is decided once here and cached with everything
+        // else, and `rangeReason` is what every plan bound from it then reports.
+        private final NavigableMap<String, Map<Integer, long[][]>> ranged;
+        private final Map<Integer, long[][]> nullRanges;
+        private final String rangeReason;
+
+        private Parsed(int version, long snapshotId, String column, int keyType, int fieldId, boolean hasPostings,
+                       String[] names, Map<String, Covered> files, Map<String, int[]> postings, Typed typed,
+                       NavigableMap<String, Map<Integer, long[][]>> ranged, Map<Integer, long[][]> nullRanges,
+                       String rangeReason) {
+            this.version = version;
+            this.snapshotId = snapshotId;
+            this.column = column;
+            this.keyType = keyType;
+            this.fieldId = fieldId;
+            this.hasPostings = hasPostings;
+            this.names = names;
+            this.files = files;
+            this.postings = postings;
+            this.typed = typed;
+            this.ranged = ranged;
+            this.nullRanges = nullRanges;
+            this.rangeReason = rangeReason;
+        }
+
+        int fileCount() {
+            return names.length;
+        }
+
+        String column() {
+            return column;
+        }
+    }
+
+    /** The predicate-independent half of a typed (v2 / v3) manifest's postings, validated once. */
+    private static final class Typed {
+        private final int keyType;
+        private final TreeMap<String, Set<Integer>> postings;
+        private final Set<Integer> nullFiles;
+
+        private Typed(int keyType, TreeMap<String, Set<Integer>> postings, Set<Integer> nullFiles) {
+            this.keyType = keyType;
+            this.postings = postings;
+            this.nullFiles = nullFiles;
+        }
+    }
+
+    /**
+     * The outcome of a predicate-independent parse: the manifest, or the single-token reason it was refused.
+     * A refusal is never cached -- {@link #load} invalidates the path -- and the reason is what {@link #explain()}
+     * renders, so routing the parse through the cache cannot lose it.
+     */
+    static final class ParseResult {
+        private final Parsed parsed;
+        private final String reason;
+
+        private ParseResult(Parsed parsed, String reason) {
+            this.parsed = parsed;
+            this.reason = reason;
+        }
+
+        static ParseResult of(Parsed parsed) {
+            return new ParseResult(parsed, REASON_OK);
+        }
+
+        static ParseResult refused(String reason) {
+            return new ParseResult(null, reason);
+        }
+
+        Parsed parsed() {
+            return parsed;
+        }
+
+        String reason() {
+            return reason;
+        }
+    }
+
+    /**
+     * Parse and validate a manifest against the expected (table uuid, snapshot). Returns a refusal -- and logs the
+     * reason -- for anything that must keep the ordinary scan: an unknown version, another table or snapshot,
+     * a duplicate file name, or any malformed posting. A refusal is never cached.
+     */
+    static ParseResult parseManifest(String json, String expectUuid, long expectSnapshot) {
         try {
             // Gson's object model otherwise silently keeps the last duplicate posting field.
             try (JsonReader reader = new JsonReader(new StringReader(json))) {
@@ -278,113 +450,162 @@ public class RapCoverage {
             int version = m.has("version") ? m.get("version").getAsBigDecimal().intValueExact() : -1;
             if (version != VERSION && version != TYPED_VERSION && version != RANGED_VERSION) {
                 LOG.warn("RAP manifest version unsupported -- ordinary scan");
-                return disabled(expectSnapshot, REASON_UNSUPPORTED_VERSION);
+                return ParseResult.refused(REASON_UNSUPPORTED_VERSION);
             }
             // v3 is v2 plus row ranges: the same typed keys, key type, field id and NULL postings decide
             // elimination, and only the extra `ranges` section decides whether plan-time hints are emitted.
-            boolean typed = version == TYPED_VERSION || version == RANGED_VERSION;
+            boolean typedManifest = version == TYPED_VERSION || version == RANGED_VERSION;
             if (!m.has("snapshot_id") || m.get("snapshot_id").getAsLong() != expectSnapshot) {
                 LOG.warn("RAP manifest is for snapshot {} not {} -- ordinary scan",
                         m.has("snapshot_id") ? m.get("snapshot_id").getAsString() : "?", expectSnapshot);
-                return disabled(expectSnapshot, REASON_OTHER_SNAPSHOT);
+                return ParseResult.refused(REASON_OTHER_SNAPSHOT);
             }
             // astra CX-29: the table identity is REQUIRED, not optional -- a manifest that does not declare
             // its table, or declares another one, never activates
             if (!m.has("table_uuid") || m.get("table_uuid").isJsonNull() || m.get("table_uuid").getAsString().isEmpty()) {
                 LOG.warn("RAP manifest declares no table_uuid -- ordinary scan");
-                return disabled(expectSnapshot, REASON_NO_TABLE_UUID);
+                return ParseResult.refused(REASON_NO_TABLE_UUID);
             }
             if (expectUuid == null || !expectUuid.equals(m.get("table_uuid").getAsString())) {
                 LOG.warn("RAP manifest is for table {} not {} -- ordinary scan", m.get("table_uuid").getAsString(), expectUuid);
-                return disabled(expectSnapshot, REASON_OTHER_TABLE);
+                return ParseResult.refused(REASON_OTHER_TABLE);
             }
             String column = m.get("column").getAsString();
-            Set<Integer> typedCandidates = typed ? typedCandidates(m, predicate, column) : null;
-            List<String> literals = version == VERSION ? extractLiterals(predicate, column) : null;
+            Typed typed = typedManifest ? typedPostings(m) : null;
             boolean hasPostings = m.has("postings") && m.get("postings").isJsonObject();
-            RapCoverage c = new RapCoverage(true, expectSnapshot, column, hasPostings,
-                    typed ? typedCandidates != null : literals != null);
-            // Active is not the same as useful: say which of the two it is, at load time, so EXPLAIN can render it.
-            c.reason = !hasPostings ? REASON_NO_POSTINGS : (c.predicateUsable ? REASON_OK : REASON_PREDICATE_NOT_BOUND);
-            if (typed) {
-                c.manifestKeyType = m.get("key_type").getAsBigDecimal().intValueExact();
-                c.manifestFieldId = m.get("field_id").getAsBigDecimal().intValueExact();
-                if (c.manifestFieldId <= 0) {
-                    return disabled(expectSnapshot, REASON_MALFORMED);
+            int keyType = 0;
+            int fieldId = -1;
+            if (typedManifest) {
+                keyType = typed.keyType;
+                fieldId = m.get("field_id").getAsBigDecimal().intValueExact();
+                if (fieldId <= 0) {
+                    return ParseResult.refused(REASON_MALFORMED);
                 }
             }
             JsonArray files = m.getAsJsonArray("files");
             List<String> names = new ArrayList<>();
+            Map<String, Covered> covered = new HashMap<>();
             for (JsonElement e : files) {
                 JsonObject f = e.getAsJsonObject();
                 String name = f.get("name").getAsString();
-                if (c.files.containsKey(name)) {
-                    return disabled(expectSnapshot, REASON_MALFORMED);
+                if (covered.containsKey(name)) {
+                    return ParseResult.refused(REASON_MALFORMED);
                 }
                 names.add(name);
-                c.files.put(name, new Covered(f.get("size").getAsLong(), f.get("rows").getAsLong()));
+                covered.put(name, new Covered(f.get("size").getAsLong(), f.get("rows").getAsLong()));
             }
+            Map<String, int[]> v1Postings = null;
             if (hasPostings) {
                 // astra CX-29: EVERY posting is validated before the manifest may eliminate anything -- an
                 // index outside `files`, a non-integer, a non-array or an empty list is a malformed manifest,
                 // and a malformed manifest keeps every file (never "ignore the bad entry and drop the rest")
                 JsonObject postings = m.getAsJsonObject("postings");
+                if (version == VERSION) {
+                    v1Postings = new HashMap<>();
+                }
                 for (Map.Entry<String, JsonElement> e : postings.entrySet()) {
                     if (!e.getValue().isJsonArray() || e.getValue().getAsJsonArray().size() == 0) {
                         LOG.warn("RAP manifest posting for a value is not a non-empty array -- ordinary scan");
-                        return disabled(expectSnapshot, REASON_MALFORMED);
+                        return ParseResult.refused(REASON_MALFORMED);
                     }
-                    for (JsonElement idx : e.getValue().getAsJsonArray()) {
+                    JsonArray entries = e.getValue().getAsJsonArray();
+                    int[] decoded = v1Postings == null ? null : new int[entries.size()];
+                    int at = 0;
+                    for (JsonElement idx : entries) {
                         // astra CX-29 (second round): Gson's getAsInt() NARROWS -- 0.5, -0.5 and 4294967296 all
                         // become 0 and would pass a post-narrowing bounds check. Integrality and range are decided
                         // on the exact decimal value BEFORE any narrowing.
                         if (!idx.isJsonPrimitive() || !idx.getAsJsonPrimitive().isNumber()) {
                             LOG.warn("RAP manifest posting index is not a number -- ordinary scan");
-                            return disabled(expectSnapshot, REASON_MALFORMED);
+                            return ParseResult.refused(REASON_MALFORMED);
                         }
                         java.math.BigDecimal exact;
                         try {
                             exact = idx.getAsJsonPrimitive().getAsBigDecimal();
                         } catch (NumberFormatException nfe) {
                             LOG.warn("RAP manifest posting index is not a decimal number -- ordinary scan");
-                            return disabled(expectSnapshot, REASON_MALFORMED);
+                            return ParseResult.refused(REASON_MALFORMED);
                         }
                         if (exact.stripTrailingZeros().scale() > 0) {
                             LOG.warn("RAP manifest posting index {} is not an integer -- ordinary scan", exact);
-                            return disabled(expectSnapshot, REASON_MALFORMED);
+                            return ParseResult.refused(REASON_MALFORMED);
                         }
                         if (exact.signum() < 0 || exact.compareTo(java.math.BigDecimal.valueOf(names.size() - 1)) > 0) {
                             LOG.warn("RAP manifest posting index {} outside its {} files -- ordinary scan", exact, names.size());
-                            return disabled(expectSnapshot, REASON_MALFORMED);
+                            return ParseResult.refused(REASON_MALFORMED);
+                        }
+                        if (decoded != null) {
+                            decoded[at++] = exact.intValueExact();
                         }
                     }
+                    if (decoded != null) {
+                        v1Postings.put(e.getKey(), decoded);
+                    }
                 }
-                if (literals != null) {
+            }
+            // R7 under slice 5: the `ranges` section is validated HERE, with the rest of the document, because
+            // nothing about it depends on the query. It never throws and never changes an elimination decision: a
+            // defect leaves `ranged` null and records the reason, which is what every plan bound from it reports.
+            Ranged ranges = version == RANGED_VERSION && hasPostings
+                    ? parseRanges(m, names, covered, expectSnapshot)
+                    : Ranged.refused(HINTS_NO_POSTINGS);
+            return ParseResult.of(new Parsed(version, expectSnapshot, column, keyType, fieldId, hasPostings,
+                    names.toArray(new String[0]), Collections.unmodifiableMap(covered),
+                    v1Postings == null ? null : Collections.unmodifiableMap(v1Postings), typed,
+                    ranges.ranged, ranges.nullRanges, ranges.reason));
+        } catch (Exception e) {
+            LOG.warn("RAP manifest malformed ({}) -- ordinary scan", e.getClass().getSimpleName());
+            return ParseResult.refused(REASON_MALFORMED);
+        }
+    }
+
+    /**
+     * Slice 5: bind a parsed manifest to ONE plan's predicate. This is all a cached manifest costs per plan --
+     * the literals of the query looked up in the postings, the matching file keys collected, and (v3) the row
+     * ranges those literals select out of the already-validated `ranges`. Everything else was established once
+     * in {@link #parseManifest}.
+     */
+    static RapCoverage bind(Parsed p, ScalarOperator predicate) {
+        try {
+            Set<Integer> typedCandidates = p.version == VERSION ? null
+                    : RapManifestPredicate.matching(predicate, p.column, p.typed.keyType, p.typed.postings,
+                            p.typed.nullFiles);
+            List<String> literals = p.version == VERSION ? extractLiterals(predicate, p.column) : null;
+            RapCoverage c = new RapCoverage(true, p.snapshotId, p.column, p.hasPostings,
+                    p.version == VERSION ? literals != null : typedCandidates != null);
+            // Active is not the same as useful: say which of the two it is, at load time, so EXPLAIN can render it.
+            c.reason = !p.hasPostings ? REASON_NO_POSTINGS : (c.predicateUsable ? REASON_OK : REASON_PREDICATE_NOT_BOUND);
+            c.manifestKeyType = p.keyType;
+            c.manifestFieldId = p.fieldId;
+            c.files = p.files;
+            if (p.hasPostings) {
+                if (literals != null && p.postings != null) {
                     for (String lit : literals) {
-                        if (!postings.has(lit)) {
+                        int[] indices = p.postings.get(lit);
+                        if (indices == null) {
                             continue;
                         }
-                        for (JsonElement idx : postings.getAsJsonArray(lit)) {
-                            // every index was proven an exact integer within [0, files) above
-                            c.matching.add(names.get(idx.getAsJsonPrimitive().getAsBigDecimal().intValueExact()));
+                        for (int index : indices) {
+                            // every index was proven an exact integer within [0, files) at parse time
+                            c.matching.add(p.names[index]);
                         }
                     }
                 }
                 if (typedCandidates != null) {
                     for (int index : typedCandidates) {
-                        c.matching.add(names.get(index));
+                        c.matching.add(p.names[index]);
                     }
                 }
             }
-            if (version == RANGED_VERSION) {
+            if (p.version == RANGED_VERSION) {
                 // R7: never throws, never changes an elimination decision -- it only decides whether this plan
                 // may also ship row ranges, and records why when it may not.
-                c.bindRowRanges(m, names, predicate, typedCandidates);
+                c.bindRowRanges(p, predicate, typedCandidates);
             }
             return c;
         } catch (Exception e) {
             LOG.warn("RAP manifest malformed ({}) -- ordinary scan", e.getClass().getSimpleName());
-            return disabled(expectSnapshot, REASON_MALFORMED);
+            return disabled(p.snapshotId, REASON_MALFORMED);
         }
     }
 
@@ -430,7 +651,12 @@ public class RapCoverage {
         return out;
     }
 
-    private static Set<Integer> typedCandidates(JsonObject manifest, ScalarOperator predicate, String column) {
+    /**
+     * The predicate-INDEPENDENT half of what a typed (v2 / v3) manifest needs: the key type, and every posting key
+     * and file-index set validated. The predicate is applied later, in {@link #bind}, so this survives in the
+     * cache across plans. Throws for anything unusable, which {@link #parseManifest} turns into "ordinary scan".
+     */
+    private static Typed typedPostings(JsonObject manifest) {
         int type = manifest.get("key_type").getAsBigDecimal().intValueExact();
         if (type < 1 || type > 5 || !"hex".equals(manifest.get("key_encoding").getAsString())) {
             throw new IllegalArgumentException("unsupported RAP typed manifest");
@@ -441,8 +667,7 @@ public class RapCoverage {
             RapManifestPredicate.validateKey(entry.getKey(), type);
             postings.put(entry.getKey(), fileIndices(entry.getValue(), size, false));
         }
-        Set<Integer> nullFiles = fileIndices(manifest.get("null_postings"), size, true);
-        return RapManifestPredicate.matching(predicate, column, type, postings, nullFiles);
+        return new Typed(type, postings, fileIndices(manifest.get("null_postings"), size, true));
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -453,17 +678,40 @@ public class RapCoverage {
     // exactly as it is today. So every failure here -- a missing section, a malformed range, a predicate shape the
     // range index cannot answer, a disagreement with the elimination candidates -- turns the hints off and leaves
     // the scan correct and complete, with the reason recorded.
+    //
+    // Slice 5 splits this work the way the rest of the manifest is split: the SECTION is parsed and validated once,
+    // in `parseRanges` (nothing about it depends on the query, so a cache hit re-parses none of it), and only the
+    // SELECTION -- which of those ranges this plan's literals choose -- happens per plan, in `bindRowRanges`.
     // ---------------------------------------------------------------------------------------------------------
 
-    private void bindRowRanges(JsonObject m, List<String> names, ScalarOperator predicate, Set<Integer> candidates) {
-        if (!Config.rap_plan_row_range_hints) {
-            hintReason = "disabled by rap_plan_row_range_hints";
-            return;
+    /** The validated `ranges` / `null_ranges` sections, or the reason they were refused. Immutable, and cached. */
+    private static final class Ranged {
+        private final NavigableMap<String, Map<Integer, long[][]>> ranged;
+        private final Map<Integer, long[][]> nullRanges;
+        private final String reason;
+
+        private Ranged(NavigableMap<String, Map<Integer, long[][]>> ranged, Map<Integer, long[][]> nullRanges,
+                       String reason) {
+            this.ranged = ranged;
+            this.nullRanges = nullRanges;
+            this.reason = reason;
         }
-        if (!hasPostings || !predicateUsable || candidates == null) {
-            hintReason = "no usable postings for this predicate";
-            return;
+
+        static Ranged of(NavigableMap<String, Map<Integer, long[][]>> ranged, Map<Integer, long[][]> nullRanges) {
+            return new Ranged(ranged, nullRanges, "");
         }
+
+        static Ranged refused(String reason) {
+            return new Ranged(null, null, reason);
+        }
+    }
+
+    /**
+     * Validate a v3 manifest's `ranges` and `null_ranges` against the postings they must agree with. Never throws:
+     * a defect returns a refusal carrying the reason, which is cached with the parse and reported by every plan
+     * bound from it. This runs ONCE per manifest, not once per plan.
+     */
+    private static Ranged parseRanges(JsonObject m, List<String> names, Map<String, Covered> covered, long snapshot) {
         try {
             JsonObject postings = m.getAsJsonObject("postings");
             if (!m.has("ranges") || !m.get("ranges").isJsonObject()) {
@@ -479,16 +727,44 @@ public class RapCoverage {
                 if (byFile == null || !byFile.isJsonObject()) {
                     throw new IllegalArgumentException("a posting value has no ranges object");
                 }
-                ranged.put(entry.getKey(), perFileRanges(byFile.getAsJsonObject(), ordinalsOf(entry.getValue()), names));
+                ranged.put(entry.getKey(), Collections.unmodifiableMap(
+                        perFileRanges(byFile.getAsJsonObject(), ordinalsOf(entry.getValue()), names, covered)));
             }
             if (!m.has("null_ranges") || !m.get("null_ranges").isJsonObject()) {
                 throw new IllegalArgumentException("v3 manifest without a null_ranges object");
             }
             Map<Integer, long[][]> nullRanges = perFileRanges(m.getAsJsonObject("null_ranges"),
-                    ordinalsOf(m.get("null_postings")), names);
+                    ordinalsOf(m.get("null_postings")), names, covered);
+            return Ranged.of(Collections.unmodifiableNavigableMap(ranged), Collections.unmodifiableMap(nullRanges));
+        } catch (Exception e) {
+            String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            LOG.warn("RAP manifest for snapshot {} carries no usable row ranges ({}) -- files are still eliminated, "
+                    + "and scheduled files are narrowed by the backend sidecar as before", snapshot, reason);
+            return Ranged.refused(reason);
+        }
+    }
 
+    /**
+     * Select this plan's row ranges out of the manifest's already-validated ones. Predicate-dependent, so it runs
+     * per plan; everything it reads was established once, at parse time, and is shared read-only.
+     */
+    private void bindRowRanges(Parsed p, ScalarOperator predicate, Set<Integer> candidates) {
+        if (!Config.rap_plan_row_range_hints) {
+            // a mutable config, so it is honoured per plan and never baked into the cached parse
+            hintReason = "disabled by rap_plan_row_range_hints";
+            return;
+        }
+        if (!hasPostings || !predicateUsable || candidates == null) {
+            hintReason = HINTS_NO_POSTINGS;
+            return;
+        }
+        if (p.ranged == null) {
+            hintReason = p.rangeReason;   // the parse-time defect, decided once and cached with the manifest
+            return;
+        }
+        try {
             Map<Integer, long[][]> selected =
-                    RapManifestPredicate.matchingRanges(predicate, column, manifestKeyType, ranged, nullRanges);
+                    RapManifestPredicate.matchingRanges(predicate, p.column, p.keyType, p.ranged, p.nullRanges);
             if (selected == null) {
                 throw new IllegalArgumentException("predicate shape carries no row ranges");
             }
@@ -502,7 +778,7 @@ public class RapCoverage {
                 // A zero-length intersection means the conjunction matches no row of that file. The posting rule
                 // still schedules it (it is in M), so emit no hint and let the ordinary scan settle it.
                 if (entry.getValue().length > 0) {
-                    hintRanges.put(names.get(entry.getKey()), entry.getValue());
+                    hintRanges.put(p.names[entry.getKey()], entry.getValue());
                 }
             }
             hintsUsable = true;
@@ -532,7 +808,8 @@ public class RapCoverage {
      * {@code {"<file ordinal>": [[start, end), ...]}} for one posting value, validated against the file ordinals the
      * posting itself declares. Throws on any defect; the caller turns hints off and keeps the scan complete.
      */
-    private Map<Integer, long[][]> perFileRanges(JsonObject byFile, Set<Integer> expected, List<String> names) {
+    private static Map<Integer, long[][]> perFileRanges(JsonObject byFile, Set<Integer> expected, List<String> names,
+                                                        Map<String, Covered> covered) {
         Map<Integer, long[][]> out = new HashMap<>();
         for (Map.Entry<String, JsonElement> entry : byFile.entrySet()) {
             int ordinal;
@@ -544,7 +821,7 @@ public class RapCoverage {
             if (ordinal < 0 || ordinal >= names.size()) {
                 throw new IllegalArgumentException("range file ordinal outside the manifest files");
             }
-            Covered file = files.get(names.get(ordinal));
+            Covered file = covered.get(names.get(ordinal));
             if (file == null) {
                 throw new IllegalArgumentException("range file ordinal names no covered file");
             }
@@ -755,23 +1032,30 @@ public class RapCoverage {
     }
 
     /**
-     * The plan line. {@code state}, {@code snapshot}, {@code column}, {@code postings}, {@code reason} and
-     * {@code hints} describe the manifest that was LOADED and are real here. The four counters are incremented
-     * later, by {@code decide} during scheduling, so they are structurally zero at render time and always have
-     * been -- see fe-coverage-counters-are-always-zero.md; they are kept because runners parse them, and the
-     * fields that answer "did the manifest do anything" are {@code reason} and, in the query profile,
-     * {@code ScanRanges}. The two new fields are APPENDED so those runners' patterns still match.
+     * The plan line. {@code state}, {@code snapshot}, {@code column}, {@code postings}, {@code reason},
+     * {@code hints} and {@code cache} describe the manifest that was LOADED and are real here. The four counters
+     * are incremented later, by {@code decide} during scheduling, so they are structurally zero at render time and
+     * always have been -- see fe-coverage-counters-are-always-zero.md; they are kept because runners parse them,
+     * and the fields that answer "did the manifest do anything" are {@code reason} and, in the query profile,
+     * {@code ScanRanges}. The new fields are APPENDED so those runners' patterns still match, and {@code cache} is
+     * appended LAST: every retained parser of this line matches its fields by name from the front, and
+     * harness/visibility_check.py reads {@code cache=} as the trailing field.
      */
     public String explain() {
         return String.format("RAP MANIFEST: %s snapshot=%d column=%s postings=%s consulted=%d covered=%d "
-                        + "identity_mismatch=%d dropped=%d reason=%s hints=%s",
+                        + "identity_mismatch=%d dropped=%d reason=%s hints=%s cache=%s",
                 active ? "active" : "off", snapshotId, column, hasPostings ? "yes" : "no",
-                consulted, covered, identityMismatch, dropped, reason, hintsUsable ? "yes" : "no");
+                consulted, covered, identityMismatch, dropped, reason, hintsUsable ? "yes" : "no", cache);
     }
 
     /** Why this plan fell back, or {@link #REASON_OK}. Decided at load time, so it is real when EXPLAIN renders. */
     public String getReason() {
         return reason;
+    }
+
+    /** Which path served this plan's manifest: none, disabled, miss, hit or refresh. */
+    public String getCache() {
+        return cache;
     }
 
     public int getConsulted() {

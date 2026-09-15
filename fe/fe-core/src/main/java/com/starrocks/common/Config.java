@@ -114,6 +114,26 @@ public class Config extends ConfigBase {
     // returns the scheduled files to the backend sidecar consult. Inert without a v3 manifest under rap_manifest_dir.
     @ConfField(mutable = true)
     public static boolean rap_plan_row_range_hints = true;
+    // RAP slice 5: how many PARSED manifests the frontend keeps between plans (RapManifestCache). 0 turns the cache
+    // off and drops what it holds, which is exactly the behaviour before the cache existed: read and parse per plan.
+    @ConfField(mutable = true)
+    public static int rap_manifest_cache_capacity = 8;
+    // RAP slice 5: total manifest SOURCE bytes the cache may hold; least-recently-used out above it. The parsed form
+    // is of the same order as the JSON when postings are kept as int arrays, so this bounds both.
+    @ConfField(mutable = true)
+    public static long rap_manifest_cache_max_bytes = 64L * 1024 * 1024;
+    // RAP slice 5: how long a cached manifest may be reused with NO probe of the object at all. 0 -- the default --
+    // means every plan probes (exists + getLength, the calls the loader already made) and reuses the parse only while
+    // the stamp is unchanged, which is what keeps a same-snapshot republish visible on the very next plan (C5).
+    // Above 0 the frontend may serve a manifest that was republished inside the window: set it only where no
+    // in-place same-snapshot publication can land inside the window, or where the publisher bumps
+    // rap_manifest_generation after publishing.
+    @ConfField(mutable = true)
+    public static long rap_manifest_cache_ttl_ms = 0;
+    // RAP slice 5: bump to invalidate every cached manifest with no round trip, the frontend mirror of the backend's
+    // rap_index_generation. This is the only invalidation the publication path can drive, and nothing drives it today.
+    @ConfField(mutable = true)
+    public static long rap_manifest_generation = 0;
     @ConfField
     public static String sys_log_level = "INFO";
     @ConfField

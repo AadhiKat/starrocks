@@ -63,22 +63,28 @@ int64_t ColumnOffsetIndexCtx::selected_page_bytes() const {
 //     FormatScannerStats::page_header_direct_read_count.
 //
 // Both are addressed here rather than in the stream: merge selected pages whose gap is within
-// opts.merge_max_distance into a single range, and extend each emitted range by opts.header_peek_size,
-// clamped to opts.chunk_end and to the start of the next range so the result can never overlap.
-// With the default options object neither applies and the emitted ranges are exactly the old ones.
+// opts.merge_max_distance into a single range, and extend each emitted range far enough that a peek
+// taken at the START of the run's LAST page is contained, clamped to opts.chunk_end and to the start
+// of the next range so the result can never overlap. With the default options object neither applies
+// and the emitted ranges are exactly the old ones.
 //
-// The trade the padding makes is explicit: at most opts.header_peek_size extra bytes per emitted run,
-// fetched inside a request that is already being made, in exchange for removing a whole extra remote
-// round trip whose bytes were going to be discarded anyway. Bytes are the cheap side of that trade on
-// remote storage and the harness retains both (RequestBytesRead / SharedIOBytes against FSIOCounter),
-// so the exchange rate stays measurable rather than assumed.
+// The trade the padding makes is explicit, and it is smaller than it first looks. PageReader clamps
+// its own peek to the chunk end, so the extra bytes are at most
+// min(header_peek_size, chunk_end - last_page_offset) - last_page_size, and they are ZERO whenever the
+// last page of the run is already at least header_peek_size long. What is left is bytes the
+// direct-read fallback was going to fetch and throw away anyway; they are now fetched inside a request
+// that is already being made, one remote round trip cheaper. Bytes are the cheap side of that trade on
+// remote storage and the harness retains both sides (RequestBytesRead / SharedIOBytes against
+// FSIOCounter and PageHeaderDirectReadCounter), so the exchange rate stays measurable, not assumed.
 void ColumnOffsetIndexCtx::collect_io_range(std::vector<SharedBufferedInputStream::IORange>* ranges,
                                             int64_t* end_offset, bool active, const PageIORangeOptions& opts) {
     const auto& page_locations = offset_index.page_locations;
 
-    // The run currently open, [run_offset, run_end). run_offset < 0 means there is none.
+    // The run currently open, [run_offset, run_end), and the start offset of the last page added to
+    // it -- which is where the page-header peek that has to stay contained is taken from.
     int64_t run_offset = -1;
     int64_t run_end = -1;
+    int64_t run_last_offset = -1;
 
     // Close the open run. `next_offset` is where the range emitted AFTER this one will start, or -1
     // when there is none; padding is never allowed to grow into it, because
@@ -89,11 +95,10 @@ void ColumnOffsetIndexCtx::collect_io_range(std::vector<SharedBufferedInputStrea
             return;
         }
         int64_t end = run_end;
-        if (opts.header_peek_size > 0) {
-            end = run_end + opts.header_peek_size;
-            if (opts.chunk_end > 0) {
-                end = std::min(end, opts.chunk_end);
-            }
+        if (opts.header_peek_size > 0 && opts.chunk_end > 0) {
+            // PageReader asks for min(header_peek_size, chunk_end - page_offset) at the last page's
+            // start, so covering exactly that is both necessary and sufficient.
+            end = std::max(end, std::min(run_last_offset + opts.header_peek_size, opts.chunk_end));
             if (next_offset >= 0) {
                 end = std::min(end, next_offset);
             }
@@ -107,17 +112,20 @@ void ColumnOffsetIndexCtx::collect_io_range(std::vector<SharedBufferedInputStrea
         }
         run_offset = -1;
         run_end = -1;
+        run_last_offset = -1;
     };
 
-    auto add_range = [&](int64_t offset, int64_t size) {
+    auto add_page = [&](int64_t offset, int64_t size) {
         const int64_t end = offset + size;
         if (run_offset < 0) {
             run_offset = offset;
             run_end = end;
+            run_last_offset = offset;
             return;
         }
         if ((offset - run_end) <= opts.merge_max_distance && (end - run_offset) <= opts.merge_max_span) {
             run_end = std::max(run_end, end);
+            run_last_offset = offset;
             if (opts.merged_pages != nullptr) {
                 *opts.merged_pages += 1;
             }
@@ -126,16 +134,12 @@ void ColumnOffsetIndexCtx::collect_io_range(std::vector<SharedBufferedInputStrea
         flush_run(offset);
         run_offset = offset;
         run_end = end;
+        run_last_offset = offset;
     };
 
-    // The dictionary page, when the caller passes it, takes part in run merging so that its own
-    // header peek is covered by the same padding rule.
-    if (opts.lead_offset >= 0) {
-        add_range(opts.lead_offset, opts.lead_size);
-    }
     for (size_t i = 0; i < page_selected.size(); i++) {
         if (page_selected[i]) {
-            add_range(page_locations[i].offset, page_locations[i].compressed_page_size);
+            add_page(page_locations[i].offset, page_locations[i].compressed_page_size);
         }
     }
     flush_run(-1);

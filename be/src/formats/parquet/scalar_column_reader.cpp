@@ -91,11 +91,15 @@ void RawColumnReader::collect_column_io_range(std::vector<SharedBufferedInputStr
             }
         }
         if (has_page_selection && !dense_selection) {
-            // Per-selected-page registration. The dictionary page is handed to collect_io_range() as
-            // the leading range instead of being emitted here, so that it takes part in run merging
-            // and gets the same header padding as the data pages: StoredColumnReaderWithIndex calls
-            // load_dictionary_page() before the first data page, and that read parses a page header
-            // through the very same fixed-size peek.
+            // add dict page
+            if (column_metadata.__isset.dictionary_page_offset) {
+                auto r = SharedBufferedInputStream::IORange(
+                        column_metadata.dictionary_page_offset,
+                        column_metadata.data_page_offset - column_metadata.dictionary_page_offset, active);
+                ranges->emplace_back(r);
+                *end_offset = std::max(*end_offset, r.offset + r.size);
+            }
+
             const int64_t chunk_start = column_metadata.__isset.dictionary_page_offset
                                                 ? column_metadata.dictionary_page_offset
                                                 : column_metadata.data_page_offset;
@@ -114,10 +118,12 @@ void RawColumnReader::collect_column_io_range(std::vector<SharedBufferedInputStr
             // when the GroupReader is destroyed) and saves the round trips between them.
             opts.merge_max_distance = config::io_coalesce_read_max_distance_size;
             opts.header_peek_size = kDefaultPageHeaderSize;
-            if (column_metadata.__isset.dictionary_page_offset) {
-                opts.lead_offset = column_metadata.dictionary_page_offset;
-                opts.lead_size = column_metadata.data_page_offset - column_metadata.dictionary_page_offset;
-            }
+            // The dictionary-page range above is deliberately NOT part of the merge. Folding it in
+            // would make every run start at dictionary_page_offset, and on a chunk whose dictionary is
+            // most of its bytes the padded run then reaches the chunk end -- turning a selective read
+            // into a whole-chunk read without the coverage guard ever being consulted. Its own header
+            // peek is unaffected by this change: a dictionary range shorter than the peek was already
+            // relying on the stream coalescing it with the following pages, exactly as before.
             if (_opts.stats != nullptr) {
                 opts.emitted_ranges = &_opts.stats->page_io_range_count;
                 opts.merged_pages = &_opts.stats->page_io_range_merged;

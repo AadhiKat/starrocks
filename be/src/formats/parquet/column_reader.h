@@ -77,18 +77,20 @@ struct PageIORangeOptions {
     // and the emitted ranges describe exactly the buffers the stream would have built anyway, so the
     // set of bytes fetched does not change -- only the number of range entries, and the padding below.
     int64_t merge_max_distance = -1;
-    // A run is closed when it would grow past this many bytes from its own start. Mirrors
-    // _merge_small_ranges()'s io_coalesce_read_max_buffer_size span bound for the same reason.
+    // A run is closed when it would grow past this many bytes from its own start, the same shape as
+    // _merge_small_ranges()'s io_coalesce_read_max_buffer_size span bound. Unbounded by default and
+    // left unbounded by the production caller on purpose -- splitting a run at 8 MB would re-create
+    // the buffer boundary the padding exists to remove, and _set_io_ranges_all_columns() already
+    // gives an oversized range its own dedicated SharedBuffer. Present for tests and for a future
+    // caller that needs the bound.
     int64_t merge_max_span = std::numeric_limits<int64_t>::max();
-    // Head-room appended to the END of every emitted range, clamped to chunk_end, so that
-    // PageReader's fixed-size page-header peek at the last page of the run still lands inside the
-    // registered buffer instead of falling through to an unbuffered remote read. Pass
-    // parquet::kDefaultPageHeaderSize.
+    // Size of PageReader's fixed-size page-header peek. Each emitted range is extended, when needed,
+    // so that a peek taken at the START of the run's LAST page still lands inside the registered
+    // buffer instead of falling through to an unbuffered remote read. Measuring from the last page's
+    // start rather than from the run end is what keeps this from over-reading: when that page is
+    // already larger than the peek -- the common case for a StarRocks-written 1 MB page -- nothing is
+    // added at all. Requires chunk_end; pass parquet::kDefaultPageHeaderSize.
     int64_t header_peek_size = 0;
-    // Optional leading range (the dictionary page) that takes part in run merging, so the dictionary
-    // page header's own peek gets padded by the same rule. Negative means "no dictionary range".
-    int64_t lead_offset = -1;
-    int64_t lead_size = 0;
     // Optional counters; see FormatScannerStats::page_io_range_count / page_io_range_merged.
     int64_t* emitted_ranges = nullptr;
     int64_t* merged_pages = nullptr;

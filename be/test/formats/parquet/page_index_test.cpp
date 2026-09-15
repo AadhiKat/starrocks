@@ -19,18 +19,23 @@
 #include <random>
 #include <vector>
 
+#include "base/utility/defer_op.h"
 #include "cache/scan/shared_buffered_input_stream.h"
 #include "column/column_helper.h"
 #include "common/config_exec_fwd.h"
+#include "common/config_scan_io_fwd.h"
 #include "compute_env/global_dict/fragment_dict_state.h"
 #include "connector/hive/scanner/hdfs_scanner.h"
 #include "exec/exec_env.h"
 #include "exprs/binary_predicate.h"
+#include "formats/parquet/column_reader.h"
 #include "formats/parquet/file_reader.h"
 #include "formats/parquet/group_reader.h"
+#include "formats/parquet/page_reader.h"
 #include "formats/parquet/parquet_test_util/util.h"
 #include "formats/parquet/parquet_ut_base.h"
 #include "fs/fs.h"
+#include "gen_cpp/parquet_types.h"
 #include "runtime/runtime_state.h"
 
 namespace starrocks::parquet {
@@ -569,8 +574,65 @@ TEST_F(PageIndexTest, TestBuildRowRangeHintsConversion) {
     EXPECT_TRUE(out.empty());
 }
 
+// ---------------------------------------------------------------------------------------------
+// page_index_small_page.parquet, row group 0, column c0, predicate 5500 < c0 < 7500.
+// Everything asserted below was read out of the file itself, not assumed:
+//
+//   chunk        dictionary_page_offset 4, data_page_offset 40069, total_compressed_size 56040
+//                => dictionary range [4, 40069) = 40065 bytes, chunk = [4, 56044)
+//   offset index 10 pages of 1000 rows each:
+//                  0: 40069/1285   1: 41354/1410   2: 42764/1535   3: 44299/1535   4: 45834/1660
+//                  5: 47494/1660   6: 49154/1660   7: 50814/1660   8: 52474/1785   9: 54259/1785
+//   selected     pages 5, 6, 7 (rows 5000..7999), contiguous, 3 x 1660 = 4980 bytes
+//   coverage     (40065 + 4980) / 56040 = 0.8038
+// ---------------------------------------------------------------------------------------------
+namespace {
+constexpr int64_t kC0ChunkStart = 4;
+constexpr int64_t kC0DataPageOffset = 40069;
+constexpr int64_t kC0ChunkCompressedSize = 56040;
+constexpr int64_t kC0ChunkEnd = kC0ChunkStart + kC0ChunkCompressedSize; // 56044
+constexpr int64_t kC0DictSize = kC0DataPageOffset - kC0ChunkStart;      // 40065
+constexpr int64_t kC0SelectedPageBytes = 3 * 1660;                      // 4980
+constexpr double kC0Coverage = static_cast<double>(kC0DictSize + kC0SelectedPageBytes) /
+                               static_cast<double>(kC0ChunkCompressedSize); // 0.8038
+// Pages 5..7 are contiguous, so they merge into one run [47494, 52474). Padding then covers the
+// page-header peek taken at page 7's start: min(50814 + 16384, 56044) = 56044, i.e. the chunk end.
+constexpr int64_t kC0MergedRunOffset = 47494;
+constexpr int64_t kC0MergedRunSize = kC0ChunkEnd - kC0MergedRunOffset; // 8550
+} // namespace
+
 TEST_F(PageIndexTest, TestCollectIORangeWithPageIndex) {
-    auto test = [&]() {
+    // What this test asserted BEFORE range-run merging and header padding existed. Kept verbatim so
+    // that the change is visible in the diff rather than silently rewritten, and used below as a
+    // negative case: the three per-page ranges and this end_offset must no longer be produced. The
+    // dictionary range is listed for completeness and is deliberately still expected.
+    const std::vector<std::pair<int64_t, int64_t>> kHistoricalUnmergedRanges = {
+            {kC0ChunkStart, kC0DictSize}, // dict page, emitted on its own
+            {47494, 1660},                // page 5, no padding
+            {49154, 1660},                // page 6
+            {50814, 1660},                // page 7, range stops dead at the last selected byte
+    };
+    const int64_t kHistoricalEndOffset = 52474;
+
+    struct Observed {
+        std::vector<SharedBufferedInputStream::IORange> ranges;
+        int64_t end_offset = 0;
+        int64_t io_range_count = 0;
+        int64_t io_range_merged = 0;
+        int64_t whole_chunk_fallback = 0;
+        size_t rows = 0;
+        std::vector<int32_t> values;
+    };
+
+    // One full read of the file at a given coverage threshold, returning both the registered ranges
+    // and the rows actually decoded. The rows are the point: whatever the reader decides to FETCH,
+    // it must decode exactly the rows the predicate selects.
+    auto run = [&](double min_coverage) {
+        const double saved_coverage = config::parquet_page_select_min_coverage;
+        config::parquet_page_select_min_coverage = min_coverage;
+        DeferOp restore([&]() { config::parquet_page_select_min_coverage = saved_coverage; });
+
+        Observed obs;
         auto chunk = std::make_shared<Chunk>();
         chunk->append_column(
                 ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_INT), true),
@@ -617,42 +679,331 @@ TEST_F(PageIndexTest, TestCollectIORangeWithPageIndex) {
                                                         std::filesystem::file_size(small_page_file));
 
         Status status = file_reader->init(&ctx->format_scan_context);
-        ASSERT_TRUE(status.ok());
+        EXPECT_TRUE(status.ok()) << status.message();
 
         // two row groups, but one is filtered.
         EXPECT_EQ(file_reader->_row_group_readers.size(), 1);
-        std::vector<SharedBufferedInputStream::IORange> ranges;
-        int64_t end_offset = 0;
 
-        file_reader->_row_group_readers[0]->collect_io_ranges(&ranges, &end_offset, ColumnIOType::PAGE_INDEX);
-        // collect io of column index and offset index for active column.
-        EXPECT_EQ(ranges.size(), 2);
-        // offset_index_offset = 293436, offset_index_length = 113, column_index_offset = 291196, column_index_length = 211
-        EXPECT_EQ(ranges[1].offset, 293436);
-        EXPECT_EQ(ranges[1].size, 113);
+        // The range-registration counters are cumulative on a shared FormatScannerStats, and init()
+        // has already run prepare() on group 0 -- which registers ranges through this same code. So
+        // the baseline goes HERE, around the explicit call, or every number would be doubled.
+        const int64_t base_count = ctx->format_scan_context.stats->page_io_range_count;
+        const int64_t base_merged = ctx->format_scan_context.stats->page_io_range_merged;
+        const int64_t base_fallback = ctx->format_scan_context.stats->page_whole_chunk_fallback;
 
-        ranges.clear();
-        end_offset = 0;
-
-        file_reader->_row_group_readers[0]->collect_io_ranges(&ranges, &end_offset);
+        file_reader->_row_group_readers[0]->collect_io_ranges(&obs.ranges, &obs.end_offset);
         // 3 pages, 1 range 5000-8000
         EXPECT_EQ(file_reader->_row_group_readers[0]->_range.size(), 1);
-        // only collect io of 3 pages, 5001-6000, 6001-7000, 7001-8000 and a dict page.
-        EXPECT_EQ(ranges.size(), 4);
-        // page 7001-8000: offset 50814, size 1660
-        EXPECT_EQ(end_offset, 52474);
 
-        size_t total_row_nums = 0;
+        obs.io_range_count = ctx->format_scan_context.stats->page_io_range_count - base_count;
+        obs.io_range_merged = ctx->format_scan_context.stats->page_io_range_merged - base_merged;
+        obs.whole_chunk_fallback = ctx->format_scan_context.stats->page_whole_chunk_fallback - base_fallback;
+
         while (!status.is_end_of_file()) {
             chunk->reset();
             status = file_reader->get_next(&chunk);
             chunk->check_or_die();
-            total_row_nums += chunk->num_rows();
+            obs.rows += chunk->num_rows();
+            for (size_t i = 0; i < chunk->num_rows(); i++) {
+                obs.values.push_back(chunk->get_column_by_index(0)->get(i).get_int32());
+            }
         }
-        EXPECT_EQ(total_row_nums, 1999);
+        return obs;
     };
 
-    test();
+    // The rows the predicate selects, independent of any I/O decision: c0 is 1..10000 in row group 0,
+    // so 5500 < c0 < 7500 is exactly 5501..7499.
+    std::vector<int32_t> expected_values;
+    for (int32_t v = 5501; v <= 7499; v++) {
+        expected_values.push_back(v);
+    }
+
+    {
+        SCOPED_TRACE("MergedAndPaddedRanges: coverage fallback disabled, so this is the merge path only");
+        auto obs = run(2.0); // > 1.0 disables the whole-chunk fallback entirely
+
+        // The dictionary page keeps its own range, exactly as before. The three contiguous selected
+        // pages become ONE range, whose end is extended so that the page-header peek taken at the
+        // start of page 7 is contained -- here that reaches the chunk end, because only 5,230 bytes
+        // of chunk remain past page 7's start and the peek wants 16 KB.
+        ASSERT_EQ(obs.ranges.size(), 2);
+        EXPECT_EQ(obs.ranges[0].offset, kC0ChunkStart);
+        EXPECT_EQ(obs.ranges[0].size, kC0DictSize);
+        EXPECT_EQ(obs.ranges[1].offset, kC0MergedRunOffset);
+        EXPECT_EQ(obs.ranges[1].size, kC0MergedRunSize);
+        EXPECT_EQ(obs.end_offset, kC0ChunkEnd);
+        // Still strictly less than reading the chunk whole -- the point of the page path.
+        EXPECT_LT(obs.ranges[0].size + obs.ranges[1].size, kC0ChunkCompressedSize);
+
+        // Produced by merging, NOT by the coverage fallback. Without this assertion the two mechanisms
+        // are hard to tell apart from the outside, and a reverted merge would still look plausible.
+        EXPECT_EQ(obs.io_range_count, 1);  // one run emitted for the three selected pages
+        EXPECT_EQ(obs.io_range_merged, 2); // pages 6 and 7 absorbed into page 5's run
+        EXPECT_EQ(obs.whole_chunk_fallback, 0);
+
+        // Negative case: the pre-change emission is gone, and gone for both reasons. The dictionary
+        // range is excluded on purpose -- it is unchanged and must stay unchanged.
+        EXPECT_NE(obs.end_offset, kHistoricalEndOffset) << "the page-header peek was not padded for";
+        for (size_t i = 1; i < kHistoricalUnmergedRanges.size(); i++) {
+            const auto& [offset, size] = kHistoricalUnmergedRanges[i];
+            for (const auto& r : obs.ranges) {
+                EXPECT_FALSE(r.offset == offset && r.size == size)
+                        << "historical unmerged page range (" << offset << ", " << size << ") still emitted";
+            }
+        }
+
+        // Fetching differently must not decode differently.
+        EXPECT_EQ(obs.rows, 1999u);
+        EXPECT_EQ(obs.values, expected_values);
+    }
+
+    {
+        SCOPED_TRACE("WholeChunkFallbackAtTheDefaultThreshold");
+        auto obs = run(0.8); // the shipped default; this chunk's coverage is 0.8038
+
+        ASSERT_EQ(obs.ranges.size(), 1);
+        EXPECT_EQ(obs.ranges[0].offset, kC0ChunkStart);
+        EXPECT_EQ(obs.ranges[0].size, kC0ChunkCompressedSize);
+        EXPECT_EQ(obs.end_offset, kC0ChunkEnd);
+
+        // Same range, different mechanism -- and the counters say which.
+        EXPECT_EQ(obs.whole_chunk_fallback, 1);
+        EXPECT_EQ(obs.io_range_count, 0);
+        EXPECT_EQ(obs.io_range_merged, 0);
+
+        EXPECT_EQ(obs.rows, 1999u);
+        EXPECT_EQ(obs.values, expected_values);
+    }
+
+    {
+        SCOPED_TRACE("CoverageThresholdBoundary");
+        // 0.8038 is the real coverage of this chunk. Just below it the fallback fires, just above it
+        // the merge path runs, and the decoded rows are identical either way.
+        EXPECT_NEAR(kC0Coverage, 0.8038, 1e-4);
+
+        auto below = run(0.8035);
+        EXPECT_EQ(below.whole_chunk_fallback, 1);
+        EXPECT_EQ(below.io_range_count, 0);
+        ASSERT_EQ(below.ranges.size(), 1);
+        EXPECT_EQ(below.ranges[0].size, kC0ChunkCompressedSize);
+        EXPECT_EQ(below.values, expected_values);
+
+        auto above = run(0.8045);
+        EXPECT_EQ(above.whole_chunk_fallback, 0);
+        EXPECT_EQ(above.io_range_count, 1);
+        ASSERT_EQ(above.ranges.size(), 2);
+        EXPECT_EQ(above.ranges[1].offset, kC0MergedRunOffset);
+        EXPECT_EQ(above.values, expected_values);
+    }
+}
+
+// The index-OFF shape: no predicate, so _range spans the whole row group, select_offset_index() is
+// never called, _offset_index_ctx stays null and collect_column_io_range() takes the else branch.
+// That branch is byte-for-byte untouched by this work and this case is what says so.
+TEST_F(PageIndexTest, TestCollectIORangeWithoutPageSelectionIsUnchanged) {
+    const std::string small_page_file = "./be/test/formats/parquet/test_data/page_index_small_page.parquet";
+
+    // No conjuncts at all: exactly the shape TestSelectedRowRangesSkipPages uses for its baseline.
+    auto ctx = _create_file_only_c0_context(small_page_file);
+    auto file = _create_file(small_page_file);
+
+    auto file_reader = std::make_shared<FileReader>(config::vector_chunk_size, file.get(),
+                                                    std::filesystem::file_size(small_page_file));
+
+    Status status = file_reader->init(&ctx->format_scan_context);
+    ASSERT_TRUE(status.ok()) << status.message();
+    ASSERT_EQ(file_reader->_row_group_readers.size(), 2);
+
+    // Baseline after init(), which has already prepared group 0 through this same code.
+    const int64_t base_count = ctx->format_scan_context.stats->page_io_range_count;
+    const int64_t base_merged = ctx->format_scan_context.stats->page_io_range_merged;
+    const int64_t base_fallback = ctx->format_scan_context.stats->page_whole_chunk_fallback;
+
+    std::vector<SharedBufferedInputStream::IORange> ranges;
+    int64_t end_offset = 0;
+    file_reader->_row_group_readers[0]->collect_io_ranges(&ranges, &end_offset);
+
+    // Exactly one range: [dictionary_page_offset, +total_compressed_size).
+    ASSERT_EQ(ranges.size(), 1);
+    EXPECT_EQ(ranges[0].offset, kC0ChunkStart);
+    EXPECT_EQ(ranges[0].size, kC0ChunkCompressedSize);
+    EXPECT_EQ(end_offset, kC0ChunkEnd);
+
+    // None of the page-path machinery ran, so none of its counters moved.
+    EXPECT_EQ(ctx->format_scan_context.stats->page_io_range_count - base_count, 0);
+    EXPECT_EQ(ctx->format_scan_context.stats->page_io_range_merged - base_merged, 0);
+    EXPECT_EQ(ctx->format_scan_context.stats->page_whole_chunk_fallback - base_fallback, 0);
+}
+
+// Direct tests of the range emission itself, on a synthetic offset index, so that the geometry under
+// test is stated in the test rather than depending on what some fixture file happens to contain.
+namespace {
+
+ColumnOffsetIndexCtx make_offset_index_ctx(const std::vector<std::pair<int64_t, int32_t>>& pages,
+                                           const std::vector<bool>& selected) {
+    ColumnOffsetIndexCtx ctx;
+    ctx.rg_first_row = 0;
+    int64_t first_row = 0;
+    for (const auto& [offset, size] : pages) {
+        tparquet::PageLocation loc;
+        loc.__set_offset(offset);
+        loc.__set_compressed_page_size(size);
+        loc.__set_first_row_index(first_row);
+        ctx.offset_index.page_locations.emplace_back(loc);
+        first_row += 1000;
+    }
+    ctx.page_selected = selected;
+    return ctx;
+}
+
+} // namespace
+
+TEST_F(PageIndexTest, TestCollectIORangeMergesRunsWithinDistance) {
+    constexpr int64_t kMB = 1024 * 1024;
+    // Two 4 KB pages with 1.5 MB of unselected data between them.
+    const int64_t first_offset = 1000000;
+    const int64_t second_offset = first_offset + 4096 + 1500000;
+    auto ctx = make_offset_index_ctx({{first_offset, 4096}, {second_offset, 4096}}, {true, true});
+
+    auto emit = [&](int64_t merge_max_distance) {
+        std::vector<SharedBufferedInputStream::IORange> ranges;
+        int64_t end_offset = 0;
+        PageIORangeOptions opts;
+        opts.chunk_end = 10 * 1000 * 1000; // far away, so nothing is clamped by it
+        opts.merge_max_distance = merge_max_distance;
+        opts.header_peek_size = kDefaultPageHeaderSize;
+        ctx.collect_io_range(&ranges, &end_offset, true, opts);
+        return ranges;
+    };
+
+    {
+        // 1 MB apart is the deployed io_coalesce_read_max_distance_size. A 1.5 MB gap breaks the run,
+        // which is the behaviour that costs a second remote round trip.
+        auto ranges = emit(1 * kMB);
+        ASSERT_EQ(ranges.size(), 2);
+        // Each range runs from its page start to that page start plus the peek (the page itself is
+        // only 4 KB, so the peek is what sets the end).
+        EXPECT_EQ(ranges[0].offset, first_offset);
+        EXPECT_EQ(ranges[0].size, kDefaultPageHeaderSize);
+        EXPECT_EQ(ranges[1].offset, second_offset);
+        EXPECT_EQ(ranges[1].size, kDefaultPageHeaderSize);
+    }
+    {
+        // Raise the bound past the gap and the same two pages become one request.
+        auto ranges = emit(2 * kMB);
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0].offset, first_offset);
+        EXPECT_EQ(ranges[0].size, (second_offset + kDefaultPageHeaderSize) - first_offset);
+    }
+}
+
+TEST_F(PageIndexTest, TestCollectIORangePaddingNeverLeavesTheChunk) {
+    constexpr int64_t kMB = 1024 * 1024;
+
+    {
+        // The chunk ends 60 bytes after the page starts, far short of the 16 KB peek. Padding stops
+        // there: a range that ran past total_compressed_size would overlap the NEXT column's chunk,
+        // and SharedBufferedInputStream::_sort_and_check_overlap() fails the whole row group on an
+        // overlap.
+        auto ctx = make_offset_index_ctx({{100, 50}}, {true});
+        std::vector<SharedBufferedInputStream::IORange> ranges;
+        int64_t end_offset = 0;
+        PageIORangeOptions opts;
+        opts.chunk_end = 160;
+        opts.merge_max_distance = kMB;
+        opts.header_peek_size = kDefaultPageHeaderSize;
+        ctx.collect_io_range(&ranges, &end_offset, true, opts);
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0].offset, 100);
+        EXPECT_EQ(ranges[0].size, 60);
+        EXPECT_EQ(ranges[0].offset + ranges[0].size, opts.chunk_end);
+        EXPECT_EQ(end_offset, opts.chunk_end);
+    }
+    {
+        // With room to spare the full peek is added.
+        auto ctx = make_offset_index_ctx({{100, 50}}, {true});
+        std::vector<SharedBufferedInputStream::IORange> ranges;
+        int64_t end_offset = 0;
+        PageIORangeOptions opts;
+        opts.chunk_end = 1000000;
+        opts.merge_max_distance = kMB;
+        opts.header_peek_size = kDefaultPageHeaderSize;
+        ctx.collect_io_range(&ranges, &end_offset, true, opts);
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0].size, kDefaultPageHeaderSize);
+    }
+    {
+        // And nothing at all is added when the page is already longer than the peek, which is the
+        // common case for a StarRocks-written page. This is what keeps the padding from becoming a
+        // read-amplification tax on normal files.
+        auto ctx = make_offset_index_ctx({{0, 20000}}, {true});
+        std::vector<SharedBufferedInputStream::IORange> ranges;
+        int64_t end_offset = 0;
+        PageIORangeOptions opts;
+        opts.chunk_end = 1000000;
+        opts.merge_max_distance = kMB;
+        opts.header_peek_size = kDefaultPageHeaderSize;
+        ctx.collect_io_range(&ranges, &end_offset, true, opts);
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0].offset, 0);
+        EXPECT_EQ(ranges[0].size, 20000);
+        EXPECT_EQ(end_offset, 20000);
+    }
+    {
+        // Padding must also never reach the next emitted range. With a merge distance below the peek
+        // size the two pages stay separate AND the first range stops exactly where the second begins.
+        auto ctx = make_offset_index_ctx({{0, 100}, {1000, 100}}, {true, true});
+        std::vector<SharedBufferedInputStream::IORange> ranges;
+        int64_t end_offset = 0;
+        PageIORangeOptions opts;
+        opts.chunk_end = 1000000;
+        opts.merge_max_distance = 200; // < the 900-byte gap, and far below the 16 KB peek
+        opts.header_peek_size = kDefaultPageHeaderSize;
+        ctx.collect_io_range(&ranges, &end_offset, true, opts);
+        ASSERT_EQ(ranges.size(), 2);
+        EXPECT_EQ(ranges[0].offset, 0);
+        EXPECT_EQ(ranges[0].size, 1000);
+        EXPECT_EQ(ranges[1].offset, 1000);
+        EXPECT_EQ(ranges[1].size, kDefaultPageHeaderSize);
+        // No overlap, which is what _sort_and_check_overlap() would otherwise reject.
+        EXPECT_LE(ranges[0].offset + ranges[0].size, ranges[1].offset);
+    }
+}
+
+TEST_F(PageIndexTest, TestCollectIORangeDefaultOptionsMatchTheHistoricalEmission) {
+    // The default options object must reproduce the pre-change emission exactly: one range per
+    // selected page, no padding, end_offset at the last selected byte. Anything that changes this is
+    // a behaviour change for every caller that does not opt in.
+    auto ctx = make_offset_index_ctx({{40069, 1285},
+                                      {41354, 1410},
+                                      {42764, 1535},
+                                      {44299, 1535},
+                                      {45834, 1660},
+                                      {47494, 1660},
+                                      {49154, 1660},
+                                      {50814, 1660},
+                                      {52474, 1785},
+                                      {54259, 1785}},
+                                     {false, false, false, false, false, true, true, true, false, false});
+
+    std::vector<SharedBufferedInputStream::IORange> ranges;
+    int64_t end_offset = 0;
+    ctx.collect_io_range(&ranges, &end_offset, true);
+
+    ASSERT_EQ(ranges.size(), 3);
+    EXPECT_EQ(ranges[0].offset, 47494);
+    EXPECT_EQ(ranges[0].size, 1660);
+    EXPECT_EQ(ranges[1].offset, 49154);
+    EXPECT_EQ(ranges[1].size, 1660);
+    EXPECT_EQ(ranges[2].offset, 50814);
+    EXPECT_EQ(ranges[2].size, 1660);
+    EXPECT_EQ(end_offset, 52474);
+    for (const auto& r : ranges) {
+        EXPECT_TRUE(r.is_active);
+    }
+
+    // selected_page_bytes() is what the coverage guard divides by total_compressed_size.
+    EXPECT_EQ(ctx.selected_page_bytes(), 3 * 1660);
 }
 
 TEST_F(PageIndexTest, TestTwoColumnIntersectPageIndex) {
@@ -747,11 +1098,24 @@ TEST_F(PageIndexTest, TestTwoColumnIntersectPageIndex) {
         end_offset = 0;
 
         file_reader->_row_group_readers[0]->collect_io_ranges(&ranges, &end_offset);
-        // only collect io of 5 pages, 5001-6000, 6001-7000, 7001-8000, 8001-9000, 9001-10000 and a dict page.
-        // three columns, (5 + 1) * 3 = 18
-        EXPECT_EQ(ranges.size(), 18);
+        // Pages 5..9 (rows 5001-10000) are selected in all three columns. This used to be
+        // (5 pages + 1 dict page) x 3 columns = 18 ranges. It is now 4, and the reason differs per
+        // column, which is the whole point of the two mechanisms being separately observable:
+        //
+        //   c0  dict 40,065 of 56,040 compressed bytes, 5 selected pages = 8,550
+        //       -> coverage 0.8675 >= parquet_page_select_min_coverage, whole chunk: (4, 56040)
+        //   c1  same shape                              -> whole chunk:         (56143, 56030)
+        //   c2  dict 402 of 4,372, 5 selected pages = 1,985
+        //       -> coverage 0.546, per-page: dict (112274, 402) plus ONE merged, padded run
+        //          (114661, 1985) -- pages 5..9 are contiguous and the run already ends at the
+        //          chunk end, so the peek adds nothing.
+        EXPECT_EQ(ranges.size(), 4);
 
-        EXPECT_EQ(shared_buffer->current_range_ref_sum(), 28);
+        // Each registered IORange contributes exactly 1 to some SharedBuffer's ref_count, so this sum
+        // is the number of ranges init() registered: 10 page-index ranges (5 per row group, both
+        // groups are filtered during init) plus the 4 page ranges of the prepared group. It was 28
+        // when the page path emitted 18.
+        EXPECT_EQ(shared_buffer->current_range_ref_sum(), 10 + static_cast<int64_t>(ranges.size()));
 
         // The second row group is not prepare yet
 

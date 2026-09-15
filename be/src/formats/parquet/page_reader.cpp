@@ -34,9 +34,7 @@
 
 namespace starrocks::parquet {
 
-// Reference for:
-// https://github.com/apache/arrow/blob/7ebc88c8fae62ed97bc30865c845c8061132af7e/cpp/src/parquet/column_reader.h#L54-L57
-static constexpr size_t kDefaultPageHeaderSize = 16 * 1024;
+// kDefaultPageHeaderSize lives in page_reader.h: the range planner has to know the size of this peek.
 // 16MB is borrowed from Arrow
 static constexpr size_t kMaxPageHeaderSize = 16 * 1024 * 1024;
 
@@ -106,7 +104,7 @@ Status PageReader::_deal_page_with_cache() {
 }
 
 Status PageReader::_read_and_deserialize_header(bool need_fill_cache) {
-    size_t allowed_page_size = kDefaultPageHeaderSize;
+    size_t allowed_page_size = static_cast<size_t>(kDefaultPageHeaderSize);
     size_t remaining = _finish_offset - _offset;
     _header_length = 0;
 

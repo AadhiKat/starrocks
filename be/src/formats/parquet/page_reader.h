@@ -36,6 +36,16 @@ namespace starrocks::parquet {
 
 struct ColumnReaderOptions;
 
+// Reference for:
+// https://github.com/apache/arrow/blob/7ebc88c8fae62ed97bc30865c845c8061132af7e/cpp/src/parquet/column_reader.h#L54-L57
+//
+// PageReader reads this many bytes at the start of EVERY page header, bounded only by the end of the
+// column chunk -- it does not know how large the page it is about to parse actually is. Whoever
+// registers I/O ranges for individual pages has to leave this much head-room past the last page of a
+// registered run, or the peek finds no containing SharedBuffer and falls through to an unbuffered
+// remote read. See ColumnOffsetIndexCtx::collect_io_range().
+inline constexpr int64_t kDefaultPageHeaderSize = 16 * 1024;
+
 // Used to parse page header of column chunk. This class don't parse page's type.
 class PageReader {
 public:

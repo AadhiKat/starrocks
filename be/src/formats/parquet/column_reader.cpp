@@ -34,16 +34,111 @@
 
 namespace starrocks::parquet {
 
-void ColumnOffsetIndexCtx::collect_io_range(std::vector<SharedBufferedInputStream::IORange>* ranges,
-                                            int64_t* end_offset, bool active) {
+int64_t ColumnOffsetIndexCtx::selected_page_bytes() const {
+    int64_t bytes = 0;
     for (size_t i = 0; i < page_selected.size(); i++) {
         if (page_selected[i]) {
-            auto r = SharedBufferedInputStream::IORange(offset_index.page_locations[i].offset,
-                                                        offset_index.page_locations[i].compressed_page_size, active);
-            ranges->emplace_back(r);
-            *end_offset = std::max(*end_offset, r.offset + r.size);
+            bytes += offset_index.page_locations[i].compressed_page_size;
         }
     }
+    return bytes;
+}
+
+// Emit the I/O ranges the reader needs in order to decode the SELECTED pages of one column chunk.
+//
+// Historically this emitted one IORange per selected page and nothing else, which has two costs that
+// only show up on remote storage:
+//
+//  1. Run splitting. The ranges are handed to SharedBufferedInputStream, whose _merge_small_ranges()
+//     closes a coalesced run whenever the gap from the previous range exceeds
+//     io_coalesce_read_max_distance_size. Every closed run is one more synchronous remote round trip
+//     paid inline in the decode loop (get_bytes() fills a buffer on first touch), and those round
+//     trips add up serially within a row group.
+//  2. The page-header peek escaping the buffer. PageReader is built over the WHOLE chunk and reads
+//     kDefaultPageHeaderSize bytes at the start of every page header, bounded only by the chunk end.
+//     A range that stops at the last selected page of a run therefore does not contain that page's
+//     header peek: find_shared_buffer() fails, read_at_fully() takes the unbuffered path, and the
+//     bytes it fetches are discarded because the page's data is read again from its own buffer a
+//     moment later. One wasted remote round trip per affected page, counted by
+//     FormatScannerStats::page_header_direct_read_count.
+//
+// Both are addressed here rather than in the stream: merge selected pages whose gap is within
+// opts.merge_max_distance into a single range, and extend each emitted range by opts.header_peek_size,
+// clamped to opts.chunk_end and to the start of the next range so the result can never overlap.
+// With the default options object neither applies and the emitted ranges are exactly the old ones.
+//
+// The trade the padding makes is explicit: at most opts.header_peek_size extra bytes per emitted run,
+// fetched inside a request that is already being made, in exchange for removing a whole extra remote
+// round trip whose bytes were going to be discarded anyway. Bytes are the cheap side of that trade on
+// remote storage and the harness retains both (RequestBytesRead / SharedIOBytes against FSIOCounter),
+// so the exchange rate stays measurable rather than assumed.
+void ColumnOffsetIndexCtx::collect_io_range(std::vector<SharedBufferedInputStream::IORange>* ranges,
+                                            int64_t* end_offset, bool active, const PageIORangeOptions& opts) {
+    const auto& page_locations = offset_index.page_locations;
+
+    // The run currently open, [run_offset, run_end). run_offset < 0 means there is none.
+    int64_t run_offset = -1;
+    int64_t run_end = -1;
+
+    // Close the open run. `next_offset` is where the range emitted AFTER this one will start, or -1
+    // when there is none; padding is never allowed to grow into it, because
+    // SharedBufferedInputStream::_sort_and_check_overlap() turns an overlap into a RuntimeError that
+    // fails the entire row group.
+    auto flush_run = [&](int64_t next_offset) {
+        if (run_offset < 0) {
+            return;
+        }
+        int64_t end = run_end;
+        if (opts.header_peek_size > 0) {
+            end = run_end + opts.header_peek_size;
+            if (opts.chunk_end > 0) {
+                end = std::min(end, opts.chunk_end);
+            }
+            if (next_offset >= 0) {
+                end = std::min(end, next_offset);
+            }
+            // A clamp must never shrink the run below the pages it has to cover.
+            end = std::max(end, run_end);
+        }
+        ranges->emplace_back(SharedBufferedInputStream::IORange(run_offset, end - run_offset, active));
+        *end_offset = std::max(*end_offset, end);
+        if (opts.emitted_ranges != nullptr) {
+            *opts.emitted_ranges += 1;
+        }
+        run_offset = -1;
+        run_end = -1;
+    };
+
+    auto add_range = [&](int64_t offset, int64_t size) {
+        const int64_t end = offset + size;
+        if (run_offset < 0) {
+            run_offset = offset;
+            run_end = end;
+            return;
+        }
+        if ((offset - run_end) <= opts.merge_max_distance && (end - run_offset) <= opts.merge_max_span) {
+            run_end = std::max(run_end, end);
+            if (opts.merged_pages != nullptr) {
+                *opts.merged_pages += 1;
+            }
+            return;
+        }
+        flush_run(offset);
+        run_offset = offset;
+        run_end = end;
+    };
+
+    // The dictionary page, when the caller passes it, takes part in run merging so that its own
+    // header peek is covered by the same padding rule.
+    if (opts.lead_offset >= 0) {
+        add_range(opts.lead_offset, opts.lead_size);
+    }
+    for (size_t i = 0; i < page_selected.size(); i++) {
+        if (page_selected[i]) {
+            add_range(page_locations[i].offset, page_locations[i].compressed_page_size);
+        }
+    }
+    flush_run(-1);
 }
 
 Status ColumnDictFilterContext::rewrite_conjunct_ctxs_to_predicate(StoredColumnReader* reader,

@@ -19,7 +19,9 @@
 #include "cache/scan/shared_buffered_input_stream.h"
 #include "column/global_dict/dict_column.h"
 #include "common/compiler_util.h"
+#include "common/config_scan_io_fwd.h"
 #include "formats/parquet/column_reader.h"
+#include "formats/parquet/page_reader.h"
 #include "formats/parquet/parquet_block_split_bloom_filter.h"
 #include "formats/parquet/predicate_filter_evaluator.h"
 #include "formats/parquet/stored_column_reader_with_index.h"
@@ -68,15 +70,38 @@ void RawColumnReader::collect_column_io_range(std::vector<SharedBufferedInputStr
     if ((types & ColumnIOType::PAGES) != 0) {
         const tparquet::ColumnMetaData& column_metadata = column.meta_data;
         if (_offset_index_ctx != nullptr && !_offset_index_ctx->page_selected.empty()) {
-            // add dict page
+            // Per-selected-page registration. The dictionary page is handed to collect_io_range() as
+            // the leading range instead of being emitted here, so that it takes part in run merging
+            // and gets the same header padding as the data pages: StoredColumnReaderWithIndex calls
+            // load_dictionary_page() before the first data page, and that read parses a page header
+            // through the very same fixed-size peek.
+            const int64_t chunk_start = column_metadata.__isset.dictionary_page_offset
+                                                ? column_metadata.dictionary_page_offset
+                                                : column_metadata.data_page_offset;
+
+            PageIORangeOptions opts;
+            // Exactly PageReader::_finish_offset for this chunk; padding never crosses it.
+            opts.chunk_end = chunk_start + column_metadata.total_compressed_size;
+            // The same gap bound SharedBufferedInputStream::_merge_small_ranges() applies, so merging
+            // here changes the NUMBER of registered ranges and (padding aside) not which bytes the
+            // stream ends up fetching. The stream's OTHER bound, the 8 MB span, is deliberately NOT
+            // mirrored: re-creating that split here would re-create the buffer boundary the padding
+            // exists to remove, and _set_io_ranges_all_columns() already gives a range larger than
+            // io_coalesce_read_max_buffer_size its own dedicated SharedBuffer -- exactly the treatment
+            // the whole-chunk branch below gets today. One big buffer instead of several costs the
+            // same resident bytes (the decode loop touches all of them and they are released together
+            // when the GroupReader is destroyed) and saves the round trips between them.
+            opts.merge_max_distance = config::io_coalesce_read_max_distance_size;
+            opts.header_peek_size = kDefaultPageHeaderSize;
             if (column_metadata.__isset.dictionary_page_offset) {
-                auto r = SharedBufferedInputStream::IORange(
-                        column_metadata.dictionary_page_offset,
-                        column_metadata.data_page_offset - column_metadata.dictionary_page_offset, active);
-                ranges->emplace_back(r);
-                *end_offset = std::max(*end_offset, r.offset + r.size);
+                opts.lead_offset = column_metadata.dictionary_page_offset;
+                opts.lead_size = column_metadata.data_page_offset - column_metadata.dictionary_page_offset;
             }
-            _offset_index_ctx->collect_io_range(ranges, end_offset, active);
+            if (_opts.stats != nullptr) {
+                opts.emitted_ranges = &_opts.stats->page_io_range_count;
+                opts.merged_pages = &_opts.stats->page_io_range_merged;
+            }
+            _offset_index_ctx->collect_io_range(ranges, end_offset, active, opts);
         } else {
             int64_t offset = 0;
             if (column_metadata.__isset.dictionary_page_offset) {

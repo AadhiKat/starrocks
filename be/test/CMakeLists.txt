@@ -231,6 +231,13 @@ set(STARROCKS_TEST_LINK_LIBS ${TEST_LINK_LIBS})
 list(REMOVE_ITEM STARROCKS_TEST_LINK_LIBS arrow_testing)
 TARGET_LINK_LIBRARIES(starrocks_test ServiceBE Service SchemaScannerBuiltin ${STARROCKS_TEST_LINK_LIBS})
 STARROCKS_FORCE_LOAD_LIBS(starrocks_test ${EXPR_FORCE_LOAD_LIBS})
+# be/CMakeLists.txt:847 links every BE object with -Wl,--wrap=__cxa_throw, so every `throw` in this binary calls
+# __wrap___cxa_throw. Only the test tree defines it (base/cxa_throw_wrap.cpp, behind the interface library above),
+# and starrocks_test was never linked with it: the symbol stayed NOTYPE WEAK UND with a zero JUMP_SLOT, so every
+# throwing path in this binary jumped to address 0. That is a test-binary-only defect -- the release starrocks_be
+# defines the symbol -- and it is what made ArrowParquetWriterTest.Exception, ParquetPageReaderTest.Normal /
+# .ExtraBytes and AddMapColumnTest.test_bad_json die with SIGSEGV at PC 0x0 instead of running to a verdict.
+target_link_be_test_cxa_throw_wrap(starrocks_test)
 
 
 SET(DW_TEST_FILES

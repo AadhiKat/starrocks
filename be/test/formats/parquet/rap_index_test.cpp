@@ -556,6 +556,9 @@ protected:
             int rap_index_consulted = 0, rap_index_ready = 0, rap_index_unusable = 0, rap_index_ranges = 0;
             int rap_build_written = 0, rap_build_skipped = 0; // slice 4 (P3b)
             int rap_plan_hinted = 0, rap_plan_hint_ranges = 0; // R7 (plan-time row ranges)
+            // workstream C's page-range registration (scalar_column_reader.cpp:67-92). A RAP row range only becomes
+            // fewer BYTES through this path, so a case that asserts planned IO has to be able to see it.
+            int64_t page_io_range_count = 0, page_io_range_merged = 0, page_whole_chunk_fallback = 0;
         } stats_delta;
     };
 
@@ -633,6 +636,8 @@ protected:
                   b_unusable = g_rap_stats.rap_index_unusable, b_ranges = g_rap_stats.rap_index_ranges;
         const int b_bw = g_rap_stats.rap_build_written, b_bs = g_rap_stats.rap_build_skipped;
         const int b_ph = g_rap_stats.rap_plan_hinted, b_phr = g_rap_stats.rap_plan_hint_ranges;
+        const int64_t b_pirc = g_rap_stats.page_io_range_count, b_pirm = g_rap_stats.page_io_range_merged,
+                      b_pwcf = g_rap_stats.page_whole_chunk_fallback;
         // pass 1: accounting (never consumed)
         {
             auto* ctx = _ctx(path, literals);
@@ -708,6 +713,9 @@ protected:
         out.stats_delta.rap_build_skipped = g_rap_stats.rap_build_skipped - b_bs;
         out.stats_delta.rap_plan_hinted = g_rap_stats.rap_plan_hinted - b_ph;
         out.stats_delta.rap_plan_hint_ranges = g_rap_stats.rap_plan_hint_ranges - b_phr;
+        out.stats_delta.page_io_range_count = g_rap_stats.page_io_range_count - b_pirc;
+        out.stats_delta.page_io_range_merged = g_rap_stats.page_io_range_merged - b_pirm;
+        out.stats_delta.page_whole_chunk_fallback = g_rap_stats.page_whole_chunk_fallback - b_pwcf;
         config::rap_index_dir = "";
         return out;
     }
@@ -910,13 +918,38 @@ TEST_F(RapIndexTest, RealSidecarIdentity) {
 // 3. Parity and narrowing through the real reader over the real files.
 TEST_F(RapIndexTest, ParityAndNarrowingEQ) {
     if (!fixtures_present()) GTEST_SKIP() << "fixture files / sidecars not present";
+    // A RAP row range becomes fewer BYTES only through workstream C's page-range registration, and that path has two
+    // read-amplification bounds of its own (scalar_column_reader.cpp:67-92 and column_reader.h:68-93):
+    //   * whole-chunk fallback -- selected pages covering >= config::parquet_page_select_min_coverage (0.8) of the
+    //     column chunk register the WHOLE chunk, counted as page_whole_chunk_fallback;
+    //   * run merging          -- selected pages whose gap is at most config::io_coalesce_read_max_distance_size
+    //     (1 MiB) become ONE IORange, so a gap smaller than that is fetched anyway.
+    // So "the index narrowed the row ranges" and "the index narrowed planned IO" are DIFFERENT claims, and a rung can
+    // do the first without the second. Each rung declares which it is, and the case asserts both.
+    enum class Outcome {
+        kEveryGranule, // the literal is in every granule: no row-range narrowing is possible, so no page selection
+        kDenseGaps,    // the index drops granules, but the gaps are too small for either bound: the same bytes
+        kNarrows,      // the index drops enough, in large enough runs, to plan fewer bytes
+    };
     struct Rung {
         const char* literal;
-        bool narrows; // pages hit < pages total in at least one file
+        Outcome outcome;
     };
-    // literals from f2-incremental-n5m.md section 1: L1 hits every page (no narrowing possible),
-    // L2 1,100 rows hits 115/129 and 107/122 pages, L3 44 rows and L4 1 row hit few; L5 is absent.
-    const Rung rungs[] = {{"V2420", false}, {"25080RABDI", true}, {"2203129G", true}, {"12 Pro", true}, {"__ABSENT_MODEL__", true}};
+    // Literals from f2-incremental-n5m.md section 1. The granule sets are re-derived from that run's retained `_pos`
+    // lists by harness/ws_b_ut_fix_evidence.py, at this fixture's 20,000-row granularity:
+    //   L1 V2420            45,954 rows  129/129 and 122/122 granules  -- every granule
+    //   L2 25080RABDI        1,100 rows  115/129 and 107/122 granules, in 14 and 12 merged ranges, every gap ONE
+    //                                    granule: selected pages cover 0.877-0.992 of every projected chunk (> 0.8)
+    //                                    and every gap is far below 1 MiB, so planned IO cannot move
+    //   L3 2203129G             44 rows    8/129 and   7/122 granules  -- 0.064-0.149 coverage: narrows
+    //   L4 12 Pro                1 row     0/129 and   1/122 granules  -- absent in file 0, narrows in file 1
+    //   L5 __ABSENT_MODEL__      0 rows    no granule anywhere         -- the file is filtered
+    const Rung rungs[] = {{"V2420", Outcome::kEveryGranule},
+                          {"25080RABDI", Outcome::kDenseGaps},
+                          {"2203129G", Outcome::kNarrows},
+                          {"12 Pro", Outcome::kNarrows},
+                          {"__ABSENT_MODEL__", Outcome::kNarrows}};
+    const double saved_coverage = config::parquet_page_select_min_coverage;
     for (const std::string file : {kFile0, kFile1}) {
         const std::string path = _fixture_dir + "/" + file;
         for (const auto& rung : rungs) {
@@ -929,24 +962,62 @@ TEST_F(RapIndexTest, ParityAndNarrowingEQ) {
             EXPECT_EQ(idx.stats_delta.rap_index_consulted, 2) << "one consult per pass";
             EXPECT_EQ(idx.stats_delta.rap_index_unusable, 0);
             EXPECT_EQ(base.stats_delta.rap_index_consulted, 0) << "no consult when the dir is unset";
+            std::cout << "[ REPORT   ] " << file << " model=" << rung.literal << " planned base=" << base.planned_bytes
+                      << " (base page_ranges=" << base.stats_delta.page_io_range_count
+                      << " base_fallback=" << base.stats_delta.page_whole_chunk_fallback << ")"
+                      << " indexed=" << idx.planned_bytes << " ranges=" << idx.stats_delta.rap_index_ranges
+                      << " page_ranges=" << idx.stats_delta.page_io_range_count
+                      << " merged=" << idx.stats_delta.page_io_range_merged
+                      << " whole_chunk_fallback=" << idx.stats_delta.page_whole_chunk_fallback << std::endl;
             if (base.rows.empty()) {
                 // this file holds no match: the index must filter the file outright
                 EXPECT_TRUE(idx.file_filtered);
                 EXPECT_EQ(idx.planned_bytes, 0);
-            } else if (rung.narrows) {
+            } else if (rung.outcome == Outcome::kNarrows) {
                 EXPECT_LT(idx.planned_bytes, base.planned_bytes) << "index did not narrow planned IO";
                 EXPECT_GT(idx.stats_delta.rap_index_ranges, 0);
+                EXPECT_GT(idx.stats_delta.page_io_range_count, 0) << "narrowing IS the per-page registration path";
+                EXPECT_EQ(idx.stats_delta.page_whole_chunk_fallback, 0) << "a sparse selection must not fall back";
                 for (const auto& [first_row, bytes] : idx.bytes_by_first_row) {
                     auto it = base.bytes_by_first_row.find(first_row);
                     ASSERT_NE(it, base.bytes_by_first_row.end());
                     EXPECT_LT(bytes, it->second);
                 }
-            } else {
-                // every page holds the value: narrowing to all pages must not change planned IO
+            } else if (rung.outcome == Outcome::kDenseGaps) {
+                // The index DID narrow the row ranges -- more than one range per consult is only possible if it
+                // dropped granules in the middle of the file -- and the reader deliberately declined to turn that
+                // into a scattered read. Both facts are asserted, so neither can rot: if the index stopped
+                // narrowing, select_offset_index() would not run at all and the fallback counter would be 0.
+                EXPECT_GE(idx.stats_delta.rap_index_ranges, 4) << "at least two disjoint ranges per consult";
                 EXPECT_EQ(idx.planned_bytes, base.planned_bytes);
+                EXPECT_GT(idx.stats_delta.page_whole_chunk_fallback, 0)
+                        << "the byte equality must be the coverage bound's doing, not an empty selection";
+                // ... and with that bound removed, run merging alone still fetches the same bytes: every gap here is
+                // a single granule, far below io_coalesce_read_max_distance_size.
+                config::parquet_page_select_min_coverage = 2.0; // no selection can ever reach it
+                const Result wide = run(path, {rung.literal}, _index_dir);
+                config::parquet_page_select_min_coverage = saved_coverage;
+                EXPECT_TRUE(same_multiset(wide.rows, base.rows, &diag)) << "coverage-off arm: " << diag;
+                EXPECT_EQ(wide.stats_delta.page_whole_chunk_fallback, 0) << "the bound is off in this arm";
+                EXPECT_GT(wide.stats_delta.page_io_range_count, 0) << "so every chunk registers its pages";
+                EXPECT_GT(wide.stats_delta.page_io_range_merged, 0) << "and the gaps are absorbed by run merging";
+                EXPECT_EQ(wide.planned_bytes, base.planned_bytes)
+                        << "single-granule gaps cannot save a byte at this page geometry, at any setting";
+                std::cout << "[ REPORT   ] " << file << " model=" << rung.literal
+                          << " coverage-off planned=" << wide.planned_bytes
+                          << " page_ranges=" << wide.stats_delta.page_io_range_count
+                          << " merged=" << wide.stats_delta.page_io_range_merged << std::endl;
+            } else {
+                // every granule holds the value: the row ranges equal the row group, select_offset_index() never
+                // runs, and planned IO is the unindexed read exactly
+                EXPECT_EQ(idx.planned_bytes, base.planned_bytes);
+                EXPECT_EQ(idx.stats_delta.rap_index_ranges, 2) << "one whole-file range per consult";
+                EXPECT_EQ(idx.stats_delta.page_io_range_count, 0) << "no page was selected, so none was registered";
+                EXPECT_EQ(idx.stats_delta.page_whole_chunk_fallback, 0);
             }
         }
     }
+    config::parquet_page_select_min_coverage = saved_coverage;
 }
 
 // 4. Composition. R7 changed the DEFAULT here: a plan-time hint now means the sidecar is not opened at all
@@ -2030,7 +2101,8 @@ int64_t min_int_field(const std::vector<std::string>& rows, size_t field) {
 } // namespace
 
 // slice 4 p/a/b/c/e (INT64 range through the real reader, sidecars built by the SCAN-SIDE builder over the real file):
-//    p: a predicate-free whole-file read with rap_build_index_dir set writes one keyed v2 sidecar per listed column;
+//    p: a predicate-free whole-file read with rap_build_index_dir set writes one keyed RAPX v5 sidecar per listed
+//       column -- a zone map for near-unique `event_time`, postings for the `model` dimension, both under test here;
 //    a: `event_time <= min` narrows and returns exactly the unindexed rows; a': `> min` (the complement) has parity;
 //    b: `>= min AND <= min` (BETWEEN, inclusive both ends) returns the same rows as a;
 //    c: `> min AND < min` (an empty interval) filters the file, and the unindexed scan agrees (no rows);
@@ -2050,12 +2122,44 @@ TEST_F(RapIndexTest, TypedRangeParityAndNarrowing) {
     const fs::path et = tmp / (key0 + ".event_time" + RapIndex::kSuffix), md = tmp / (key0 + ".model" + RapIndex::kSuffix);
     ASSERT_TRUE(fs::exists(et)) << et;
     ASSERT_TRUE(fs::exists(md)) << md;
+    // v5 (2026-09-16): both sidecars the builder just wrote are RAPX v5, and the SHAPE RULE picks a different shape
+    // for each of them -- which is what makes this case a parity test over both shapes rather than over postings
+    // alone. `event_time` is near-unique on this file, so its postings body cannot fit
+    //   budget = max(rap_index_postings_budget_pct % of the data file, rap_index_postings_min_bytes)
+    // and it becomes a per-granule min/max zone map with no value list; `model` is a 3,963-value dimension and stays
+    // on postings. Everything below -- a, a', b, c, e, d' -- is then answered through the zone map, and passes.
+    const uint64_t f0_size = fs::file_size(f0);
+    const double budget = std::max(config::rap_index_postings_budget_pct * static_cast<double>(f0_size) / 100.0,
+                                   static_cast<double>(config::rap_index_postings_min_bytes));
     {
-        auto r = RapIndex::load(et.string(), RapIndex::Identity{key0, fs::file_size(f0), 2576384, "event_time", -1});
+        auto r = RapIndex::load(et.string(), RapIndex::Identity{key0, f0_size, 2576384, "event_time", -1});
         ASSERT_EQ(r.state, RapIndex::State::READY) << r.reason;
-        EXPECT_EQ(r.index->version(), RapIndex::kVersionV2);
+        EXPECT_EQ(r.index->version(), RapIndex::kVersionV5);
         EXPECT_EQ(r.index->key_type(), RapIndex::KeyType::INT64);
+        EXPECT_EQ(r.index->shape(), RapIndex::Shape::ZONEMAP) << "a near-unique column does not fit the budget";
+        EXPECT_EQ(r.index->num_values(), 0u) << "a zone map carries no value list";
+        EXPECT_EQ(r.index->num_granules(), 129u) << "ceil(2576384 / 20000)";
+        EXPECT_EQ(r.index->granularity_rows(), 20000u);
+        // the rule, with this file's own numbers, not with the outcome: a postings body costs at least 6 bytes per
+        // distinct value (a front-coded key is >= 3 -- two uvarints and at least one suffix byte -- and the cheaper
+        // of a 17-byte granule bitmap or a >= 3-byte single-granule run), so the zone map is the rule's answer here
+        // by a wide margin and not an accident of this fixture.
+        EXPECT_GT(6.0 * static_cast<double>(r.index->distinct_values()), budget)
+                << "postings would have fitted the budget: the shape choice is not what this case thinks it is";
+        std::cout << "[ REPORT   ] v5 shape rule on event_time: file " << f0_size << " B, budget " << budget
+                  << " B, distinct " << r.index->distinct_values() << ", granules " << r.index->num_granules()
+                  << ", sidecar " << fs::file_size(et) << " B" << std::endl;
+    }
+    {
+        auto r = RapIndex::load(md.string(), RapIndex::Identity{key0, f0_size, 2576384, "model", -1});
+        ASSERT_EQ(r.state, RapIndex::State::READY) << r.reason;
+        EXPECT_EQ(r.index->version(), RapIndex::kVersionV5);
+        EXPECT_EQ(r.index->key_type(), RapIndex::KeyType::STRING);
+        EXPECT_EQ(r.index->shape(), RapIndex::Shape::POSTINGS) << "a dimension fits the budget and keeps its postings";
         EXPECT_GT(r.index->num_values(), 0u);
+        EXPECT_LT(static_cast<double>(fs::file_size(md)), budget);
+        std::cout << "[ REPORT   ] v5 shape rule on model: values " << r.index->num_values() << ", sidecar "
+                  << fs::file_size(md) << " B against a " << budget << " B budget" << std::endl;
     }
     ASSERT_FALSE(built.rows.empty());
     const int64_t m = min_int_field(built.rows, 1);
@@ -2832,11 +2936,23 @@ TEST_F(RapIndexTest, V5PostingsAnswerIdenticallyToV2) {
 // narrowing no Parquet page min/max on this layout can do.
 TEST_F(RapIndexTest, V5ZoneMapEqualityAndStraddlingRange) {
     const RapIndex::Identity id{"f.parquet", 4000000, 100000, "event_time", 2};
-    // five granules of 20,000 rows; granule g holds the ten timestamps 10g .. 10g+9 (a miniature of a near-unique
-    // column: distinct values well inside each granule, gaps between granules)
+    // Five granules of 20,000 rows. Granule g holds the ten timestamps 20g .. 20g+9, so consecutive granules are
+    // separated by a TEN-VALUE GAP -- a miniature of a near-unique column whose granules do not touch:
+    //     g0 [t0+0, t0+9]  g1 [t0+20, t0+29]  g2 [t0+40, t0+49]  g3 [t0+60, t0+69]  g4 [t0+80, t0+89]
+    // The gap is the point of the case. As first written (2026-09-15) the spacing was 10, not 20, which made the
+    // intervals CONTIGUOUS -- [t0+10, t0+19] for g1 -- so the "inside no granule's interval" literal t0+15 was in
+    // fact inside granule 1 and the case asserted two contradictory things about granule 1 at once
+    // (`>= t0+15` excludes it, `[t0+19, t0+20]` includes it). The loader was right and the fixture was wrong; the
+    // assertions below therefore guard the fixture's own shape before they use it.
     const int64_t t0 = 1785058200000;
+    const int64_t kSpacing = 20, kWidth = 9, kGap = t0 + 15; // kGap: above g0's max, below g1's min
     std::vector<std::tuple<uint8_t, int64_t, int64_t>> z;
-    for (int g = 0; g < 5; ++g) z.emplace_back(g == 4 ? RapIndex::kZoneHasNull : 0, t0 + 10 * g, t0 + 10 * g + 9);
+    for (int g = 0; g < 5; ++g) {
+        z.emplace_back(g == 4 ? RapIndex::kZoneHasNull : 0, t0 + kSpacing * g, t0 + kSpacing * g + kWidth);
+    }
+    ASSERT_LT(std::get<2>(z[0]), std::get<1>(z[1])) << "the granules must NOT touch, or nothing here is a gap";
+    ASSERT_GT(kGap, std::get<2>(z[0]));
+    ASSERT_LT(kGap, std::get<1>(z[1])) << "the gap literal must lie strictly between two granules' intervals";
     const std::string blob = encode_v5("f.parquet", 4000000, 100000, "event_time", 2,
                                        static_cast<uint8_t>(RapIndex::KeyType::INT64), 20000,
                                        static_cast<uint8_t>(RapIndex::Shape::ZONEMAP), 0, {}, {}, zone_int64(z), 50);
@@ -2849,23 +2965,26 @@ TEST_F(RapIndexTest, V5ZoneMapEqualityAndStraddlingRange) {
     EXPECT_EQ(r.index->distinct_values(), 50u) << "the rule's numerator is kept so the choice can be audited";
 
     // equality inside granule 2's interval selects granule 2 and nothing else
-    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 25)})), "[40000,60000)");
+    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 45)})), "[40000,60000)");
+    // equality inside granule 1's interval selects granule 1: a literal a granule CAN hold is never dropped
+    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 25)})), "[20000,40000)");
     // IN of two literals in different granules
-    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 5), enc_i64(t0 + 25)})), "[0,20000)[40000,60000)");
+    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 5), enc_i64(t0 + 45)})), "[0,20000)[40000,60000)");
     // a value inside the file's overall span but inside NO granule's interval: nothing is read
-    EXPECT_EQ(show(r.index->lookup({enc_i64(t0 + 15)})), "<empty>") << "the gap between granule 0 and granule 2";
+    EXPECT_EQ(show(r.index->lookup({enc_i64(kGap)})), "<empty>") << "the gap between granule 0 and granule 1";
     // a range STRADDLING granules 1 and 2 selects exactly those two
-    const std::string lo = enc_i64(t0 + 12), hi = enc_i64(t0 + 23);
+    const std::string lo = enc_i64(t0 + 25), hi = enc_i64(t0 + 45);
     EXPECT_EQ(show(r.index->lookup_range(&lo, true, &hi, true)), "[20000,60000)");
     // the SQL bounds, exactly: an interval that lies strictly between two granules selects neither
-    const std::string glo = enc_i64(t0 + 19), ghi = enc_i64(t0 + 20);
+    const std::string glo = enc_i64(t0 + 29), ghi = enc_i64(t0 + 40);
     EXPECT_EQ(show(r.index->lookup_range(&glo, false, &ghi, false)), "<empty>");
     // and inclusive on the same two bounds picks up the granules that touch them
     EXPECT_EQ(show(r.index->lookup_range(&glo, true, &ghi, true)), "[20000,60000)");
-    // half-open ranges
-    const std::string mid = enc_i64(t0 + 15);
-    EXPECT_EQ(show(r.index->lookup_range(nullptr, true, &mid, true)), "[0,40000)");
-    EXPECT_EQ(show(r.index->lookup_range(&mid, true, nullptr, true)), "[40000,100000)");
+    // half-open ranges, on the gap literal: everything at or below it is granule 0, everything at or above it
+    // starts at granule 1 -- the two halves partition the granules, which a literal inside a granule cannot do
+    const std::string mid = enc_i64(kGap);
+    EXPECT_EQ(show(r.index->lookup_range(nullptr, true, &mid, true)), "[0,20000)");
+    EXPECT_EQ(show(r.index->lookup_range(&mid, true, nullptr, true)), "[20000,100000)");
     // NULL semantics stay exact: the flag byte, not the bounds
     EXPECT_EQ(show(r.index->null_ranges()), "[80000,100000)");
     EXPECT_EQ(show(r.index->not_null_ranges()), "[0,100000)");

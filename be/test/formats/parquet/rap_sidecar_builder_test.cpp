@@ -635,10 +635,48 @@ TEST_F(RapSidecarBuilderTest, WriterKeysSidecarByFullPathWithoutDataRoot) {
 // =====================================================================================================================
 
 // n: the export path indexes the BIGINT column `v` (0..99999, one per row) as INT64 keys in numeric order -- the sidecar is
-//    v2 / INT64, a range over the values selects exactly their buckets, and the keys 9 < 10 < 100 order numerically
-//    (a string key would put "10" and "100" before "9").
+//    RAPX v5 / INT64, a range over the values selects exactly their buckets, and the keys 9 < 10 < 100 order numerically
+//    (a string key would put "10" and "100" before "9"). v5 also made the SHAPE a decision, so the case now measures
+//    that decision (arm 1) before pinning the budget to get the postings it is actually about (arm 2).
 TEST_F(RapSidecarBuilderTest, TypedInt64KeysEncodeInNumericOrder) {
+    // v5 (2026-09-16). `v` is 100,000 DISTINCT INT64 keys in a file of roughly 0.85 MB, so the shape rule REFUSES
+    // postings for it: the postings body is 400,398 B (100,000 front-coded 8-byte keys = 300,398 B, plus a 1-byte
+    // granule bitmap each -- cheaper than the 300,000 B of delta-varint runs) against a budget of
+    //   max(rap_index_postings_budget_pct % of the data file, rap_index_postings_min_bytes) = 16,384 B,
+    // the floor winning on a file this small. A 24x overrun: the zone map is the DESIGNED outcome here, and arm 1
+    // measures that. But the subject of this case is the postings encoding itself -- INT64 keys in numeric and not
+    // lexicographic order, and the buckets a range over them selects -- which only postings can carry, so arm 2
+    // raises the budget above the postings body for the length of one build and restores it.
+    const double saved_pct = config::rap_index_postings_budget_pct;
+    uint64_t zonemap_sidecar_bytes = 0, data_file_bytes = 0;
+    double budget = 0;
+
+    // arm 1: the default rule, and the numbers that decide it
+    {
+        Written w0 = write_file(_dir + "/rapx", {"v"});
+        ASSERT_TRUE(w0.result.io_status.ok()) << w0.result.io_status.message();
+        EXPECT_EQ(w0.writer->rap_export_stats().sidecars_written, 1) << "an integer column is indexable (slice 4)";
+        const std::string key0 = parquet::RapIndex::key_of(w0.path);
+        const std::string sidecar0 = _dir + "/rapx/" + key0 + ".v.rapx";
+        ASSERT_TRUE(std::filesystem::exists(sidecar0)) << sidecar0;
+        data_file_bytes = static_cast<uint64_t>(w0.result.file_statistics.file_size);
+        budget = std::max<double>(config::rap_index_postings_budget_pct * static_cast<double>(data_file_bytes) / 100.0,
+                                  static_cast<double>(config::rap_index_postings_min_bytes));
+        auto r0 = parquet::RapIndex::load(sidecar0, parquet::RapIndex::Identity{key0, data_file_bytes, static_cast<uint64_t>(kRows), "v", 8});
+        ASSERT_EQ(r0.state, parquet::RapIndex::State::READY) << r0.reason;
+        EXPECT_EQ(r0.index->version(), parquet::RapIndex::kVersionV5);
+        EXPECT_EQ(r0.index->key_type(), parquet::RapIndex::KeyType::INT64);
+        EXPECT_EQ(r0.index->shape(), parquet::RapIndex::Shape::ZONEMAP) << "100,000 distinct keys do not fit the budget";
+        EXPECT_EQ(r0.index->num_values(), 0u) << "a zone map carries no value list";
+        EXPECT_EQ(r0.index->num_granules(), static_cast<uint32_t>((kRows + G - 1) / G));
+        EXPECT_EQ(r0.index->distinct_values(), static_cast<uint64_t>(kRows)) << "the rule's numerator is kept";
+        zonemap_sidecar_bytes = std::filesystem::file_size(sidecar0);
+    }
+
+    // arm 2: the budget pinned above the postings body, so the postings encoding is what is under test
+    config::rap_index_postings_budget_pct = 1000.0;
     Written w = write_file(_dir + "/rapx", {"v"});
+    config::rap_index_postings_budget_pct = saved_pct;
     ASSERT_TRUE(w.result.io_status.ok()) << w.result.io_status.message();
     EXPECT_EQ(w.writer->rap_export_stats().sidecars_written, 1) << "an integer column is indexable (slice 4)";
     const std::string key = parquet::RapIndex::key_of(w.path);
@@ -646,9 +684,20 @@ TEST_F(RapSidecarBuilderTest, TypedInt64KeysEncodeInNumericOrder) {
     ASSERT_TRUE(std::filesystem::exists(sidecar)) << sidecar;
     auto r = parquet::RapIndex::load(sidecar, parquet::RapIndex::Identity{key, static_cast<uint64_t>(w.result.file_statistics.file_size), static_cast<uint64_t>(kRows), "v", 8});
     ASSERT_EQ(r.state, parquet::RapIndex::State::READY) << r.reason;
-    EXPECT_EQ(r.index->version(), parquet::RapIndex::kVersionV2);
+    EXPECT_EQ(r.index->version(), parquet::RapIndex::kVersionV5);
+    EXPECT_EQ(r.index->shape(), parquet::RapIndex::Shape::POSTINGS) << "the raised budget must keep the value list";
     EXPECT_EQ(r.index->key_type(), parquet::RapIndex::KeyType::INT64);
     EXPECT_EQ(r.index->num_values(), static_cast<size_t>(kRows));
+
+    // the shape decision itself, measured on the two sidecars this case just built rather than asserted from the
+    // outcome: the postings body is what the default budget refuses, and the zone map is what fits inside it.
+    const uint64_t postings_sidecar_bytes = std::filesystem::file_size(sidecar);
+    EXPECT_GT(static_cast<double>(postings_sidecar_bytes), budget)
+            << "postings fit the default budget here, so the zone map in arm 1 was not the rule's doing";
+    EXPECT_LT(static_cast<double>(zonemap_sidecar_bytes), budget);
+    LOG(INFO) << "RAP v5 shape rule on 100,000 distinct INT64 keys: data file " << data_file_bytes << " B, budget "
+              << budget << " B, postings sidecar " << postings_sidecar_bytes << " B, zone-map sidecar "
+              << zonemap_sidecar_bytes << " B";
     auto enc = [](int64_t x) { std::string k; parquet::RapIndex::encode_int64(x, &k); return k; };
     // [9, 100]: rows 9..100 -- all inside bucket 0
     const std::string lo = enc(9), hi = enc(100);
